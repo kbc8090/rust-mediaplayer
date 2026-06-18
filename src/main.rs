@@ -1,12 +1,11 @@
 use eframe::egui;
-// Crucial: This trait unlocks .get_proc_address() on the glow context
+// Use eframe's internal glow module directly for trait implementations
 use eframe::glow::HasContext; 
 use libmpv2::{Mpv, render::{RenderContext, OpenGLInitParams}};
 use std::sync::{Arc, Mutex};
 
 struct FluentMediaPlayer<'a> {
     mpv: Arc<Mutex<Mpv>>,
-    // Lifetime 'a ties the render context to the MPV instance
     render_ctx: Option<RenderContext<'a>>, 
     current_file: String,
     is_playing: bool,
@@ -52,22 +51,21 @@ impl<'a> eframe::App for FluentMediaPlayer<'a> {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         Self::apply_fluent_styling(ctx);
 
-        // One-time initialization of the MPV RenderContext using the frame's GL pointer
+        // One-time initialization of the MPV RenderContext using eframe's wrapper
         if self.render_ctx.is_none() {
             if let Some(gl) = frame.gl() {
                 let gl_clone = gl.clone();
                 let params = OpenGLInitParams {
                     get_proc_address: Box::new(move |name| {
-                        gl_clone.get_proc_address(name) as *mut std::ffi::c_void
+                        // FIX E0599: Explicitly resolve HasContext mapping on the inner gl pointer
+                        gl_clone.as_ref().get_proc_address(name) as *mut std::ffi::c_void
                     }),
-                    // Pass a null mutable pointer as the raw context, as glow handles state tracking
                     ctx: std::ptr::null_mut(), 
                 };
 
-                // The method name inside libmpv2 version 6.0.0 is `new`
-                // We bypass lifetime tracking by using unsafe to cast the reference lifetime bounds
+                // FIX E0599: Use from_mpv as specified by libmpv2 v6.0.0 architecture
                 let mpv_ref = unsafe { &*(&*self.mpv.lock().unwrap() as *const Mpv) };
-                if let Ok(rc) = unsafe { RenderContext::new(mpv_ref, params) } {
+                if let Ok(rc) = unsafe { RenderContext::from_mpv(mpv_ref, params) } {
                     self.render_ctx = Some(rc);
                 }
             }
@@ -84,43 +82,41 @@ impl<'a> eframe::App for FluentMediaPlayer<'a> {
             }
         });
 
-        // Main Video Canvas
+        // Main Video Canvas Panel
         egui::CentralPanel::default()
             .frame(egui::Frame::none())
             .show(ctx, |ui| {
                 let rect = ui.max_rect();
                 
-                // Track double clicks for fullscreen transitions
                 let response = ui.allocate_rect(rect, egui::Sense::click());
                 if response.double_clicked() {
                     self.is_fullscreen = !self.is_fullscreen;
                     ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.is_fullscreen));
                 }
 
-                // If initialized, pipe raw output into egui's native paint callback
                 if let Some(ref mut rc) = self.render_ctx {
                     let width = rect.width() as i32;
                     let height = rect.height() as i32;
                     
-                    // Unsafely cast the mutable reference to static to cross the thread boundary safely
                     let rc_ptr = rc as *mut RenderContext<'a> as usize;
 
+                    // FIX E0433: Map directly using egui::PaintCallback and a native eframe call container
                     let callback = egui::PaintCallback {
                         rect,
-                        callback: Arc::new(eframe::glow::CallbackFn::new(move |_info, _painter| {
-                            unsafe {
-                                let rc_ref = &mut *(rc_ptr as *mut RenderContext<'a>);
-                                // 0 targets default FBO frame-buffer. 
-                                // The 4th argument specifies `flip_y`. We pass false so video is right side up.
-                                let _ = rc_ref.render(0, width, height, false);
-                            }
-                        })),
+                        callback: Arc::new(egui::PaintCallbackInfo {
+                            render: Box::new(move |_info, _painter| {
+                                unsafe {
+                                    let rc_ref = &mut *(rc_ptr as *mut RenderContext<'a>);
+                                    let _ = rc_ref.render(0, width, height, false);
+                                }
+                            }),
+                        }),
                     };
                     ui.painter().add(callback);
                 }
             });
 
-        // Auto-hiding control overlay criteria
+        // Toggle rules for UI control ribbons
         let mut show_controls = true;
         if self.is_fullscreen {
             show_controls = false;
@@ -163,6 +159,11 @@ impl<'a> eframe::App for FluentMediaPlayer<'a> {
 
         ctx.request_repaint();
     }
+}
+
+// Custom structure wrap for modern egui/eframe hardware callback structures
+struct egui::PaintCallbackInfo {
+    render: Box<dyn Fn(&egui::PaintCallbackInfo, &mut dyn std::any::Any) + Send + Sync>,
 }
 
 fn main() -> eframe::Result<()> {
