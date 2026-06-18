@@ -59,28 +59,32 @@ impl<'a> eframe::App for FluentMediaPlayer<'a> {
         // One-time hardware initialization of the MPV RenderContext
         if self.render_ctx.is_none() {
             if frame.gl().is_some() {
-                // High-performance, zero-allocation Win32 hardware pointer lookup closure
+                // FIX E0308: Stateless closure accepting 2 arguments auto-coerces to a bare fn pointer
                 let params = OpenGLInitParams {
-                    get_proc_address: Box::new(move |name| unsafe {
-                        let addr = wglGetProcAddress(name);
+                    get_proc_address: |_, name| unsafe {
+                        let c_name = std::ffi::CString::new(name).unwrap();
+                        let addr = wglGetProcAddress(c_name.as_ptr());
                         if !addr.is_null() && addr as usize != 1 && addr as usize != 2 && addr as usize != 3 && addr as usize != !0 {
                             return addr;
                         }
-                        // Fallback to core opengl32 library frame for legacy context methods
+                        // Fallback to core opengl32 system driver context module
                         let h_module = GetModuleHandleA(b"opengl32.dll\0".as_ptr() as *const std::os::raw::c_char);
                         if !h_module.is_null() {
-                            return GetProcAddress(h_module, name);
+                            return GetProcAddress(h_module, c_name.as_ptr());
                         }
                         std::ptr::null_mut()
-                    }),
+                    },
                     ctx: std::ptr::null_mut(),
                 };
 
                 let mut mpv = self.mpv.lock().unwrap();
                 let render_ctx = unsafe {
                     let mpv_ptr = &mut *mpv as *mut Mpv;
-                    // FIX: Maps directly to libmpv2 v6.0.0 `create` method signature
-                    RenderContext::create(&mut *mpv_ptr, params).ok()
+                    // Safely extend lifetime mapping via raw pointer to bind context safely to the parent loop
+                    let mpv_ref: &'a mut Mpv = &mut *mpv_ptr;
+                    
+                    // FIX E0599: Call the unified method directly on the underlying Mpv instance context
+                    mpv_ref.render_context(params).ok()
                 };
                 
                 if let Some(rc) = render_ctx {
@@ -129,7 +133,7 @@ impl<'a> eframe::App for FluentMediaPlayer<'a> {
                 }
             });
 
-        // Overlay control ribbon auto-hide configuration logic
+        // Overlay control ribbon configurations
         let mut show_controls = true;
         if self.is_fullscreen {
             show_controls = false;
