@@ -2,7 +2,6 @@ use eframe::egui;
 use libmpv2::{Mpv, render::{RenderContext, OpenGLInitParams, RenderParam, RenderParamApiType}};
 use std::sync::{Arc, Mutex};
 use std::cell::RefCell;
-use std::path::Path;
 
 unsafe extern "system" {
     fn wglGetProcAddress(lpszProc: *const std::os::raw::c_char) -> *mut std::ffi::c_void;
@@ -28,14 +27,11 @@ struct FluentMediaPlayer {
 }
 
 impl FluentMediaPlayer {
-    fn new(cc: &eframe::CreationContext<'_>) -> Self {
+    fn new(_cc: &eframe::CreationContext<'_>) -> Self {
         let mpv = Mpv::new().expect("Failed to initialize libmpv backend!");
         let _ = mpv.set_property("hwdec", "auto");
-        let _ = mpv.set_property("loop-file", "inf"); // Enable looping
+        let _ = mpv.set_property("loop-file", "inf");
         let _ = mpv.set_property("osc", "no");
-
-        let ctx = &cc.egui_ctx;
-        Self::apply_fluent_styling(ctx);
 
         Self {
             mpv: Arc::new(Mutex::new(mpv)),
@@ -50,16 +46,6 @@ impl FluentMediaPlayer {
             last_mouse_move: 0.0,
         }
     }
-
-    fn apply_fluent_styling(ctx: &egui::Context) {
-        let mut visuals = egui::Visuals::dark();
-        visuals.selection.bg_fill = egui::Color32::from_rgb(0, 120, 212); // Blue Accent
-        // Make sliders smaller with solid blue handles
-        visuals.widgets.active.fg_stroke = egui::Stroke::new(6.0, egui::Color32::from_rgb(0, 120, 212));
-        visuals.widgets.hovered.fg_stroke = egui::Stroke::new(6.0, egui::Color32::from_rgb(0, 120, 212));
-        visuals.widgets.inactive.fg_stroke = egui::Stroke::new(6.0, egui::Color32::from_rgb(0, 120, 212));
-        ctx.set_visuals(visuals);
-    }
 }
 
 impl eframe::App for FluentMediaPlayer {
@@ -72,14 +58,14 @@ impl eframe::App for FluentMediaPlayer {
 
         if !self.render_ctx_initialized && frame.gl().is_some() {
             let init_params = OpenGLInitParams {
-                get_proc_address: |_, name| unsafe {
+                get_proc_address: |_: *const std::os::raw::c_void, name| unsafe {
                     let c_name = std::ffi::CString::new(name).unwrap();
                     let addr = wglGetProcAddress(c_name.as_ptr());
                     if !addr.is_null() && (addr as usize) > 3 && (addr as usize) != !0 { return addr; }
                     let h_mod = GetModuleHandleA(b"opengl32.dll\0".as_ptr() as *const _);
                     GetProcAddress(h_mod, c_name.as_ptr())
                 },
-                ctx: std::ptr::null_mut(),
+                ctx: std::ptr::null_mut::<std::os::raw::c_void>(),
             };
             let params = vec![RenderParam::ApiType(RenderParamApiType::OpenGl), RenderParam::InitParams(init_params)];
             if let Ok(rc) = unsafe { std::mem::transmute::<&Mpv, &'static Mpv>(&*self.mpv.lock().unwrap()) }.create_render_context(params) {
@@ -96,7 +82,6 @@ impl eframe::App for FluentMediaPlayer {
                     self.is_playing = true;
                 }
             }
-            // Mouse logic: Show if moving or near bottom
             let mouse_y = i.pointer.hover_pos().map(|p| p.y).unwrap_or(0.0);
             let screen_h = ctx.screen_rect().height();
             if i.pointer.delta().length_sq() > 0.0 || (self.is_fullscreen && screen_h - mouse_y < 20.0) {
@@ -117,8 +102,6 @@ impl eframe::App for FluentMediaPlayer {
                 let (w, h) = (rect.width() as i32, rect.height() as i32);
                 ui.painter().add(egui::PaintCallback { rect, callback: Arc::new(egui_glow::CallbackFn::new(move |_, _| {
                     TLS_RENDER_CTX.with(|c| if let Some(rc) = c.borrow_mut().as_mut() {
-                        // Flip rendering by passing custom flip logic if the API allows, 
-                        // or use a negative scale transformation here
                         let _ = rc.render::<*mut std::os::raw::c_void>(0, w, h, false);
                     });
                 }))});
@@ -127,18 +110,23 @@ impl eframe::App for FluentMediaPlayer {
 
         if self.show_controls {
             egui::TopBottomPanel::bottom("ribbon").frame(egui::Frame::default()
-                .fill(egui::Color32::from_black_alpha(200)).inner_margin(8.0)).show(ctx, |ui| {
+                .fill(egui::Color32::from_black_alpha(220)).inner_margin(6.0)).show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     if ui.button(if self.is_playing { "\u{E103}" } else { "\u{E102}" }).clicked() {
                         self.is_playing = !self.is_playing;
                         let _ = self.mpv.lock().unwrap().set_property("pause", !self.is_playing);
                     }
+                    ui.spacing_mut().slider_width = ui.available_width() - 120.0;
                     let mut progress = self.time_pos;
-                    ui.add(egui::Slider::new(&mut progress, 0.0..=self.duration.max(1.0)).show_value(false).trailing_fill(true));
-                    if ui.button("\u{E1D9}").clicked() { /* Toggle FS */ }
+                    if ui.add(egui::Slider::new(&mut progress, 0.0..=self.duration.max(1.0)).show_value(false).trailing_fill(true)).changed() {
+                        let _ = self.mpv.lock().unwrap().set_property("time-pos", progress);
+                    }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let mut vol = self.volume as f32;
-                        ui.add(egui::Slider::new(&mut vol, 0.0..=100.0).show_value(false));
+                        ui.spacing_mut().slider_width = 60.0;
+                        if ui.add(egui::Slider::new(&mut vol, 0.0..=100.0).show_value(false)).changed() {
+                            let _ = self.mpv.lock().unwrap().set_property("volume", vol as i64);
+                        }
                         ui.label("\u{E15D}");
                     });
                 });
