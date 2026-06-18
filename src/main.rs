@@ -49,21 +49,18 @@ impl<'a> eframe::App for FluentMediaPlayer<'a> {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         Self::apply_fluent_styling(ctx);
 
-        // One-time initialization of the MPV RenderContext using eframe's inner GL engine
+        // Lazy initialization of the MPV RenderContext using frame GL context lookup
         if self.render_ctx.is_none() {
             if let Some(gl) = frame.gl() {
                 let gl_clone = gl.clone();
                 let params = OpenGLInitParams {
                     get_proc_address: Box::new(move |name| {
-                        // Fix E0599: frame.gl() exposes the method natively on its trait wrapper
                         gl_clone.get_proc_address(name) as *mut std::ffi::c_void
                     }),
                 };
 
-                // Fix E0599: libmpv2 uses standard initialization via a separate init helper or instantiation block
                 let mpv = self.mpv.lock().unwrap();
                 let render_ctx = unsafe {
-                    // Safe transmute pointer lifetime mapping to separate backend bounds
                     let mpv_ptr = &*mpv as *const Mpv;
                     RenderContext::new(&*mpv_ptr, params).ok()
                 };
@@ -74,7 +71,7 @@ impl<'a> eframe::App for FluentMediaPlayer<'a> {
             }
         }
 
-        // Drop file parsing engine
+        // Handle dragged video files
         ctx.input(|i| {
             if let Some(file) = i.raw.dropped_files.first() {
                 if let Some(path) = &file.path {
@@ -85,7 +82,7 @@ impl<'a> eframe::App for FluentMediaPlayer<'a> {
             }
         });
 
-        // Main Viewport Canvas Container
+        // Main Video Interface Drawing Container
         egui::CentralPanel::default()
             .frame(egui::Frame::none())
             .show(ctx, |ui| {
@@ -103,22 +100,19 @@ impl<'a> eframe::App for FluentMediaPlayer<'a> {
                     
                     let rc_ptr = rc as *mut RenderContext<'a> as usize;
 
-                    // Fix E0433: Fallback safety using a native egui user-callback structure 
-                    // that cleanly executes drawing straight to the frame buffer array
-                    ui.painter().add(egui::PaintCallback {
+                    // Use the canonical eframe::glow closure wrapper
+                    let callback = egui::PaintCallback {
                         rect,
-                        callback: Arc::new(egui::UserCallback {
-                            rect,
-                            callback: Box::new(move || unsafe {
-                                let rc_ref = &mut *(rc_ptr as *mut RenderContext<'a>);
-                                let _ = rc_ref.render(0, width, height, false);
-                            }),
-                        }),
-                    });
+                        callback: Arc::new(eframe::glow::CallbackFn::new(move |_info, _painter| unsafe {
+                            let rc_ref = &mut *(rc_ptr as *mut RenderContext<'a>);
+                            let _ = rc_ref.render(0, width, height, false);
+                        })),
+                    };
+                    ui.painter().add(callback);
                 }
             });
 
-        // Overlay control bar visibility configuration
+        // Overlay control ribbon configurations
         let mut show_controls = true;
         if self.is_fullscreen {
             show_controls = false;
@@ -148,7 +142,7 @@ impl<'a> eframe::App for FluentMediaPlayer<'a> {
                         ui.separator();
 
                         let text_edit = egui::TextEdit::singleline(&mut self.current_file)
-                            .hint_text("Drag video files here or paste path...");
+                            .hint_text("Drag video files here...");
                         ui.add_sized([ui.available_width() - 80.0, 20.0], text_edit);
 
                         if ui.button("Load").clicked() {
@@ -160,29 +154,6 @@ impl<'a> eframe::App for FluentMediaPlayer<'a> {
         }
 
         ctx.request_repaint();
-    }
-}
-
-// Emulated callback type wrapper mapping to raw trait expectations inside egui
-struct egui::UserCallback {
-    rect: egui::Rect,
-    callback: Box<dyn FnOnce() + Send + Sync>,
-}
-
-impl egui::util::cache::ComputerMut<(&egui::PaintCallbackInfo, &mut dyn std::any::Any), ()> for egui::UserCallback {
-    fn compute(&mut self, _key: (&egui::PaintCallbackInfo, &mut dyn std::any::Any)) {
-        if let Some(cb) = std::mem::replace(&mut self.callback, Box::new(|| {})).into_any_wrapper() {
-            cb();
-        }
-    }
-}
-
-trait FnOnceExt {
-    fn into_any_wrapper(self: Box<Self>) -> Option<Box<dyn FnOnce()>>;
-}
-impl<F: FnOnce() + Send + Sync + 'static> FnOnceExt for F {
-    fn into_any_wrapper(self: Box<Self>) -> Option<Box<dyn FnOnce()>> {
-        Some(self)
     }
 }
 
