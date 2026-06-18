@@ -1,0 +1,63 @@
+name: Build Windows EXE
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@v6
+
+      - name: Install Rust Environment
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Fetch and Link Pinned libmpv Core Libraries
+        shell: pwsh
+        run: |
+          # Use static, unchanging libmpv development targets to prevent pipeline hash drops
+          $devUrl = "https://github.com/media-kit/libmpv-win32-video-build/releases/download/2023-09-24/mpv-dev-x86_64-20230924-git-652a1dd.7z"
+          
+          Invoke-WebRequest -Uri $devUrl -OutFile "$env:RUNNER_TEMP\mpv_dev.7z"
+          
+          # Extract with 7-Zip (native on windows-latest runners)
+          & "C:\Program Files\7-Zip\7z.exe" x "$env:RUNNER_TEMP\mpv_dev.7z" -o"C:\mpv_dev"
+          
+          # Inject paths into the MSVC Compiler Linker environment
+          echo "LIB=C:\mpv_dev" >> $env:GITHUB_ENV
+          echo "PATH=C:\mpv_dev;$env:PATH" >> $env:GITHUB_PATH
+
+      - name: Cache Build Cache
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Compile Release Executable
+        shell: pwsh
+        run: cargo build --release --target x86_64-pc-windows-msvc
+        env:
+          LIB: "C:\\mpv_dev"
+
+      - name: Structure Delivery Bundle
+        shell: pwsh
+        run: |
+          # Standardize build artifact location output arrays
+          New-Item -ItemType Directory -Force -Path "target\bundle\"
+          Copy-Item "target\x86_64-pc-windows-msvc\release\*.exe" "target\bundle\"
+          Copy-Item "C:\mpv_dev\mpv-1.dll" "target\bundle\"
+
+      - name: Upload Complete Media Player Package
+        uses: actions/upload-artifact@v6
+        with:
+          name: fluent-mediaplayer-windows
+          path: target/bundle/*
+          retention-days: 14
