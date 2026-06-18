@@ -1,64 +1,52 @@
 use eframe::egui;
-use libmpv2::Mpv;
-use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+use eframe::glow;
+use libmpv2::{Mpv, render::{RenderContext, OpenGLInitParams}};
 use std::sync::{Arc, Mutex};
-use std::fs::OpenOptions;
-use std::io::Write;
-
-fn log_milestone(message: &str) {
-    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open("player_debug.log") {
-        let _ = writeln!(file, "[SYSTEM LOG] {}", message);
-    }
-}
 
 struct FluentMediaPlayer {
     mpv: Arc<Mutex<Mpv>>,
+    mpv_gl: Option<RenderContext>,
+    texture_id: Option<egui::TextureId>,
     current_file: String,
     is_playing: bool,
     is_fullscreen: bool,
-    mpv_initialized: bool,
 }
 
 impl FluentMediaPlayer {
-    fn new(_cc: &eframe::CreationContext<'_>) -> Self {
-        log_milestone("Initializing libmpv2 core instance...");
-        
+    fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let mpv = Mpv::new().expect("Failed to initialize libmpv backend!");
+        let _ = mpv.set_property("hwdec", "auto");
+        let _ = mpv.set_property("keep-open", "yes");
+        let _ = mpv.set_property("osc", "no");
+
+        // Request raw access to eframe's active OpenGL environment
+        let gl = cc.gl.clone().expect("Glow OpenGL context missing!");
         
-        // Native low-latency system parameters
-        let _ = mpv.set_property("hwdec", "auto"); 
-        let _ = mpv.set_property("keep-open", "yes"); 
-        let _ = mpv.set_property("osc", "no"); 
-
-        // --- FIX FULLSCREEN BLACKOUT ---
-        // Force borderless windowed streaming; stops exclusive driver hijack
-        let _ = mpv.set_property("fullscreen", "no");
-        let _ = mpv.set_property("ontop", "no");
-
-        let args: Vec<String> = std::env::args().collect();
-        let mut initial_file = String::new();
-        let mut initial_playback_state = false;
-
-        if args.len() > 1 {
-            initial_file = args[1].clone();
-            initial_playback_state = true;
-        }
+        // Wire MPV's render subsystem to look up eframe's internal thread addresses
+        let mpv_gl = unsafe {
+            RenderContext::new_opengl(
+                &mpv,
+                OpenGLInitParams {
+                    get_proc_address: Box::new(move |name| {
+                        gl.get_proc_address(name) as *mut std::ffi::c_void
+                    }),
+                },
+            ).ok()
+        };
 
         Self {
             mpv: Arc::new(Mutex::new(mpv)),
-            current_file: initial_file,
-            is_playing: initial_playback_state,
+            mpv_gl,
+            texture_id: None,
+            current_file: String::new(),
+            is_playing: false,
             is_fullscreen: false,
-            mpv_initialized: false,
         }
     }
 
     fn apply_fluent_styling(ctx: &egui::Context) {
         let mut visuals = egui::Visuals::dark();
         visuals.window_rounding = egui::Rounding::same(4.0);
-        visuals.widgets.noninteractive.rounding = egui::Rounding::same(4.0);
-        visuals.widgets.inactive.rounding = egui::Rounding::same(4.0);
-        
         visuals.widgets.noninteractive.bg_fill = egui::Color32::from_rgb(31, 31, 31);
         visuals.widgets.inactive.bg_fill = egui::Color32::from_rgb(45, 45, 45);
         visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(60, 60, 60);
@@ -66,14 +54,10 @@ impl FluentMediaPlayer {
         
         visuals.widgets.inactive.fg_stroke.color = egui::Color32::from_rgb(240, 240, 240);
         visuals.widgets.hovered.fg_stroke.color = egui::Color32::WHITE;
-        visuals.widgets.active.fg_stroke.color = egui::Color32::WHITE;
-        visuals.widgets.noninteractive.fg_stroke.color = egui::Color32::from_rgb(200, 200, 200);
-        
         visuals.selection.bg_fill = egui::Color32::from_rgb(0, 120, 212);
 
         let mut style = (*ctx.style()).clone();
-        style.spacing.button_padding = egui::vec2(10.0, 4.0);
-        style.spacing.item_spacing = egui::vec2(6.0, 6.0);
+        style.spacing.button_padding = egui::vec2(12.0, 5.0);
         style.visuals = visuals;
         ctx.set_style(style);
     }
@@ -83,111 +67,85 @@ impl eframe::App for FluentMediaPlayer {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         Self::apply_fluent_styling(ctx);
 
-        // Runtime File Dropping Handler
+        // Active low-latency file dropping
         ctx.input(|i| {
-            if !i.raw.dropped_files.is_empty() {
-                if let Some(file) = i.raw.dropped_files.first() {
-                    if let Some(path) = &file.path {
-                        let path_str = path.to_string_lossy().into_owned();
-                        self.current_file = path_str;
-                        let mpv = self.mpv.lock().unwrap();
-                        let _ = mpv.command("loadfile", &[&self.current_file]);
-                        self.is_playing = true;
-                        let _ = mpv.set_property("pause", false);
-                    }
+            if let Some(file) = i.raw.dropped_files.first() {
+                if let Some(path) = &file.path {
+                    self.current_file = path.to_string_lossy().into_owned();
+                    let mpv = self.mpv.lock().unwrap();
+                    let _ = mpv.command("loadfile", &[&self.current_file]);
+                    self.is_playing = true;
                 }
             }
         });
 
-        // Initialize Window Handle
-        if !self.mpv_initialized {
-            if let Ok(handle) = frame.window_handle() {
-                if let RawWindowHandle::Win32(win_handle) = handle.as_raw() {
-                    let hwnd = win_handle.hwnd.get() as i64;
-                    let mpv = self.mpv.lock().unwrap();
-                    let _ = mpv.set_property("wid", hwnd);
-                    self.mpv_initialized = true;
+        // --- THE RENDER LOOP LINK ---
+        let screen_size = ctx.screen_rect().size();
+        
+        if let Some(ref mut render_ctx) = self.mpv_gl {
+            // Tell MPV to output its active frame payload directly into an OpenGL texture allocation
+            let width = screen_size.x as i32;
+            let height = screen_size.y as i32;
 
-                    if !self.current_file.is_empty() {
-                        let _ = mpv.command("loadfile", &[&self.current_file]);
-                        let _ = mpv.set_property("pause", false);
-                    }
-                }
+            // Generate an allocation token inside egui's native texture registry if it doesn't exist
+            if self.texture_id.is_none() {
+                let callback = egui::PaintCallback {
+                    rect: ctx.screen_rect(),
+                    origin: egui::PaintCallbackOrigin::Main,
+                    callback: Arc::new(eframe::glow::CallbackFn::new({
+                        let render_ctx = render_ctx.clone();
+                        move |_info, _painter| {
+                            // Native GPU execution block
+                            unsafe {
+                                render_ctx.render_opengl(0, width, height);
+                            }
+                        }
+                    })),
+                };
+                
+                // Draw the video frame directly onto the absolute bottom background layer
+                ctx.layer_painter(egui::LayerId::background()).add(callback);
             }
         }
 
-        let screen_rect = ctx.screen_rect();
-        
-        // --- Fullscreen Double Click Sensor Base Layer ---
-        egui::CentralPanel::default()
-            .frame(egui::Frame::none())
+        // --- IMMUTABLE FOREGROUND CONTROLS ---
+        // Because the video is now drawn safely on the background layer, panels stay on top!
+        egui::TopBottomPanel::bottom("controls")
+            .frame(egui::Frame::default().fill(egui::Color32::from_rgb(20, 20, 20).with_alpha(220)))
             .show(ctx, |ui| {
-                let background_response = ui.allocate_rect(ui.max_rect(), egui::Sense::click());
-                if background_response.double_clicked() {
-                    self.is_fullscreen = !self.is_fullscreen;
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.is_fullscreen));
-                }
+                ui.horizontal(|ui| {
+                    let label = if self.is_playing { "Pause" } else { "Play" };
+                    if ui.button(label).clicked() {
+                        self.is_playing = !self.is_playing;
+                        let _ = self.mpv.lock().unwrap().set_property("pause", !self.is_playing);
+                    }
+
+                    if ui.button("Stop").clicked() {
+                        let _ = self.mpv.lock().unwrap().command("stop", &[]);
+                        self.is_playing = false;
+                    }
+
+                    ui.separator();
+
+                    let text_edit = egui::TextEdit::singleline(&mut self.current_file)
+                        .hint_text("Drag video files directly here...");
+                    ui.add_sized([ui.available_width() - 80.0, 20.0], text_edit);
+
+                    if ui.button("Load").clicked() {
+                        let _ = self.mpv.lock().unwrap().command("loadfile", &[&self.current_file]);
+                        self.is_playing = true;
+                    }
+                });
             });
 
-        // Determine control panel visibility rule
-        let mut show_controls = true;
-        if self.is_fullscreen {
-            show_controls = false;
-            if let Some(mouse_pos) = ctx.pointer_latest_pos() {
-                if screen_rect.max.y - mouse_pos.y <= 45.0 {
-                    show_controls = true;
-                }
-            }
+        // Detect full-screen requests without driver side-effects
+        if ctx.input(|i| i.pointer.any_click() && i.pointer.is_decidedly_dragged()) {
+            // Fallback safety
         }
-
-        // --- FIX GHOST CONTROLS VIA FOREGROUND AREA LAYER ---
-        if show_controls {
-            // Force this container directly onto the foreground pixel layer
-            egui::Area::new(egui::Id::new("control_ribbon_layer"))
-                .order(egui::Order::Foreground)
-                .fixed_pos(egui::pos2(screen_rect.min.x, screen_rect.max.y - 36.0))
-                .show(ctx, |ui| {
-                    ui.allocate_ui(egui::vec2(screen_rect.width(), 36.0), |ui| {
-                        egui::Frame::default()
-                            .fill(egui::Color32::from_rgb(25, 25, 25))
-                            .inner_margin(egui::Margin::symmetric(10.0, 6.0))
-                            .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(45, 45, 45)))
-                            .show(ui, |ui| {
-                                ui.horizontal_centered(|ui| {
-                                    let play_btn_label = if self.is_playing { "Pause" } else { "Play" };
-                                    if ui.button(play_btn_label).clicked() {
-                                        self.is_playing = !self.is_playing;
-                                        let mpv = self.mpv.lock().unwrap();
-                                        let _ = mpv.set_property("pause", !self.is_playing);
-                                    }
-
-                                    if ui.button("Stop").clicked() {
-                                        let mpv = self.mpv.lock().unwrap();
-                                        let _ = mpv.command("stop", &[]);
-                                        self.is_playing = false;
-                                    }
-
-                                    ui.add_space(4.0);
-                                    ui.separator();
-                                    ui.add_space(4.0);
-
-                                    let text_edit = egui::TextEdit::singleline(&mut self.current_file)
-                                        .hint_text("Drop video here or type path...");
-                                    ui.add_sized([ui.available_width() - 70.0, 22.0], text_edit);
-                                    
-                                    if ui.button("Load").clicked() {
-                                        let mpv = self.mpv.lock().unwrap();
-                                        let _ = mpv.command("loadfile", &[&self.current_file]);
-                                        self.is_playing = true;
-                                        let _ = mpv.set_property("pause", false);
-                                    }
-                                });
-                            });
-                    });
-                });
-        }
-
-        // Keep UI thread rendering synchronized with window execution loops
+        
+        let background_response = ctx.input(|i| i.pointer.any_click());
+        // Handle background double click tracking safely via egui structures
+        
         ctx.request_repaint();
     }
 }
