@@ -27,11 +27,14 @@ struct FluentMediaPlayer {
 }
 
 impl FluentMediaPlayer {
-    fn new(_cc: &eframe::CreationContext<'_>) -> Self {
+    fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let mpv = Mpv::new().expect("Failed to initialize libmpv backend!");
         let _ = mpv.set_property("hwdec", "auto");
         let _ = mpv.set_property("loop-file", "inf");
         let _ = mpv.set_property("osc", "no");
+
+        // Force initial frame
+        cc.egui_ctx.request_repaint();
 
         Self {
             mpv: Arc::new(Mutex::new(mpv)),
@@ -58,7 +61,6 @@ impl eframe::App for FluentMediaPlayer {
 
         if !self.render_ctx_initialized && frame.gl().is_some() {
             let init_params = OpenGLInitParams {
-                // FIXED: Signature matches expected `fn` pointer
                 get_proc_address: |_, name| unsafe {
                     let c_name = std::ffi::CString::new(name).unwrap();
                     let addr = wglGetProcAddress(c_name.as_ptr());
@@ -138,5 +140,12 @@ impl eframe::App for FluentMediaPlayer {
 }
 
 fn main() -> eframe::Result<()> {
-    eframe::run_native("Media Player", eframe::NativeOptions::default(), Box::new(|cc| Box::new(FluentMediaPlayer::new(cc))))
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([960.0, 540.0])
+            .with_min_inner_size([400.0, 300.0])
+            .with_transparent(true),
+        ..Default::default()
+    };
+    eframe::run_native("Media Player", options, Box::new(|cc| Box::new(FluentMediaPlayer::new(cc))))
 }
