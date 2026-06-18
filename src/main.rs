@@ -59,9 +59,9 @@ impl<'a> eframe::App for FluentMediaPlayer<'a> {
         // One-time hardware initialization of the MPV RenderContext
         if self.render_ctx.is_none() {
             if frame.gl().is_some() {
-                // FIX E0283: Explicitly type the opaque context pointer to resolve inference
                 let init_params = OpenGLInitParams {
-                    get_proc_address: |_: *mut std::os::raw::c_void, name| unsafe {
+                    // FIX: Let Rust infer the reference type naturally so it auto-coerces to 'fn'
+                    get_proc_address: |_, name| unsafe {
                         let c_name = std::ffi::CString::new(name).unwrap();
                         let addr = wglGetProcAddress(c_name.as_ptr());
                         if !addr.is_null() && addr as usize != 1 && addr as usize != 2 && addr as usize != 3 && addr as usize != !0 {
@@ -74,7 +74,7 @@ impl<'a> eframe::App for FluentMediaPlayer<'a> {
                         }
                         std::ptr::null_mut()
                     },
-                    ctx: std::ptr::null_mut(),
+                    ctx: std::ptr::null_mut::<std::os::raw::c_void>(),
                 };
 
                 let params = vec![
