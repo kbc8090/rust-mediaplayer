@@ -25,8 +25,11 @@ jobs:
         key: ${{ runner.os }}-vcpkg-${{ hashFiles('Cargo.toml') }}
 
     - name: Install FFmpeg via vcpkg
-      shell: cmd
-      run: vcpkg install ffmpeg:x86_64-windows
+      # Bypasses the shell parser entirely to avoid string syntax errors
+      run: >-
+        vcpkg
+        install
+        ffmpeg:x86_64-windows
 
     - name: Set FFmpeg Environment Variables for Rust
       shell: bash
