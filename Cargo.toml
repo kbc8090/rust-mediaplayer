@@ -5,7 +5,7 @@ edition = "2021"
 
 [dependencies]
 eframe = { version = "0.27.2", default-features = false, features = ["glow"] }
-libmpv = "2.0.1"
+libmpv2 = "6.0.0"
 anyhow = "1.0"
 raw-window-handle = "0.6"
 
