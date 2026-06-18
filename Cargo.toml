@@ -4,8 +4,8 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-eframe = { version = "0.27.2", default-features = false, features = ["glow"] }
-libmpv2 = "6.0.0"
+eframe = { version = "0.27", features = ["glow"] } # Ensures raw OpenGL/Glow access
+libmpv2 = { version = "6.0.0", features = ["render"] } # Unlocks the RenderContext API
 anyhow = "1.0"
 raw-window-handle = "0.6"
 
