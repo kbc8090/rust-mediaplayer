@@ -1,36 +1,42 @@
 use eframe::egui;
+// Pull glow directly from eframe's re-exports where it actually lives
+use eframe::glow; 
 use libmpv2::{Mpv, render::{RenderContext, OpenGLInitParams}};
 use std::sync::{Arc, Mutex};
 
-struct FluentMediaPlayer<'a> {
+struct FluentMediaPlayer {
     mpv: Arc<Mutex<Mpv>>,
-    mpv_gl: Option<RenderContext<'a>>,
+    // Use an Arc wrapper so we can safely share the MPV context with the UI paint thread
+    mpv_gl: Option<Arc<Mutex<RenderContext>>>, 
     current_file: String,
     is_playing: bool,
     is_fullscreen: bool,
 }
 
-impl<'a> FluentMediaPlayer<'a> {
+impl FluentMediaPlayer {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let mpv = Mpv::new().expect("Failed to initialize libmpv backend!");
         let _ = mpv.set_property("hwdec", "auto");
         let _ = mpv.set_property("keep-open", "yes");
         let _ = mpv.set_property("osc", "no");
 
-        // Extract the raw GL reference safely
+        // Access the raw GL context provided by eframe
         let mpv_gl = if let Some(gl) = &cc.gl {
             let gl_clone = gl.clone();
+            
+            // In libmpv2, the API uses init_opengl directly on the instantiated context
+            let render_param = OpenGLInitParams {
+                get_proc_address: Box::new(move |name| {
+                    // glow contexts use standard lookup syntax via your hardware drivers
+                    gl_clone.get_proc_address(name) as *mut std::ffi::c_void
+                }),
+            };
+
+            // Safely initialize the internal GPU renderer context
             unsafe {
-                RenderContext::new_opengl(
-                    &mpv,
-                    OpenGLInitParams {
-                        get_proc_address: Box::new(move |name| {
-                            gl_clone.get_proc_address(name) as *mut std::ffi::c_void
-                        }),
-                        // Pass the raw pointer to the underlying glow/EGL context if required by libmpv bindings
-                        ctx: std::ptr::null_mut(), 
-                    },
-                ).ok()
+                RenderContext::init_opengl(&mpv, render_param)
+                    .ok()
+                    .map(|ctx| Arc::new(Mutex::new(ctx)))
             }
         } else {
             None
@@ -64,11 +70,11 @@ impl<'a> FluentMediaPlayer<'a> {
     }
 }
 
-impl<'a> eframe::App for FluentMediaPlayer<'a> {
-    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+impl eframe::App for FluentMediaPlayer {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         Self::apply_fluent_styling(ctx);
 
-        // Active file dropping
+        // Process drag and drop assets
         ctx.input(|i| {
             if let Some(file) = i.raw.dropped_files.first() {
                 if let Some(path) = &file.path {
@@ -80,7 +86,7 @@ impl<'a> eframe::App for FluentMediaPlayer<'a> {
             }
         });
 
-        // Double-click tracking for Fullscreen toggle via background response surface
+        // Main UI Frame container layout
         egui::CentralPanel::default()
             .frame(egui::Frame::none())
             .show(ctx, |ui| {
@@ -91,18 +97,20 @@ impl<'a> eframe::App for FluentMediaPlayer<'a> {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.is_fullscreen));
                 }
 
-                // Render video directly inside the CentralPanel paint callback pipeline
-                if let Some(ref mut render_ctx) = self.mpv_gl {
+                // Push frame buffer data down onto the active layout texture surface
+                if let Some(ref render_ctx_mutex) = self.mpv_gl {
                     let width = rect.width() as i32;
                     let height = rect.height() as i32;
-                    let render_ctx_clone = render_ctx.clone();
+                    let render_ctx_clone = render_ctx_mutex.clone();
 
                     let callback = egui::PaintCallback {
                         rect,
-                        callback: Arc::new(egui::glow::CallbackFn::new(move |_info, _painter| {
-                            unsafe {
-                                // 0 tells mpv to render straight to the current default FBO/surface
-                                render_ctx_clone.render_opengl(0, width, height);
+                        callback: Arc::new(glow::CallbackFn::new(move |_info, _painter| {
+                            if let Ok(mut render_ctx) = render_ctx_clone.lock() {
+                                unsafe {
+                                    // Target FBO 0 (Default display frame buffer array)
+                                    let _ = render_ctx.render_opengl(0, width, height);
+                                }
                             }
                         })),
                     };
@@ -110,7 +118,7 @@ impl<'a> eframe::App for FluentMediaPlayer<'a> {
                 }
             });
 
-        // Determine controls visibility overlay rules
+        // Bottom UI playback navigation strip panel overlay
         let mut show_controls = true;
         if self.is_fullscreen {
             show_controls = false;
@@ -122,7 +130,6 @@ impl<'a> eframe::App for FluentMediaPlayer<'a> {
         }
 
         if show_controls {
-            // Semi-transparent overlay panel docked cleanly to the bottom edge
             egui::TopBottomPanel::bottom("controls_panel")
                 .frame(egui::Frame::default().fill(egui::Color32::from_rgba_premultiplied(20, 20, 20, 220)))
                 .show(ctx, |ui| {
