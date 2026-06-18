@@ -1,31 +1,17 @@
 [package]
-name = "mediaplayer"
+name = "rust-mediaplayer"
 version = "0.1.0"
 edition = "2021"
 
-[[bin]]
-name = "mediaplayer"
-path = "src/main.rs"
-
 [dependencies]
-# eframe 0.28 + egui 0.28: stable, works on Windows with current Rust/winapi
-eframe = { version = "0.28", features = ["default"] }
-egui   = "0.28"
-
-# ffmpeg-next 7.x matches FFmpeg 7.1.1 we download in the workflow
-ffmpeg-next = "7.0"
-
-# Audio output
-rodio = "0.19"
-
-# Utilities
-anyhow            = "1.0"
-crossbeam-channel = "0.5"
-parking_lot       = "0.12"
-once_cell         = "1.19"
+eframe = { version = "0.27.2", default-features = false, features = ["glow"] }
+libmpv = "2.0.1"
+anyhow = "1.0"
+raw-window-handle = "0.6"
 
 [profile.release]
-opt-level      = 3
-lto            = true
-codegen-units  = 1
-strip          = true
+opt-level = "s"         # Optimize for minimal memory footprint and size
+lto = true              # Deep Link-Time Optimization
+codegen-units = 1       # Single-threaded code generation for max optimization
+panic = "abort"         # Strip unwinding tables
+strip = true            # Hard strip symbols out of the executable
