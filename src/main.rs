@@ -1,5 +1,5 @@
 use eframe::egui;
-use libmpv::Mpv;
+use libmpv2::Mpv;
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use std::sync::{Arc, Mutex};
 use std::fs::OpenOptions;
