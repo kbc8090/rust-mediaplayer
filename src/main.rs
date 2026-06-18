@@ -59,7 +59,6 @@ impl<'a> eframe::App for FluentMediaPlayer<'a> {
         // One-time hardware initialization of the MPV RenderContext
         if self.render_ctx.is_none() {
             if frame.gl().is_some() {
-                // FIX E0308: Stateless closure accepting 2 arguments auto-coerces to a bare fn pointer
                 let params = OpenGLInitParams {
                     get_proc_address: |_, name| unsafe {
                         let c_name = std::ffi::CString::new(name).unwrap();
@@ -83,8 +82,8 @@ impl<'a> eframe::App for FluentMediaPlayer<'a> {
                     // Safely extend lifetime mapping via raw pointer to bind context safely to the parent loop
                     let mpv_ref: &'a mut Mpv = &mut *mpv_ptr;
                     
-                    // FIX E0599: Call the unified method directly on the underlying Mpv instance context
-                    mpv_ref.render_context(params).ok()
+                    // FIX: Match exact libmpv2 factory method name
+                    mpv_ref.create_render_context(params).ok()
                 };
                 
                 if let Some(rc) = render_ctx {
