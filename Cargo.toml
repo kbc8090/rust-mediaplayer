@@ -4,14 +4,18 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-eframe = { version = "0.27", features = ["glow"] } # Ensures raw OpenGL/Glow access
-libmpv2 = { version = "6.0.0", features = ["render"] } # Unlocks the RenderContext API
-anyhow = "1.0"
-raw-window-handle = "0.6"
+# Activates eframe with the native OpenGL/Glow window management hooks
+eframe = { version = "0.27", features = ["glow"] }
+
+# Explicitly pull in egui_glow to get access to native canvas paint callbacks
+egui_glow = "0.27"
+
+# Critical: You must tell libmpv2 to expose its internal OpenGL Init bindings
+libmpv2 = { version = "6.0.0", features = ["render"] }
 
 [profile.release]
-opt-level = "s"         # Optimize for minimal memory footprint and size
-lto = true              # Deep Link-Time Optimization
-codegen-units = 1       # Single-threaded code generation for max optimization
-panic = "abort"         # Strip unwinding tables
-strip = true            # Hard strip symbols out of the executable
+opt-level = 3           # Maximize pure execution speed (replaces "s")
+lto = true              # Deep Link-Time Optimization across all crates
+codegen-units = 1       # Reduces parallelism to allow maximum compiler optimization
+panic = "abort"         # Removes stack unwinding overhead for raw speed and smaller binary
+strip = true            # Hard strip all symbols out of the final executable
