@@ -1,0 +1,46 @@
+name: Build Windows Executable
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  workflow_dispatch: # Allows you to run this manually from the Actions tab
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Install Rust Toolchain
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        targets: x86_64-pc-windows-msvc
+
+    - name: Restore/Cache vcpkg dependencies
+      uses: actions/cache@v4
+      with:
+        path: $VCPKG_ROOT/downloads
+        key: ${{ runner.os }}-vcpkg-${{ hashFiles('Cargo.toml') }}
+
+    - name: Install FFmpeg via vcpkg
+      run: |
+        vcpkg install ffmpeg:x86_64-windows
+
+    - name: Set FFmpeg Environment Variables for Rust
+      shell: bash
+      run: |
+        # Point the ffmpeg-sys-next crate to the vcpkg installation path
+        VCPKG_FFMPEG_DIR="$VCPKG_INSTALLATION_ROOT/installed/x86_64-windows"
+        echo "FFMPEG_DIR=$VCPKG_FFMPEG_DIR" >> $GITHUB_ENV
+        echo "$VCPKG_FFMPEG_DIR/bin" >> $GITHUB_PATH
+
+    - name: Build Release Binary
+      run: cargo build --release --target x86_64-pc-windows-msvc
+
+    - name: Upload Finished Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: Windows-Media-Player
+        path: target/x86_64-pc-windows-msvc/release/*.exe
