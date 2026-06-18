@@ -1,5 +1,4 @@
 use eframe::egui;
-// Use eframe's internal glow module directly for trait implementations
 use eframe::glow::HasContext; 
 use libmpv2::{Mpv, render::{RenderContext, OpenGLInitParams}};
 use std::sync::{Arc, Mutex};
@@ -51,19 +50,17 @@ impl<'a> eframe::App for FluentMediaPlayer<'a> {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         Self::apply_fluent_styling(ctx);
 
-        // One-time initialization of the MPV RenderContext using eframe's wrapper
+        // One-time initialization of the MPV RenderContext
         if self.render_ctx.is_none() {
             if let Some(gl) = frame.gl() {
                 let gl_clone = gl.clone();
                 let params = OpenGLInitParams {
                     get_proc_address: Box::new(move |name| {
-                        // FIX E0599: Explicitly resolve HasContext mapping on the inner gl pointer
                         gl_clone.as_ref().get_proc_address(name) as *mut std::ffi::c_void
                     }),
                     ctx: std::ptr::null_mut(), 
                 };
 
-                // FIX E0599: Use from_mpv as specified by libmpv2 v6.0.0 architecture
                 let mpv_ref = unsafe { &*(&*self.mpv.lock().unwrap() as *const Mpv) };
                 if let Ok(rc) = unsafe { RenderContext::from_mpv(mpv_ref, params) } {
                     self.render_ctx = Some(rc);
@@ -100,17 +97,15 @@ impl<'a> eframe::App for FluentMediaPlayer<'a> {
                     
                     let rc_ptr = rc as *mut RenderContext<'a> as usize;
 
-                    // FIX E0433: Map directly using egui::PaintCallback and a native eframe call container
+                    // Corrected native eframe/glow callback signature
                     let callback = egui::PaintCallback {
                         rect,
-                        callback: Arc::new(egui::PaintCallbackInfo {
-                            render: Box::new(move |_info, _painter| {
-                                unsafe {
-                                    let rc_ref = &mut *(rc_ptr as *mut RenderContext<'a>);
-                                    let _ = rc_ref.render(0, width, height, false);
-                                }
-                            }),
-                        }),
+                        callback: Arc::new(eframe::glow::CallbackFn::new(move |_info, _painter| {
+                            unsafe {
+                                let rc_ref = &mut *(rc_ptr as *mut RenderContext<'a>);
+                                let _ = rc_ref.render(0, width, height, false);
+                            }
+                        })),
                     };
                     ui.painter().add(callback);
                 }
@@ -159,11 +154,6 @@ impl<'a> eframe::App for FluentMediaPlayer<'a> {
 
         ctx.request_repaint();
     }
-}
-
-// Custom structure wrap for modern egui/eframe hardware callback structures
-struct egui::PaintCallbackInfo {
-    render: Box<dyn Fn(&egui::PaintCallbackInfo, &mut dyn std::any::Any) + Send + Sync>,
 }
 
 fn main() -> eframe::Result<()> {
