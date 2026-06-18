@@ -25,12 +25,13 @@ jobs:
         key: ${{ runner.os }}-vcpkg-${{ hashFiles('Cargo.toml') }}
 
     - name: Install FFmpeg via vcpkg
-      run: vcpkg install ffmpeg --triplet=x86_64-windows
+      run: vcpkg install ffmpeg --triplet=x64-windows
 
     - name: Set FFmpeg Environment Variables for Rust
       shell: bash
       run: |
-        VCPKG_FFMPEG_DIR="$VCPKG_INSTALLATION_ROOT/installed/x86_64-windows"
+        # Point the ffmpeg-sys-next crate to the corrected x64-windows path
+        VCPKG_FFMPEG_DIR="$VCPKG_INSTALLATION_ROOT/installed/x64-windows"
         echo "FFMPEG_DIR=$VCPKG_FFMPEG_DIR" >> $GITHUB_ENV
         echo "$VCPKG_FFMPEG_DIR/bin" >> $GITHUB_PATH
 
