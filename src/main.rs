@@ -1,5 +1,4 @@
 use eframe::egui;
-// FIX: Import RenderParam and RenderParamApiType alongside the existing items
 use libmpv2::{Mpv, render::{RenderContext, OpenGLInitParams, RenderParam, RenderParamApiType}};
 use std::sync::{Arc, Mutex};
 
@@ -60,8 +59,9 @@ impl<'a> eframe::App for FluentMediaPlayer<'a> {
         // One-time hardware initialization of the MPV RenderContext
         if self.render_ctx.is_none() {
             if frame.gl().is_some() {
+                // FIX E0283: Explicitly type the opaque context pointer to resolve inference
                 let init_params = OpenGLInitParams {
-                    get_proc_address: |_, name| unsafe {
+                    get_proc_address: |_: *mut std::os::raw::c_void, name| unsafe {
                         let c_name = std::ffi::CString::new(name).unwrap();
                         let addr = wglGetProcAddress(c_name.as_ptr());
                         if !addr.is_null() && addr as usize != 1 && addr as usize != 2 && addr as usize != 3 && addr as usize != !0 {
@@ -77,7 +77,6 @@ impl<'a> eframe::App for FluentMediaPlayer<'a> {
                     ctx: std::ptr::null_mut(),
                 };
 
-                // FIX E0277: Package initialization parameters inside an iterable sequence wrapper
                 let params = vec![
                     RenderParam::ApiType(RenderParamApiType::OpenGl),
                     RenderParam::InitParams(init_params),
