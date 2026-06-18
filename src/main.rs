@@ -119,7 +119,7 @@ impl eframe::App for FluentMediaPlayer {
         // ── Initialize mpv OpenGL render context once GL is available ─────────
         if !self.render_ctx_initialized && frame.gl().is_some() {
             let init_params = OpenGLInitParams {
-                get_proc_address: |_, name| unsafe {
+                get_proc_address: |_: &*mut std::os::raw::c_void, name| unsafe {
                     let c_name = std::ffi::CString::new(name).unwrap();
                     let addr = wglGetProcAddress(c_name.as_ptr());
                     if !addr.is_null() && (addr as usize) > 3 && (addr as usize) != usize::MAX {
@@ -128,7 +128,7 @@ impl eframe::App for FluentMediaPlayer {
                     let h_mod = GetModuleHandleA(b"opengl32.dll\0".as_ptr() as *const _);
                     GetProcAddress(h_mod, c_name.as_ptr())
                 },
-                ctx: std::ptr::null_mut(),
+                ctx: std::ptr::null_mut::<std::os::raw::c_void>(),
             };
             let params = vec![
                 RenderParam::ApiType(RenderParamApiType::OpenGl),
@@ -401,6 +401,6 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "Media Player",
         options,
-        Box::new(|cc| Ok(Box::new(FluentMediaPlayer::new(cc)))),
+        Box::new(|cc| Box::new(FluentMediaPlayer::new(cc))),
     )
 }
