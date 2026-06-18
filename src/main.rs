@@ -1,5 +1,6 @@
 use eframe::egui;
-use libmpv2::{Mpv, render::{RenderContext, OpenGLInitParams}};
+// FIX: Import RenderParam and RenderParamApiType alongside the existing items
+use libmpv2::{Mpv, render::{RenderContext, OpenGLInitParams, RenderParam, RenderParamApiType}};
 use std::sync::{Arc, Mutex};
 
 // Raw Win32 OpenGL function pointer loader hooks
@@ -59,7 +60,7 @@ impl<'a> eframe::App for FluentMediaPlayer<'a> {
         // One-time hardware initialization of the MPV RenderContext
         if self.render_ctx.is_none() {
             if frame.gl().is_some() {
-                let params = OpenGLInitParams {
+                let init_params = OpenGLInitParams {
                     get_proc_address: |_, name| unsafe {
                         let c_name = std::ffi::CString::new(name).unwrap();
                         let addr = wglGetProcAddress(c_name.as_ptr());
@@ -76,13 +77,18 @@ impl<'a> eframe::App for FluentMediaPlayer<'a> {
                     ctx: std::ptr::null_mut(),
                 };
 
+                // FIX E0277: Package initialization parameters inside an iterable sequence wrapper
+                let params = vec![
+                    RenderParam::ApiType(RenderParamApiType::OpenGl),
+                    RenderParam::InitParams(init_params),
+                ];
+
                 let mut mpv = self.mpv.lock().unwrap();
                 let render_ctx = unsafe {
                     let mpv_ptr = &mut *mpv as *mut Mpv;
                     // Safely extend lifetime mapping via raw pointer to bind context safely to the parent loop
                     let mpv_ref: &'a mut Mpv = &mut *mpv_ptr;
                     
-                    // FIX: Match exact libmpv2 factory method name
                     mpv_ref.create_render_context(params).ok()
                 };
                 
