@@ -14,7 +14,7 @@ use ffmpeg::media::Type;
 use ffmpeg::software::scaling::{context::Context as SwsContext, flag::Flags};
 use ffmpeg::util::frame::video::Video;
 
-use rodio::{OutputStream, Sink, Source};
+use rodio::{OutputStream, Sink};
 
 use crate::player::{PlaybackState, PlayerCommand, PlayerEvent, PlayState};
 
