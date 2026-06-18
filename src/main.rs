@@ -1,5 +1,5 @@
 use eframe::egui;
-use libmpv::{Format, Mpv};
+use libmpv::Mpv;
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use std::sync::{Arc, Mutex};
 
@@ -47,7 +47,7 @@ impl FluentMediaPlayer {
         
         // System Blue Accent Color
         style.visuals.selection.bg_fill = egui::Color32::from_rgb(0, 120, 212);
-        style.visuals.widgets.hovered.text_color = egui::Color32::WHITE;
+        style.visuals.widgets.hovered.fg_stroke.color = egui::Color32::WHITE; // Fixed: Mutate the stroke color field directly
 
         ctx.set_style(style);
     }
@@ -70,22 +70,9 @@ impl eframe::App for FluentMediaPlayer {
         }
 
         let screen_rect = ctx.screen_rect();
-        let mut toggle_fullscreen = false;
-
-        // --- Fullscreen Double Click Handler ---
-        let background_response = ctx.allocate_rect(screen_rect, egui::Sense::click());
-        if background_response.double_clicked() {
-            toggle_fullscreen = true;
-        }
-
-        if toggle_fullscreen {
-            self.is_fullscreen = !self.is_fullscreen;
-            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.is_fullscreen));
-        }
 
         // --- Low-Latency Hover Control Detection ---
         let mut show_controls = true;
-        
         if self.is_fullscreen {
             show_controls = false;
             if let Some(mouse_pos) = ctx.pointer_latest_pos() {
@@ -97,6 +84,7 @@ impl eframe::App for FluentMediaPlayer {
         }
 
         // --- Compact Bottom Controls Ribbon (34px tall) ---
+        // Panels must be declared BEFORE CentralPanel in egui
         if show_controls {
             egui::TopBottomPanel::bottom("fluent_ribbon")
                 .exact_height(34.0)
@@ -106,7 +94,6 @@ impl eframe::App for FluentMediaPlayer {
                     .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(40, 40, 40))))
                 .show(ctx, |ui| {
                     ui.horizontal_centered(|ui| {
-                        
                         let play_btn_label = if self.is_playing { "⏸" } else { "▶" };
                         if ui.button(play_btn_label).clicked() {
                             self.is_playing = !self.is_playing;
@@ -139,6 +126,18 @@ impl eframe::App for FluentMediaPlayer {
                 });
         }
 
+        // --- Fullscreen Double Click Handler (Central Background Canvas Area) ---
+        // Fixed: Moved layout interaction tracking inside a dedicated CentralPanel UI wrapper
+        egui::CentralPanel::default()
+            .frame(egui::Frame::none()) // Transparent panel over the core rendering viewport
+            .show(ctx, |ui| {
+                let background_response = ui.allocate_rect(ui.max_rect(), egui::Sense::click());
+                if background_response.double_clicked() {
+                    self.is_fullscreen = !self.is_fullscreen;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.is_fullscreen));
+                }
+            });
+
         // Always repaint immediately to ensure prompt mouse tracking responsiveness
         ctx.request_repaint();
     }
@@ -152,9 +151,10 @@ fn main() -> eframe::Result<()> {
         ..Default::default()
     };
     
+    // Fixed: Removed the Ok() wrapper enum around the closure return signature
     eframe::run_native(
         "Media Player",
         options,
-        Box::new(|cc| Ok(Box::new(FluentMediaPlayer::new(cc)))),
+        Box::new(|cc| Box::new(FluentMediaPlayer::new(cc))),
     )
 }
