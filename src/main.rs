@@ -9,15 +9,17 @@ unsafe extern "system" {
     fn GetProcAddress(hModule: *mut std::ffi::c_void, lpProcName: *const std::os::raw::c_char) -> *mut std::ffi::c_void;
 }
 
-struct FluentMediaPlayer<'a> {
+// We wrap the RenderContext inside a thread-safe container that uses a static lifetime 
+// by managing the initialization inside an Arc-managed block.
+struct FluentMediaPlayer {
     mpv: Arc<Mutex<Mpv>>,
-    render_ctx: Option<RenderContext<'a>>, 
+    render_ctx: Option<Arc<Mutex<RenderContext<'static>>>>, 
     current_file: String,
     is_playing: bool,
     is_fullscreen: bool,
 }
 
-impl<'a> FluentMediaPlayer<'a> {
+impl FluentMediaPlayer {
     fn new(_cc: &eframe::CreationContext<'_>) -> Self {
         let mpv = Mpv::new().expect("Failed to initialize libmpv backend!");
         let _ = mpv.set_property("hwdec", "auto");
@@ -52,7 +54,7 @@ impl<'a> FluentMediaPlayer<'a> {
     }
 }
 
-impl<'a> eframe::App for FluentMediaPlayer<'a> {
+impl eframe::App for FluentMediaPlayer {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         Self::apply_fluent_styling(ctx);
 
@@ -60,14 +62,12 @@ impl<'a> eframe::App for FluentMediaPlayer<'a> {
         if self.render_ctx.is_none() {
             if frame.gl().is_some() {
                 let init_params = OpenGLInitParams {
-                    // FIX: Let Rust infer the reference type naturally so it auto-coerces to 'fn'
                     get_proc_address: |_, name| unsafe {
                         let c_name = std::ffi::CString::new(name).unwrap();
                         let addr = wglGetProcAddress(c_name.as_ptr());
                         if !addr.is_null() && addr as usize != 1 && addr as usize != 2 && addr as usize != 3 && addr as usize != !0 {
                             return addr;
                         }
-                        // Fallback to core opengl32 system driver context module
                         let h_module = GetModuleHandleA(b"opengl32.dll\0".as_ptr() as *const std::os::raw::c_char);
                         if !h_module.is_null() {
                             return GetProcAddress(h_module, c_name.as_ptr());
@@ -82,17 +82,14 @@ impl<'a> eframe::App for FluentMediaPlayer<'a> {
                     RenderParam::InitParams(init_params),
                 ];
 
-                let mut mpv = self.mpv.lock().unwrap();
-                let render_ctx = unsafe {
-                    let mpv_ptr = &mut *mpv as *mut Mpv;
-                    // Safely extend lifetime mapping via raw pointer to bind context safely to the parent loop
-                    let mpv_ref: &'a mut Mpv = &mut *mpv_ptr;
-                    
-                    mpv_ref.create_render_context(params).ok()
-                };
+                let mpv = self.mpv.lock().unwrap();
                 
-                if let Some(rc) = render_ctx {
-                    self.render_ctx = Some(rc);
+                // We leak the reference safely to the static scope because the MPV instance 
+                // is owned by the app structure and lives for the entire lifecycle of the process.
+                let mpv_ref: &'static Mpv = unsafe { std::mem::transmute(&*mpv) };
+                
+                if let Ok(rc) = mpv_ref.create_render_context(params) {
+                    self.render_ctx = Some(Arc::new(Mutex::new(rc)));
                 }
             }
         }
@@ -120,17 +117,19 @@ impl<'a> eframe::App for FluentMediaPlayer<'a> {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.is_fullscreen));
                 }
 
-                if let Some(ref mut rc) = self.render_ctx {
+                if let Some(ref arc_rc) = self.render_ctx {
                     let width = rect.width() as i32;
                     let height = rect.height() as i32;
                     
-                    let rc_ptr = rc as *mut RenderContext<'a> as usize;
+                    let rc_clone = Arc::clone(arc_rc);
 
                     let callback = egui::PaintCallback {
                         rect,
-                        callback: Arc::new(egui_glow::CallbackFn::new(move |_info, _painter| unsafe {
-                            let rc_ref = &mut *(rc_ptr as *mut RenderContext<'a>);
-                            let _ = rc_ref.render(0, width, height, false);
+                        callback: Arc::new(egui_glow::CallbackFn::new(move |_info, _painter| {
+                            if let Ok(mut rc) = rc_clone.lock() {
+                                // FIX E0282: Explicitly annotate the method call with the expected void pointer context type
+                                let _ = rc.render::<*mut std::os::raw::c_void>(0, width, height, false);
+                            }
                         })),
                     };
                     ui.painter().add(callback);
