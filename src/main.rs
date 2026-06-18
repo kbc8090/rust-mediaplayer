@@ -1,4 +1,6 @@
 use eframe::egui;
+// FIX: This trait must be imported to unlock .get_proc_address on the glow context
+use eframe::glow::HasContext; 
 use libmpv2::{Mpv, render::{RenderContext, OpenGLInitParams}};
 use std::sync::{Arc, Mutex};
 
@@ -49,25 +51,24 @@ impl<'a> eframe::App for FluentMediaPlayer<'a> {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         Self::apply_fluent_styling(ctx);
 
-        // One-time initialization of the MPV RenderContext using frame GL context lookup
+        // One-time initialization of the MPV RenderContext
         if self.render_ctx.is_none() {
             if let Some(gl) = frame.gl() {
-                // Cast the Arc handle to obtain the internal function loader pointer
                 let gl_rc = gl.clone();
                 
                 let params = OpenGLInitParams {
                     get_proc_address: Box::new(move |name| {
-                        // Look up symbol directly from the underlying context implementation
+                        // Trait usage allows lookup directly from the context block
                         gl_rc.get_proc_address(name) as *mut std::ffi::c_void
                     }),
-                    ctx: std::ptr::null_mut(), // Satisfies E0063
+                    ctx: std::ptr::null_mut(),
                 };
 
-                let mpv = self.mpv.lock().unwrap();
+                let mut mpv = self.mpv.lock().unwrap();
                 let render_ctx = unsafe {
-                    let mpv_ptr = &*mpv as *const Mpv;
-                    // Properly construct using base instantiation method via raw tracking pointer
-                    RenderContext::new(&*mpv_ptr, params).ok()
+                    // FIX: Coerce a mutable unmanaged reference and call the true API method
+                    let mpv_ptr = &mut *mpv as *mut Mpv;
+                    RenderContext::new_opengl(&mut *mpv_ptr, params).ok()
                 };
                 
                 if let Some(rc) = render_ctx {
@@ -76,7 +77,7 @@ impl<'a> eframe::App for FluentMediaPlayer<'a> {
             }
         }
 
-        // Handle dropped video files
+        // Handle file drop tracking
         ctx.input(|i| {
             if let Some(file) = i.raw.dropped_files.first() {
                 if let Some(path) = &file.path {
@@ -87,7 +88,7 @@ impl<'a> eframe::App for FluentMediaPlayer<'a> {
             }
         });
 
-        // Main Video Interface Drawing Container
+        // Interface Window Core Viewport Canvas
         egui::CentralPanel::default()
             .frame(egui::Frame::none())
             .show(ctx, |ui| {
@@ -105,7 +106,6 @@ impl<'a> eframe::App for FluentMediaPlayer<'a> {
                     
                     let rc_ptr = rc as *mut RenderContext<'a> as usize;
 
-                    // Fixed E0433: Using standard egui_glow implementation pipeline
                     let callback = egui::PaintCallback {
                         rect,
                         callback: Arc::new(egui_glow::CallbackFn::new(move |_info, _painter| unsafe {
@@ -117,7 +117,7 @@ impl<'a> eframe::App for FluentMediaPlayer<'a> {
                 }
             });
 
-        // Control ribbon calculations
+        // Overlay toolbar auto-hide configuration logic
         let mut show_controls = true;
         if self.is_fullscreen {
             show_controls = false;
