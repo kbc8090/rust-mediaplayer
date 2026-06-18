@@ -58,7 +58,8 @@ impl eframe::App for FluentMediaPlayer {
 
         if !self.render_ctx_initialized && frame.gl().is_some() {
             let init_params = OpenGLInitParams {
-                get_proc_address: |_: *const std::os::raw::c_void, name| unsafe {
+                // FIXED: Signature matches expected `fn` pointer
+                get_proc_address: |_, name| unsafe {
                     let c_name = std::ffi::CString::new(name).unwrap();
                     let addr = wglGetProcAddress(c_name.as_ptr());
                     if !addr.is_null() && (addr as usize) > 3 && (addr as usize) != !0 { return addr; }
