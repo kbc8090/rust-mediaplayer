@@ -1,6 +1,7 @@
 use eframe::egui;
 use libmpv2::{Mpv, render::{RenderContext, OpenGLInitParams, RenderParam, RenderParamApiType}};
 use std::sync::{Arc, Mutex};
+use std::cell::RefCell;
 
 // Raw Win32 OpenGL function pointer loader hooks
 unsafe extern "system" {
@@ -9,11 +10,14 @@ unsafe extern "system" {
     fn GetProcAddress(hModule: *mut std::ffi::c_void, lpProcName: *const std::os::raw::c_char) -> *mut std::ffi::c_void;
 }
 
-// We wrap the RenderContext inside a thread-safe container that uses a static lifetime 
-// by managing the initialization inside an Arc-managed block.
+// Thread-local fallback container to bypass `Send`/`Sync` limitations on the underlying libmpv pointers
+thread_local! {
+    static TLS_RENDER_CTX: RefCell<Option<RenderContext<'static>>> = const { RefCell::new(None) };
+}
+
 struct FluentMediaPlayer {
     mpv: Arc<Mutex<Mpv>>,
-    render_ctx: Option<Arc<Mutex<RenderContext<'static>>>>, 
+    render_ctx_initialized: bool,
     current_file: String,
     is_playing: bool,
     is_fullscreen: bool,
@@ -28,7 +32,7 @@ impl FluentMediaPlayer {
 
         Self {
             mpv: Arc::new(Mutex::new(mpv)),
-            render_ctx: None,
+            render_ctx_initialized: false,
             current_file: String::new(),
             is_playing: false,
             is_fullscreen: false,
@@ -59,7 +63,7 @@ impl eframe::App for FluentMediaPlayer {
         Self::apply_fluent_styling(ctx);
 
         // One-time hardware initialization of the MPV RenderContext
-        if self.render_ctx.is_none() {
+        if !self.render_ctx_initialized {
             if frame.gl().is_some() {
                 let init_params = OpenGLInitParams {
                     get_proc_address: |_, name| unsafe {
@@ -84,12 +88,15 @@ impl eframe::App for FluentMediaPlayer {
 
                 let mpv = self.mpv.lock().unwrap();
                 
-                // We leak the reference safely to the static scope because the MPV instance 
-                // is owned by the app structure and lives for the entire lifecycle of the process.
+                // Safely extend reference lifetime to 'static since the backing MPV handle 
+                // remains allocated inside the App state for the complete application process life cycle.
                 let mpv_ref: &'static Mpv = unsafe { std::mem::transmute(&*mpv) };
                 
                 if let Ok(rc) = mpv_ref.create_render_context(params) {
-                    self.render_ctx = Some(Arc::new(Mutex::new(rc)));
+                    TLS_RENDER_CTX.with(|cell| {
+                        *cell.borrow_mut() = Some(rc);
+                    });
+                    self.render_ctx_initialized = true;
                 }
             }
         }
@@ -117,19 +124,19 @@ impl eframe::App for FluentMediaPlayer {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.is_fullscreen));
                 }
 
-                if let Some(ref arc_rc) = self.render_ctx {
+                if self.render_ctx_initialized {
                     let width = rect.width() as i32;
                     let height = rect.height() as i32;
-                    
-                    let rc_clone = Arc::clone(arc_rc);
 
                     let callback = egui::PaintCallback {
                         rect,
                         callback: Arc::new(egui_glow::CallbackFn::new(move |_info, _painter| {
-                            if let Ok(mut rc) = rc_clone.lock() {
-                                // FIX E0282: Explicitly annotate the method call with the expected void pointer context type
-                                let _ = rc.render::<*mut std::os::raw::c_void>(0, width, height, false);
-                            }
+                            // Extract context from thread-local storage safely inside the render loop thread
+                            TLS_RENDER_CTX.with(|cell| {
+                                if let Some(ref mut rc) = *cell.borrow_mut() {
+                                    let _ = rc.render::<*mut std::os::raw::c_void>(0, width, height, false);
+                                }
+                            });
                         })),
                     };
                     ui.painter().add(callback);
