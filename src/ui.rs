@@ -15,7 +15,7 @@ pub fn draw(app: &mut MediaPlayerApp, ctx: &egui::Context, _frame: &mut eframe::
     apply_style(ctx);
 
     egui::CentralPanel::default()
-        .frame(egui::Frame::ZERO.fill(BG_DARK))
+        .frame(egui::Frame::default().fill(BG_DARK))
         .show(ctx, |ui| {
             let panel_rect = ui.max_rect();
             draw_video(app, ui, panel_rect);
@@ -77,7 +77,7 @@ fn draw_control_bar(
         panel_rect.right_bottom(),
     );
 
-    let (pos, dur, vol, playing, shuffle, repeat) = {
+    let (pos, dur, _vol, playing, shuffle, repeat) = {
         let s = app.state.lock();
         (s.position, s.duration, s.volume,
          matches!(s.state, PlayState::Playing), s.shuffle, s.repeat)
