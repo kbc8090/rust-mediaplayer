@@ -10,72 +10,75 @@ jobs:
     runs-on: windows-latest
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - name: Checkout Source Code
+        uses: actions/checkout@v6
 
-      - name: Install Rust (stable)
+      - name: Install Rust Environment
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
 
-      # ── The fix: install FFmpeg via winget BEFORE cargo runs ──────────────
-      # ffmpeg-sys-next needs FFmpeg headers + libs at build time.
-      # The easiest reliable method on windows-latest is the "gyan.dev" build
-      # downloaded and extracted manually, then pointed to via FFMPEG_DIR.
-
-      - name: Download FFmpeg (gyan.dev full build)
+      - name: Fetch and Link Pinned libmpv Core Libraries
         shell: pwsh
         run: |
-          $url = "https://github.com/GyanD/codexffmpeg/releases/download/7.1.1/ffmpeg-7.1.1-full_build-shared.zip"
-          Invoke-WebRequest -Uri $url -OutFile "$env:RUNNER_TEMP\ffmpeg.zip"
-          Expand-Archive -Path "$env:RUNNER_TEMP\ffmpeg.zip" -DestinationPath "$env:RUNNER_TEMP\ffmpeg_extracted"
-          # The zip contains a single top-level folder; move it to a fixed path
-          $inner = Get-ChildItem "$env:RUNNER_TEMP\ffmpeg_extracted" | Select-Object -First 1
-          Move-Item $inner.FullName "C:\ffmpeg"
-          echo "Extracted to C:\ffmpeg"
-          Get-ChildItem "C:\ffmpeg"
+          $devUrl = "https://github.com/media-kit/libmpv-win32-video-build/releases/download/2023-09-24/mpv-dev-x86_64-20230924-git-652a1dd.7z"
+          
+          Invoke-WebRequest -Uri $devUrl -OutFile "$env:RUNNER_TEMP\mpv_dev.7z"
+          
+          # Extract with 7-Zip
+          & "C:\Program Files\7-Zip\7z.exe" x "$env:RUNNER_TEMP\mpv_dev.7z" -o"C:\mpv_dev"
+          
+          # Dynamically locate the library file inside subfolders and flatten it to the root as mpv.lib
+          $libFile = Get-ChildItem -Path "C:\mpv_dev" -Filter "*mpv*.lib" -Recurse | Select-Object -First 1
+          if ($null -eq $libFile) {
+              $libFile = Get-ChildItem -Path "C:\mpv_dev" -Filter "*mpv*.dll.a" -Recurse | Select-Object -First 1
+          }
+          
+          if ($libFile) {
+              Copy-Item $libFile.FullName -Destination "C:\mpv_dev\mpv.lib" -Force
+              Write-Host "Successfully staged compiler link library to C:\mpv_dev\mpv.lib"
+          } else {
+              Write-Error "Could not find any mpv static library file inside the downloaded archive."
+              exit 1
+          }
+          
+          # Inject paths into the MSVC Compiler Linker environment
+          echo "LIB=C:\mpv_dev" >> $env:GITHUB_ENV
+          echo "PATH=C:\mpv_dev;$env:PATH" >> $env:GITHUB_PATH
 
-      - name: Set FFmpeg environment variables
-        shell: pwsh
-        run: |
-          echo "FFMPEG_DIR=C:\ffmpeg"              >> $env:GITHUB_ENV
-          echo "FFMPEG_INCLUDE_DIR=C:\ffmpeg\include" >> $env:GITHUB_ENV
-          echo "FFMPEG_LIB_DIR=C:\ffmpeg\lib"      >> $env:GITHUB_ENV
-          # Make sure the DLLs are findable at runtime too
-          echo "C:\ffmpeg\bin"                      >> $env:GITHUB_PATH
-
-      # ── Cache cargo registry to speed up future runs ─────────────────────
-      - name: Cache cargo
-        uses: actions/cache@v4
+      - name: Cache Build Cache
+        uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-
 
-      # ── Build ─────────────────────────────────────────────────────────────
-      - name: Build release
+      - name: Compile Release Executable
         shell: pwsh
-        run: cargo build --release
+        run: cargo build --release --target x86_64-pc-windows-msvc
         env:
-          FFMPEG_DIR: C:\ffmpeg
-          FFMPEG_INCLUDE_DIR: C:\ffmpeg\include
-          FFMPEG_LIB_DIR: C:\ffmpeg\lib
+          LIB: "C:\\mpv_dev"
 
-      # ── Bundle the FFmpeg DLLs next to the EXE ───────────────────────────
-      # The shared build means the .exe needs the FFmpeg .dll files at runtime.
-      # We copy them into the same folder so users don't need to install FFmpeg.
-      - name: Copy FFmpeg DLLs alongside EXE
+      - name: Structure Delivery Bundle
         shell: pwsh
         run: |
-          Copy-Item "C:\ffmpeg\bin\*.dll" "target\release\"
+          New-Item -ItemType Directory -Force -Path "target\bundle\"
+          Copy-Item "target\x86_64-pc-windows-msvc\release\*.exe" "target\bundle\"
+          
+          # Dynamically locate the dynamic .dll library file and copy it to the distribution folder
+          $dllFile = Get-ChildItem -Path "C:\mpv_dev" -Filter "*mpv*.dll" -Recurse | Select-Object -First 1
+          if ($dllFile) {
+              Copy-Item $dllFile.FullName -Destination "target\bundle\" -Force
+              Write-Host "Bundled dynamic runtime library: $($dllFile.Name)"
+          } else {
+              Write-Error "Could not find any mpv dynamic link runtime library (.dll) to package."
+              exit 1
+          }
 
-      # ── Upload everything as a zip artifact ───────────────────────────────
-      - name: Upload build artifact
-        uses: actions/upload-artifact@v4
+      - name: Upload Complete Media Player Package
+        uses: actions/upload-artifact@v6
         with:
-          name: mediaplayer-windows
-          path: |
-            target\release\mediaplayer.exe
-            target\release\*.dll
-          retention-days: 30
+          name: fluent-mediaplayer-windows
+          path: target/bundle/*
+          retention-days: 14
