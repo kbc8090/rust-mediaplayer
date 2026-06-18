@@ -5,7 +5,6 @@ use libmpv2::{Mpv, render::{RenderContext, OpenGLInitParams, RenderParam, Render
 use std::sync::{Arc, Mutex};
 use std::cell::RefCell;
 
-// Windows OpenGL proc address lookup
 unsafe extern "system" {
     fn wglGetProcAddress(lpszProc: *const std::os::raw::c_char) -> *mut std::ffi::c_void;
     fn GetModuleHandleA(lpModuleName: *const std::os::raw::c_char) -> *mut std::ffi::c_void;
@@ -17,11 +16,16 @@ thread_local! {
 }
 
 // ── Palette ───────────────────────────────────────────────────────────────────
-const ACCENT:      egui::Color32 = egui::Color32::from_rgb(255, 165, 0);
-const BAR_BG:      egui::Color32 = egui::Color32::from_rgba_premultiplied(18, 18, 22, 230);
-const TRACK_BG:    egui::Color32 = egui::Color32::from_rgb(55, 55, 65);
-const ICON_DIM:    egui::Color32 = egui::Color32::from_rgb(200, 200, 210);
-const TEXT_DIM:    egui::Color32 = egui::Color32::from_rgb(150, 150, 160);
+const ACCENT:   egui::Color32 = egui::Color32::from_rgb(255, 165, 0);
+const BAR_BG:   egui::Color32 = egui::Color32::from_rgba_premultiplied(14, 14, 18, 240);
+const TRACK_BG: egui::Color32 = egui::Color32::from_rgb(55, 55, 65);
+const ICON_DIM: egui::Color32 = egui::Color32::from_rgb(200, 200, 210);
+const TEXT_DIM: egui::Color32 = egui::Color32::from_rgb(150, 150, 160);
+
+// Controls bar height — compact
+const BAR_H: f32 = 52.0;
+// Bottom trigger zone for showing controls in fullscreen (px from bottom of screen)
+const TRIGGER_ZONE: f32 = 20.0;
 
 struct FluentMediaPlayer {
     mpv: Arc<Mutex<Mpv>>,
@@ -33,9 +37,11 @@ struct FluentMediaPlayer {
     duration: f64,
     volume: f64,
     show_controls: bool,
-    last_mouse_move: f64,
-    // Drop-hint state
+    /// Wall-clock instant of last mouse movement, used for auto-hide
+    last_mouse_move: std::time::Instant,
     has_file: bool,
+    /// Wakeup sender so mpv can ask for repaints from its own thread
+    repaint_tx: std::sync::mpsc::SyncSender<()>,
 }
 
 impl FluentMediaPlayer {
@@ -43,9 +49,21 @@ impl FluentMediaPlayer {
         let mpv = Mpv::new().expect("Failed to initialize libmpv!");
         let _ = mpv.set_property("hwdec", "auto");
         let _ = mpv.set_property("osc", "no");
-        let _ = mpv.set_property("keep-open", "yes"); // don't close on EOF
+        let _ = mpv.set_property("keep-open", "yes");
         let _ = mpv.set_property("volume", 80_i64);
-        cc.egui_ctx.request_repaint();
+        // Let mpv decide its own frame pacing — do NOT tell egui to repaint every frame.
+        // Instead we use a channel: mpv signals us when a new frame is ready.
+        let _ = mpv.set_property("video-sync", "display-resample");
+
+        // Channel: mpv render thread → egui repaint
+        let (tx, rx) = std::sync::mpsc::sync_channel::<()>(1);
+        let ctx_clone = cc.egui_ctx.clone();
+        // Spawn a thread that wakes egui whenever mpv signals a new frame
+        std::thread::spawn(move || {
+            while rx.recv().is_ok() {
+                ctx_clone.request_repaint();
+            }
+        });
 
         Self {
             mpv: Arc::new(Mutex::new(mpv)),
@@ -57,8 +75,9 @@ impl FluentMediaPlayer {
             duration: 0.0,
             volume: 80.0,
             show_controls: true,
-            last_mouse_move: 0.0,
+            last_mouse_move: std::time::Instant::now(),
             has_file: false,
+            repaint_tx: tx,
         }
     }
 
@@ -107,16 +126,15 @@ impl FluentMediaPlayer {
 
 impl eframe::App for FluentMediaPlayer {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
-        // ── Poll mpv properties ───────────────────────────────────────────────
+        // ── Poll mpv properties (cheap IPC calls) ─────────────────────────────
         if let Ok(mpv) = self.mpv.lock() {
-            if let Ok(t) = mpv.get_property::<f64>("time-pos")   { self.time_pos = t; }
-            if let Ok(d) = mpv.get_property::<f64>("duration")   { self.duration = d; }
-            if let Ok(v) = mpv.get_property::<f64>("volume")     { self.volume   = v; }
-            // Sync play state from mpv (handles natural EOF etc)
-            if let Ok(p) = mpv.get_property::<bool>("pause")     { self.is_playing = !p; }
+            if let Ok(t) = mpv.get_property::<f64>("time-pos") { self.time_pos = t; }
+            if let Ok(d) = mpv.get_property::<f64>("duration") { self.duration = d; }
+            if let Ok(v) = mpv.get_property::<f64>("volume")   { self.volume   = v; }
+            if let Ok(p) = mpv.get_property::<bool>("pause")   { self.is_playing = !p; }
         }
 
-        // ── Initialize mpv OpenGL render context once GL is available ─────────
+        // ── Initialize mpv OpenGL render context once GL is ready ─────────────
         if !self.render_ctx_initialized && frame.gl().is_some() {
             let init_params = OpenGLInitParams {
                 get_proc_address: |_: &*mut std::os::raw::c_void, name| unsafe {
@@ -134,37 +152,50 @@ impl eframe::App for FluentMediaPlayer {
                 RenderParam::ApiType(RenderParamApiType::OpenGl),
                 RenderParam::InitParams(init_params),
             ];
-            // SAFETY: render context lifetime is tied to mpv which lives as long as the app
             let mpv_ref = unsafe {
                 std::mem::transmute::<&Mpv, &'static Mpv>(&*self.mpv.lock().unwrap())
             };
-            if let Ok(rc) = mpv_ref.create_render_context(params) {
+            if let Ok(mut rc) = mpv_ref.create_render_context(params) {
+                // Register mpv's frame-update callback → send wakeup to our repaint thread
+                let tx = self.repaint_tx.clone();
+                rc.set_update_callback(move || { let _ = tx.try_send(()); });
                 TLS_RENDER_CTX.with(|c| *c.borrow_mut() = Some(rc));
                 self.render_ctx_initialized = true;
             }
         }
 
-        // ── Input handling ────────────────────────────────────────────────────
+        // ── Controls visibility logic ─────────────────────────────────────────
+        let screen_h = ctx.screen_rect().height();
+        let (mouse_moved, mouse_y) = ctx.input(|i| (
+            i.pointer.delta().length_sq() > 0.5,
+            i.pointer.hover_pos().map(|p| p.y).unwrap_or(0.0),
+        ));
+
+        if mouse_moved {
+            self.last_mouse_move = std::time::Instant::now();
+            self.show_controls = true;
+        }
+
+        if self.is_fullscreen && self.has_file {
+            let idle_secs = self.last_mouse_move.elapsed().as_secs_f32();
+            // Show if mouse is in bottom trigger zone OR recently moved
+            let in_trigger = screen_h - mouse_y < TRIGGER_ZONE;
+            self.show_controls = idle_secs < 2.5 || in_trigger;
+        } else {
+            // Windowed mode: always show controls
+            self.show_controls = true;
+        }
+
+        // ── Input ─────────────────────────────────────────────────────────────
         ctx.input(|i| {
             // Drag and drop
             for file in &i.raw.dropped_files {
                 if let Some(path) = &file.path {
-                    let path_str = path.to_string_lossy().into_owned();
-                    if is_video_file(&path_str) {
-                        self.open_file(&path_str);
-                    }
+                    let s = path.to_string_lossy().into_owned();
+                    if is_video_file(&s) { self.open_file(&s); }
                 }
             }
-
-            // Mouse move → show controls
-            if i.pointer.delta().length_sq() > 0.0 {
-                self.last_mouse_move = i.time;
-                self.show_controls = true;
-            } else if self.is_fullscreen && self.has_file && i.time - self.last_mouse_move > 2.5 {
-                self.show_controls = false;
-            }
-
-            // Keyboard shortcuts
+            // Keys
             if i.key_pressed(egui::Key::Space)      { self.toggle_play_pause(); }
             if i.key_pressed(egui::Key::ArrowRight) { self.skip(10.0); }
             if i.key_pressed(egui::Key::ArrowLeft)  { self.skip(-10.0); }
@@ -180,20 +211,19 @@ impl eframe::App for FluentMediaPlayer {
             }
         });
 
-        // ── Video panel (solid black — NO transparency) ───────────────────────
+        // ── Video panel ───────────────────────────────────────────────────────
         egui::CentralPanel::default()
             .frame(egui::Frame::none().fill(egui::Color32::BLACK))
             .show(ctx, |ui| {
                 let rect = ui.max_rect();
 
-                // Double-click → fullscreen
+                // Double-click → toggle fullscreen
                 if ui.allocate_rect(rect, egui::Sense::click()).double_clicked() {
                     self.is_fullscreen = !self.is_fullscreen;
                     ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.is_fullscreen));
                 }
 
                 if self.render_ctx_initialized {
-                    // mpv renders directly into this OpenGL rect
                     let (w, h) = (rect.width() as i32, rect.height() as i32);
                     ui.painter().add(egui::PaintCallback {
                         rect,
@@ -206,19 +236,20 @@ impl eframe::App for FluentMediaPlayer {
                         })),
                     });
                 } else if !self.has_file {
-                    // Drop hint while no file loaded
                     draw_drop_hint(ui, rect);
                 }
             });
 
-        // ── Control bar overlay ───────────────────────────────────────────────
+        // ── Control bar (overlay in fullscreen, panel in windowed) ────────────
         if self.show_controls {
             draw_controls(self, ctx);
         }
 
-        // Keep repainting while playing so time_pos updates
+        // Schedule a time-display refresh every ~250ms while playing.
+        // mpv's update callback handles actual frame repaints — we only need
+        // this slow tick for the seek-bar clock to stay current.
         if self.is_playing {
-            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+            ctx.request_repaint_after(std::time::Duration::from_millis(250));
         }
     }
 }
@@ -248,127 +279,106 @@ fn draw_drop_hint(ui: &mut egui::Ui, rect: egui::Rect) {
 // ── Control bar ───────────────────────────────────────────────────────────────
 fn draw_controls(app: &mut FluentMediaPlayer, ctx: &egui::Context) {
     egui::TopBottomPanel::bottom("controls")
-        .frame(egui::Frame::none().fill(BAR_BG).inner_margin(egui::Margin::symmetric(12.0, 8.0)))
+        .exact_height(BAR_H)
+        .frame(egui::Frame::none()
+            .fill(BAR_BG)
+            .inner_margin(egui::Margin { left: 10.0, right: 10.0, top: 6.0, bottom: 6.0 }))
         .show(ctx, |ui| {
             let total_w = ui.available_width();
 
-            // ── Seek bar row ──────────────────────────────────────────────────
+            // ── Single row: [time] [seekbar] [time] [skip] [play] [skip] [vol_icon] [vol] [fs] ──
             ui.horizontal(|ui| {
-                // Elapsed time
-                ui.label(egui::RichText::new(fmt_time(app.time_pos))
-                    .color(TEXT_DIM).size(11.0));
+                ui.set_height(BAR_H - 12.0); // respect vertical margin
 
-                // Seek bar — custom drawn
-                let bar_w = total_w - 90.0;
+                // Elapsed
+                ui.label(egui::RichText::new(fmt_time(app.time_pos)).color(TEXT_DIM).size(11.0));
+                ui.add_space(4.0);
+
+                // Seek bar — takes up middle portion
+                let seek_w = (total_w - 330.0).max(80.0);
                 let (seek_rect, seek_resp) = ui.allocate_exact_size(
-                    egui::Vec2::new(bar_w, 16.0),
+                    egui::Vec2::new(seek_w, BAR_H - 12.0),
                     egui::Sense::click_and_drag(),
                 );
                 let frac = if app.duration > 0.0 {
                     (app.time_pos / app.duration).clamp(0.0, 1.0) as f32
                 } else { 0.0 };
 
-                // Handle seek interaction
                 if seek_resp.is_pointer_button_down_on() || seek_resp.dragged() {
-                    if let Some(p) = seek_resp.interact_pointer_pos() {
-                        let f = ((p.x - seek_rect.left()) / seek_rect.width()).clamp(0.0, 1.0);
+                    if let Some(pos) = seek_resp.interact_pointer_pos() {
+                        let f = ((pos.x - seek_rect.left()) / seek_rect.width()).clamp(0.0, 1.0);
                         app.seek_to(f as f64 * app.duration);
                     }
                 }
 
+                // Draw seek track
                 let p = ui.painter();
                 let mid_y = seek_rect.center().y;
+                let track_h = 3.0;
                 let track = egui::Rect::from_min_max(
-                    egui::Pos2::new(seek_rect.left(), mid_y - 2.0),
-                    egui::Pos2::new(seek_rect.right(), mid_y + 2.0),
+                    egui::Pos2::new(seek_rect.left(), mid_y - track_h / 2.0),
+                    egui::Pos2::new(seek_rect.right(), mid_y + track_h / 2.0),
                 );
                 p.rect_filled(track, egui::Rounding::same(2.0), TRACK_BG);
                 if frac > 0.0 {
-                    let filled = egui::Rect::from_min_max(
-                        track.min,
-                        egui::Pos2::new(track.left() + track.width() * frac, track.bottom()),
+                    p.rect_filled(
+                        egui::Rect::from_min_max(track.min, egui::Pos2::new(track.left() + track.width() * frac, track.bottom())),
+                        egui::Rounding::same(2.0), ACCENT,
                     );
-                    p.rect_filled(filled, egui::Rounding::same(2.0), ACCENT);
                 }
-                // Knob
                 let knob_x = seek_rect.left() + seek_rect.width() * frac;
-                let hovered = seek_resp.hovered() || seek_resp.dragged();
-                let knob_r = if hovered { 7.0 } else { 5.5 };
+                let knob_r = if seek_resp.hovered() || seek_resp.dragged() { 6.0 } else { 4.5 };
                 p.circle_filled(egui::Pos2::new(knob_x, mid_y), knob_r, ACCENT);
 
+                ui.add_space(4.0);
                 // Duration
-                ui.label(egui::RichText::new(fmt_time(app.duration))
-                    .color(TEXT_DIM).size(11.0));
-            });
+                ui.label(egui::RichText::new(fmt_time(app.duration)).color(TEXT_DIM).size(11.0));
+                ui.add_space(8.0);
 
-            ui.add_space(4.0);
-
-            // ── Transport row ─────────────────────────────────────────────────
-            ui.horizontal(|ui| {
-                // File name (left side)
-                let name = app.file_stem().to_owned();
-                if !name.is_empty() {
-                    let truncated = if name.chars().count() > 35 {
-                        format!("{}…", name.chars().take(34).collect::<String>())
-                    } else { name };
-                    ui.label(egui::RichText::new(truncated)
-                        .color(egui::Color32::from_rgb(210, 210, 220)).size(12.0));
-                }
-
-                // Push buttons to center
-                let side_w = (total_w - 220.0) / 2.0;
-                ui.add_space((side_w - ui.min_rect().width()).max(0.0));
-
-                // Skip back 10s
-                if icon_btn(ui, "⏮", 26.0) { app.skip(-10.0); }
+                // Skip back
+                if icon_btn(ui, "⏮", 18.0) { app.skip(-10.0); }
                 ui.add_space(4.0);
 
-                // Play/pause (big white circle)
+                // Play/pause — compact circle button
                 let play_resp = ui.add_sized(
-                    [40.0, 40.0],
+                    [30.0, 30.0],
                     egui::Button::new(
                         egui::RichText::new(if app.is_playing { "⏸" } else { "▶" })
-                            .size(18.0).color(egui::Color32::BLACK)
-                    ).fill(egui::Color32::WHITE).rounding(20.0),
+                            .size(14.0).color(egui::Color32::BLACK)
+                    ).fill(egui::Color32::WHITE).rounding(15.0),
                 );
                 if play_resp.clicked() { app.toggle_play_pause(); }
                 ui.add_space(4.0);
 
-                // Skip forward 10s
-                if icon_btn(ui, "⏭", 26.0) { app.skip(10.0); }
+                // Skip forward
+                if icon_btn(ui, "⏭", 18.0) { app.skip(10.0); }
+                ui.add_space(8.0);
 
-                // Push volume to right
+                // Right-side controls (volume + fullscreen) — right-to-left
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    // Fullscreen button
-                    if icon_btn(ui, "⛶", 26.0) {
+                    if icon_btn(ui, "⛶", 18.0) {
                         app.is_fullscreen = !app.is_fullscreen;
                         ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(app.is_fullscreen));
                     }
-                    ui.add_space(8.0);
-
-                    // Volume slider (80px wide)
+                    ui.add_space(4.0);
                     let vol_icon = if app.volume == 0.0 { "🔇" }
-                        else if app.volume < 40.0 { "🔉" }
-                        else { "🔊" };
-                    ui.label(egui::RichText::new(vol_icon).size(14.0).color(ICON_DIM));
-
+                        else if app.volume < 40.0 { "🔉" } else { "🔊" };
+                    ui.label(egui::RichText::new(vol_icon).size(13.0).color(ICON_DIM));
                     let mut vol = app.volume as f32;
-                    let vol_resp = ui.add(
-                        egui::Slider::new(&mut vol, 0.0f32..=100.0)
-                            .show_value(false)
-                            .trailing_fill(true)
-                    );
-                    if vol_resp.changed() { app.set_volume(vol as f64); }
+                    ui.spacing_mut().slider_width = 70.0;
+                    if ui.add(egui::Slider::new(&mut vol, 0.0f32..=100.0)
+                        .show_value(false).trailing_fill(true)).changed() {
+                        app.set_volume(vol as f64);
+                    }
                 });
             });
         });
 }
 
 fn icon_btn(ui: &mut egui::Ui, icon: &str, size: f32) -> bool {
-    ui.add(
-        egui::Button::new(egui::RichText::new(icon).size(size).color(ICON_DIM))
-            .frame(false)
-    ).clicked()
+    ui.add(egui::Button::new(
+        egui::RichText::new(icon).size(size).color(ICON_DIM)
+    ).frame(false)).clicked()
 }
 
 fn fmt_time(secs: f64) -> String {
@@ -378,13 +388,11 @@ fn fmt_time(secs: f64) -> String {
 }
 
 fn is_video_file(path: &str) -> bool {
-    let ext = std::path::Path::new(path)
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(|s| s.to_lowercase());
-    matches!(ext.as_deref(), Some(
-        "mp4"|"mkv"|"avi"|"mov"|"wmv"|"flv"|"webm"|"m4v"|"ts"|"m2ts"|"mpg"|"mpeg"|"3gp"|"ogv"
-    ))
+    matches!(
+        std::path::Path::new(path).extension()
+            .and_then(|e| e.to_str()).map(|s| s.to_lowercase()).as_deref(),
+        Some("mp4"|"mkv"|"avi"|"mov"|"wmv"|"flv"|"webm"|"m4v"|"ts"|"m2ts"|"mpg"|"mpeg"|"3gp"|"ogv")
+    )
 }
 
 fn main() -> eframe::Result<()> {
@@ -394,7 +402,6 @@ fn main() -> eframe::Result<()> {
             .with_inner_size([960.0, 540.0])
             .with_min_inner_size([400.0, 300.0])
             .with_drag_and_drop(true),
-            // NOTE: with_transparent removed — that was causing the invisible window
         renderer: eframe::Renderer::Glow,
         ..Default::default()
     };
