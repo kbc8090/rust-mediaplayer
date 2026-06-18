@@ -1,8 +1,8 @@
-name: Build Windows Executable
+name: Build Windows EXE
 
 on:
   push:
-    branches: [ "main", "master" ]
+    branches: [ main, master ]
   workflow_dispatch:
 
 jobs:
@@ -10,36 +10,72 @@ jobs:
     runs-on: windows-latest
 
     steps:
-    - name: Checkout repository
-      uses: actions/checkout@v6
+      - name: Checkout
+        uses: actions/checkout@v4
 
-    - name: Install Rust Toolchain
-      uses: dtolnay/rust-toolchain@stable
-      with:
-        targets: x86_64-pc-windows-msvc
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
 
-    - name: Restore/Cache vcpkg dependencies
-      uses: actions/cache@v5
-      with:
-        path: $VCPKG_ROOT/downloads
-        key: ${{ runner.os }}-vcpkg-${{ hashFiles('Cargo.toml') }}
+      # ── The fix: install FFmpeg via winget BEFORE cargo runs ──────────────
+      # ffmpeg-sys-next needs FFmpeg headers + libs at build time.
+      # The easiest reliable method on windows-latest is the "gyan.dev" build
+      # downloaded and extracted manually, then pointed to via FFMPEG_DIR.
 
-    - name: Install FFmpeg via vcpkg
-      run: vcpkg install ffmpeg --triplet=x64-windows
+      - name: Download FFmpeg (gyan.dev full build)
+        shell: pwsh
+        run: |
+          $url = "https://github.com/GyanD/codexffmpeg/releases/download/7.1.1/ffmpeg-7.1.1-full_build-shared.zip"
+          Invoke-WebRequest -Uri $url -OutFile "$env:RUNNER_TEMP\ffmpeg.zip"
+          Expand-Archive -Path "$env:RUNNER_TEMP\ffmpeg.zip" -DestinationPath "$env:RUNNER_TEMP\ffmpeg_extracted"
+          # The zip contains a single top-level folder; move it to a fixed path
+          $inner = Get-ChildItem "$env:RUNNER_TEMP\ffmpeg_extracted" | Select-Object -First 1
+          Move-Item $inner.FullName "C:\ffmpeg"
+          echo "Extracted to C:\ffmpeg"
+          Get-ChildItem "C:\ffmpeg"
 
-    - name: Set FFmpeg Environment Variables for Rust
-      shell: bash
-      run: |
-        # Point the ffmpeg-sys-next crate to the corrected x64-windows path
-        VCPKG_FFMPEG_DIR="$VCPKG_INSTALLATION_ROOT/installed/x64-windows"
-        echo "FFMPEG_DIR=$VCPKG_FFMPEG_DIR" >> $GITHUB_ENV
-        echo "$VCPKG_FFMPEG_DIR/bin" >> $GITHUB_PATH
+      - name: Set FFmpeg environment variables
+        shell: pwsh
+        run: |
+          echo "FFMPEG_DIR=C:\ffmpeg"              >> $env:GITHUB_ENV
+          echo "FFMPEG_INCLUDE_DIR=C:\ffmpeg\include" >> $env:GITHUB_ENV
+          echo "FFMPEG_LIB_DIR=C:\ffmpeg\lib"      >> $env:GITHUB_ENV
+          # Make sure the DLLs are findable at runtime too
+          echo "C:\ffmpeg\bin"                      >> $env:GITHUB_PATH
 
-    - name: Build Release Binary
-      run: cargo build --release --target x86_64-pc-windows-msvc
+      # ── Cache cargo registry to speed up future runs ─────────────────────
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
 
-    - name: Upload Finished Artifact
-      uses: actions/upload-artifact@v6
-      with:
-        name: Windows-Media-Player
-        path: target/x86_64-pc-windows-msvc/release/*.exe
+      # ── Build ─────────────────────────────────────────────────────────────
+      - name: Build release
+        shell: pwsh
+        run: cargo build --release
+        env:
+          FFMPEG_DIR: C:\ffmpeg
+          FFMPEG_INCLUDE_DIR: C:\ffmpeg\include
+          FFMPEG_LIB_DIR: C:\ffmpeg\lib
+
+      # ── Bundle the FFmpeg DLLs next to the EXE ───────────────────────────
+      # The shared build means the .exe needs the FFmpeg .dll files at runtime.
+      # We copy them into the same folder so users don't need to install FFmpeg.
+      - name: Copy FFmpeg DLLs alongside EXE
+        shell: pwsh
+        run: |
+          Copy-Item "C:\ffmpeg\bin\*.dll" "target\release\"
+
+      # ── Upload everything as a zip artifact ───────────────────────────────
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mediaplayer-windows
+          path: |
+            target\release\mediaplayer.exe
+            target\release\*.dll
+          retention-days: 30
