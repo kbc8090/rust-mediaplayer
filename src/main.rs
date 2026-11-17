@@ -4,6 +4,8 @@ use eframe::egui::{self, pos2, vec2, Align2, Color32, FontFamily, FontId, Pos2, 
 use libmpv2::{Mpv, render::{RenderContext, OpenGLInitParams, RenderParam, RenderParamApiType}};
 use std::sync::{Arc, Mutex};
 use std::cell::RefCell;
+use std::cmp::Ordering;
+use std::path::{Path, PathBuf};
 
 unsafe extern "system" {
     fn wglGetProcAddress(lpszProc: *const std::os::raw::c_char) -> *mut std::ffi::c_void;
@@ -55,13 +57,25 @@ struct FluentMediaPlayer {
     has_file: bool,
     /// Wakeup sender so mpv can ask for repaints from its own thread
     repaint_tx: std::sync::mpsc::SyncSender<()>,
+    /// Video files in the current file's folder, in Explorer-style order
+    folder_files: Vec<PathBuf>,
+    folder_index: Option<usize>,
+    /// Accumulated mouse-wheel scroll (points) not yet converted into volume steps
+    scroll_accum: f32,
 }
 
 impl FluentMediaPlayer {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         install_fonts(&cc.egui_ctx);
 
-        let mpv = Mpv::new().expect("Failed to initialize libmpv!");
+        // video-timing-offset = 0 stops mpv from blocking the UI thread inside
+        // render() while it waits for each frame's display time (the default 50 ms
+        // wait made window moves/resizes follow the video's frame rate).
+        let mpv = Mpv::with_initializer(|init| {
+            init.set_property("video-timing-offset", 0.0_f64)?;
+            Ok(())
+        })
+        .expect("Failed to initialize libmpv!");
         let _ = mpv.set_property("hwdec", "auto");
         let _ = mpv.set_property("osc", "no");
         let _ = mpv.set_property("keep-open", "yes");
@@ -99,12 +113,17 @@ impl FluentMediaPlayer {
             last_mouse_move: std::time::Instant::now(),
             has_file: false,
             repaint_tx: tx,
+            folder_files: Vec::new(),
+            folder_index: None,
+            scroll_accum: 0.0,
         }
     }
 
     fn open_file(&mut self, path: &str) {
         self.current_file = path.to_owned();
         self.has_file = true;
+        self.folder_files = scan_folder(Path::new(path));
+        self.folder_index = self.folder_files.iter().position(|p| p == Path::new(path));
         if let Ok(mpv) = self.mpv.lock() {
             let _ = mpv.command("loadfile", &[path]);
             let _ = mpv.set_property("pause", false);
@@ -157,6 +176,23 @@ impl FluentMediaPlayer {
         if let Ok(mpv) = self.mpv.lock() {
             let _ = mpv.set_property("speed", speed);
         }
+    }
+
+    fn has_prev(&self) -> bool {
+        self.folder_index.map_or(false, |i| i > 0)
+    }
+
+    fn has_next(&self) -> bool {
+        self.folder_index.map_or(false, |i| i + 1 < self.folder_files.len())
+    }
+
+    /// Open the previous (-1) or next (+1) video in the current file's folder
+    fn play_adjacent(&mut self, delta: isize) {
+        let Some(i) = self.folder_index else { return };
+        let target = i as isize + delta;
+        if target < 0 || target as usize >= self.folder_files.len() { return; }
+        let path = self.folder_files[target as usize].to_string_lossy().into_owned();
+        self.open_file(&path);
     }
 
     fn skip(&mut self, secs: f64) {
@@ -246,7 +282,11 @@ impl eframe::App for FluentMediaPlayer {
             down:  i.key_pressed(egui::Key::ArrowDown),
             f:     i.key_pressed(egui::Key::F),
             m:     i.key_pressed(egui::Key::M),
+            n:     i.key_pressed(egui::Key::N),
+            p:     i.key_pressed(egui::Key::P),
             esc:   i.key_pressed(egui::Key::Escape),
+            scroll_y: i.raw_scroll_delta.y,
+            pressed: i.pointer.primary_pressed(),
             moved: i.pointer.delta().length_sq() > 0.5,
             active: i.pointer.any_down()
                 || i.events.iter().any(|e| matches!(e, egui::Event::Key { pressed: true, .. })),
@@ -254,7 +294,7 @@ impl eframe::App for FluentMediaPlayer {
         });
 
         // ── Controls visibility logic ─────────────────────────────────────────
-        if inp.moved || inp.active {
+        if inp.moved || inp.active || inp.scroll_y != 0.0 {
             self.last_mouse_move = std::time::Instant::now();
         }
         let near_edge = inp.pointer
@@ -279,10 +319,36 @@ impl eframe::App for FluentMediaPlayer {
         if inp.up    { self.set_volume(self.volume + 5.0); }
         if inp.down  { self.set_volume(self.volume - 5.0); }
         if inp.m     { let m = !self.muted; self.set_mute(m); }
+        if inp.n     { self.play_adjacent(1); }
+        if inp.p     { self.play_adjacent(-1); }
+
+        // Mouse wheel anywhere in the window = volume, 5 % per notch
+        // (egui reports one wheel notch as 50 points)
+        self.scroll_accum += inp.scroll_y;
+        let steps = (self.scroll_accum / 50.0).trunc();
+        if steps != 0.0 {
+            self.scroll_accum -= steps * 50.0;
+            self.set_volume(self.volume + steps as f64 * 5.0);
+            if steps > 0.0 && self.muted { self.set_mute(false); }
+        }
+
         if inp.f     { self.toggle_fullscreen(ctx); }
         if inp.esc && self.is_fullscreen {
             self.is_fullscreen = false;
             ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+        }
+
+        // ── Resize from the window edges (we have no OS frame) ────────────────
+        let maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
+        let edge = if self.is_fullscreen || maximized {
+            None
+        } else {
+            inp.pointer.and_then(|p| hit_edge(p, screen))
+        };
+        if let Some((dir, _)) = edge {
+            if inp.pressed {
+                ctx.send_viewport_cmd(egui::ViewportCommand::BeginResize(dir));
+            }
         }
 
         // ── Video panel: full-bleed, the controls float on top of it ──────────
@@ -290,10 +356,15 @@ impl eframe::App for FluentMediaPlayer {
             .frame(egui::Frame::none().fill(Color32::BLACK))
             .show(ctx, |ui| {
                 let rect = ui.max_rect();
+                let resp = ui.allocate_rect(rect, Sense::click_and_drag());
 
                 // Double-click → toggle fullscreen
-                if ui.allocate_rect(rect, Sense::click()).double_clicked() {
+                if resp.double_clicked() {
                     self.toggle_fullscreen(ctx);
+                }
+                // Drag anywhere on the video → move the window
+                if resp.drag_started() && !self.is_fullscreen && edge.is_none() {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
                 }
 
                 if self.render_ctx_initialized {
@@ -323,9 +394,13 @@ impl eframe::App for FluentMediaPlayer {
             draw_bottom_bar(self, ctx, t);
         }
 
+        // Resize cursor wins over any other cursor set this frame
+        if let Some((_, icon)) = edge {
+            ctx.set_cursor_icon(icon);
+        }
+
         // Thin window border (we have no OS frame any more)
         if !self.is_fullscreen {
-            let maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
             if !maximized {
                 ctx.layer_painter(egui::LayerId::new(egui::Order::Tooltip, egui::Id::new("border")))
                     .rect_stroke(screen.shrink(0.5), 0.0, Stroke::new(1.0_f32, WIN_BORDER));
@@ -339,12 +414,21 @@ impl eframe::App for FluentMediaPlayer {
             ctx.request_repaint_after(std::time::Duration::from_millis(250));
         }
     }
+
+    /// Quit immediately. Letting Rust tear down mpv, the GL context and the audio
+    /// device the normal way takes a noticeable moment (busy cursor); there is
+    /// nothing to save, so just end the process.
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        std::process::exit(0);
+    }
 }
 
 struct InputSnapshot {
     dropped: Vec<String>,
     space: bool, right: bool, left: bool, up: bool, down: bool,
-    f: bool, m: bool, esc: bool,
+    f: bool, m: bool, n: bool, p: bool, esc: bool,
+    scroll_y: f32,
+    pressed: bool,
     moved: bool, active: bool,
     pointer: Option<Pos2>,
 }
@@ -506,17 +590,6 @@ fn icon_more(p: &egui::Painter, c: Pos2, col: Color32) {
         p.circle_filled(pos2(c.x + dx, c.y), 1.5, col);
     }
 }
-fn icon_chevron_down(p: &egui::Painter, c: Pos2, col: Color32) {
-    poly(p, c, &[(-6.0, -2.5), (0.0, 3.5), (6.0, -2.5)], col, 1.6);
-}
-fn icon_playlist(p: &egui::Painter, c: Pos2, col: Color32) {
-    for (i, w) in [(-6.0_f32, 11.0_f32), (-2.0, 11.0), (2.0, 11.0), (6.0, 6.0)] {
-        poly(p, c, &[(-2.0, i), (-2.0 + w, i)], col, 1.5);
-    }
-    for i in [-6.0_f32, -2.0, 2.0, 6.0] {
-        p.circle_filled(pos2(c.x - 8.0, c.y + i), 1.1, col);
-    }
-}
 
 // ── Title bar (overlaid on the video) ─────────────────────────────────────────
 fn draw_top_bar(app: &mut FluentMediaPlayer, ctx: &egui::Context, t: f32) {
@@ -550,16 +623,13 @@ fn draw_top_bar(app: &mut FluentMediaPlayer, ctx: &egui::Context, t: f32) {
                 }
             }
 
-            // Left: chevron, playlist glyph, file name
+            // Left: file name
             let y = 29.0;
-            icon_chevron_down(&p, pos2(27.0, y), white);
-            icon_playlist(&p, pos2(75.0, y + 0.5), white);
-
             let right_limit = if fullscreen { screen.right() - 20.0 } else { screen.right() - WIN_BTN_W * 3.0 - 10.0 };
-            let clip = p.with_clip_rect(Rect::from_min_max(pos2(112.0, 0.0), pos2(right_limit, TOP_H)));
+            let clip = p.with_clip_rect(Rect::from_min_max(pos2(20.0, 0.0), pos2(right_limit, TOP_H)));
             let font = FontId::new(17.0, FontFamily::Name("semibold".into()));
-            clip.text(pos2(113.0, y + 1.0), Align2::LEFT_CENTER, &title, font.clone(), black(170, t));
-            clip.text(pos2(112.0, y), Align2::LEFT_CENTER, &title, font, white);
+            clip.text(pos2(21.0, y + 1.0), Align2::LEFT_CENTER, &title, font.clone(), black(170, t));
+            clip.text(pos2(20.0, y), Align2::LEFT_CENTER, &title, font, white);
 
             // Right: window buttons (not shown in fullscreen)
             if !fullscreen {
@@ -598,7 +668,11 @@ fn draw_top_bar(app: &mut FluentMediaPlayer, ctx: &egui::Context, t: f32) {
                         match k {
                             0 => ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true)),
                             1 => app.toggle_maximize(ctx),
-                            _ => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+                            _ => {
+                                // Hide first so the window vanishes instantly
+                                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+                                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                            }
                         }
                     }
                 }
@@ -684,14 +758,15 @@ fn draw_bottom_bar(app: &mut FluentMediaPlayer, ctx: &egui::Context, t: f32) {
             }
             if app.is_playing { icon_pause(&p, c, white) } else { icon_play(&p, c, white) }
 
-            // Previous / next = skip ∓10 s (there is no playlist yet)
+            // Previous / next file in the same folder (dimmed when there isn't one)
+            let dim = white.gamma_multiply(0.4);
             let c = pos2(left + 71.0, row_y);
-            if hit(ui, c, "prev", "Back 10 seconds (←)", t).clicked() { app.skip(-10.0); }
-            icon_prev(&p, c, white);
+            if hit(ui, c, "prev", "Previous file (P)", t).clicked() { app.play_adjacent(-1); }
+            icon_prev(&p, c, if app.has_prev() { white } else { dim });
 
             let c = pos2(left + 111.0, row_y);
-            if hit(ui, c, "next", "Forward 10 seconds (→)", t).clicked() { app.skip(10.0); }
-            icon_next(&p, c, white);
+            if hit(ui, c, "next", "Next file (N)", t).clicked() { app.play_adjacent(1); }
+            icon_next(&p, c, if app.has_next() { white } else { dim });
 
             // Time
             p.text(
@@ -777,6 +852,87 @@ fn draw_bottom_bar(app: &mut FluentMediaPlayer, ctx: &egui::Context, t: f32) {
                 }
             });
         });
+}
+
+// ── Folder navigation ─────────────────────────────────────────────────────────
+/// Video files in the same folder as `path`, in Explorer-like (natural) order
+fn scan_folder(path: &Path) -> Vec<PathBuf> {
+    let Some(dir) = path.parent() else { return vec![path.to_owned()] };
+    let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
+        .map(|rd| {
+            rd.filter_map(|e| e.ok())
+                .map(|e| e.path())
+                .filter(|p| p.is_file() && is_video_file(&p.to_string_lossy()))
+                .collect()
+        })
+        .unwrap_or_default();
+    files.sort_by(|a, b| {
+        let name = |p: &PathBuf| p.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+        natural_cmp(&name(a), &name(b))
+    });
+    files
+}
+
+/// Case-insensitive compare where digit runs compare by value ("2" < "10"),
+/// like Windows Explorer
+fn natural_cmp(a: &str, b: &str) -> Ordering {
+    let mut ai = a.chars().peekable();
+    let mut bi = b.chars().peekable();
+    loop {
+        match (ai.peek().copied(), bi.peek().copied()) {
+            (None, None) => return Ordering::Equal,
+            (None, Some(_)) => return Ordering::Less,
+            (Some(_), None) => return Ordering::Greater,
+            (Some(x), Some(y)) => {
+                if x.is_ascii_digit() && y.is_ascii_digit() {
+                    let mut na = String::new();
+                    while let Some(&c) = ai.peek() {
+                        if c.is_ascii_digit() { na.push(c); ai.next(); } else { break; }
+                    }
+                    let mut nb = String::new();
+                    while let Some(&c) = bi.peek() {
+                        if c.is_ascii_digit() { nb.push(c); bi.next(); } else { break; }
+                    }
+                    let (ta, tb) = (na.trim_start_matches('0'), nb.trim_start_matches('0'));
+                    let o = ta.len().cmp(&tb.len()).then_with(|| ta.cmp(tb));
+                    if o != Ordering::Equal { return o; }
+                } else {
+                    let o = x.to_lowercase().collect::<String>()
+                        .cmp(&y.to_lowercase().collect::<String>());
+                    if o != Ordering::Equal { return o; }
+                    ai.next();
+                    bi.next();
+                }
+            }
+        }
+    }
+}
+
+// ── Window edge resizing ──────────────────────────────────────────────────────
+/// Which resize edge/corner (if any) the pointer is on, with its cursor icon
+fn hit_edge(p: Pos2, screen: Rect) -> Option<(egui::viewport::ResizeDirection, egui::CursorIcon)> {
+    use egui::viewport::ResizeDirection as D;
+    use egui::CursorIcon as C;
+    const EDGE: f32 = 6.0;
+    const CORNER: f32 = 14.0;
+
+    // Keep the close/maximize/minimize buttons clickable in the top-right corner
+    if p.y < WIN_BTN_H && p.x > screen.right() - WIN_BTN_W * 3.0 {
+        return None;
+    }
+
+    let (dl, dr) = (p.x - screen.left(), screen.right() - p.x);
+    let (dt, db) = (p.y - screen.top(), screen.bottom() - p.y);
+
+    if dl < CORNER && dt < CORNER { return Some((D::NorthWest, C::ResizeNwSe)); }
+    if dr < CORNER && dt < CORNER { return Some((D::NorthEast, C::ResizeNeSw)); }
+    if dl < CORNER && db < CORNER { return Some((D::SouthWest, C::ResizeNeSw)); }
+    if dr < CORNER && db < CORNER { return Some((D::SouthEast, C::ResizeNwSe)); }
+    if dl < EDGE { return Some((D::West,  C::ResizeHorizontal)); }
+    if dr < EDGE { return Some((D::East,  C::ResizeHorizontal)); }
+    if dt < EDGE { return Some((D::North, C::ResizeVertical)); }
+    if db < EDGE { return Some((D::South, C::ResizeVertical)); }
+    None
 }
 
 fn fmt_time(secs: f64) -> String {
