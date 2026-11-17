@@ -81,4 +81,4 @@ jobs:
         with:
           name: fluent-mediaplayer-windows
           path: target/bundle/*
-          retention-days: 14
+          retention-days: 15
