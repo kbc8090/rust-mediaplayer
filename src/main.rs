@@ -630,12 +630,6 @@ fn icon_volume(p: &egui::Painter, c: Pos2, col: Color32, level: f64, muted: bool
         if level >= 40.0 { poly(p, c, &arc(9.0), col, SW); }
     }
 }
-fn icon_shuffle(p: &egui::Painter, c: Pos2, col: Color32) {
-    poly(p, c, &[(-8.0, -4.0), (-3.0, -4.0), (3.0, 4.0), (7.0, 4.0)], col, SW);
-    poly(p, c, &[(-8.0, 4.0), (-3.0, 4.0), (3.0, -4.0), (7.0, -4.0)], col, SW);
-    poly(p, c, &[(4.5, 1.5), (7.5, 4.0), (4.5, 6.5)], col, SW);
-    poly(p, c, &[(4.5, -6.5), (7.5, -4.0), (4.5, -1.5)], col, SW);
-}
 fn icon_repeat(p: &egui::Painter, c: Pos2, col: Color32) {
     poly(p, c, &[(-8.0, 2.0), (-8.0, -2.0), (-5.0, -5.0), (6.0, -5.0)], col, SW);
     poly(p, c, &[(3.5, -7.5), (6.0, -5.0), (3.5, -2.5)], col, SW);
@@ -848,14 +842,14 @@ fn draw_bottom_bar(app: &mut FluentMediaPlayer, ctx: &egui::Context, t: f32) {
             );
 
             // Volume icon (click = mute) + slider
-            let c = pos2(right - 400.0, row_y);
+            let c = pos2(right - 355.0, row_y);
             if hit(ui, c, "mute", if app.muted { "Unmute (M)" } else { "Mute (M)" }, t).clicked() {
                 let m = !app.muted;
                 app.set_mute(m);
             }
             icon_volume(&p, c, white, app.volume, app.muted);
 
-            let vl = right - 370.0;
+            let vl = right - 325.0;
             let vw = 93.0;
             let vr = Rect::from_min_max(pos2(vl - 8.0, row_y - 12.0), pos2(vl + vw + 8.0, row_y + 12.0));
             let vresp = ui.interact(vr, ui.id().with("vol"), Sense::click_and_drag());
@@ -1001,6 +995,117 @@ fn hit_edge(p: Pos2, screen: Rect) -> Option<(egui::viewport::ResizeDirection, e
     None
 }
 
+// ── Windows accent colour ─────────────────────────────────────────────────────
+fn reg_dword(sub_key: &str, value: &str) -> Option<u32> {
+    let wide = |s: &str| s.encode_utf16().chain(std::iter::once(0)).collect::<Vec<u16>>();
+    let (key, val) = (wide(sub_key), wide(value));
+    let mut data: u32 = 0;
+    let mut len: u32 = 4;
+    // HKEY_CURRENT_USER = 0x80000001 (sign-extended to pointer size); RRF_RT_REG_DWORD = 0x10
+    let rc = unsafe {
+        RegGetValueW(
+            0x8000_0001_u32 as i32 as isize,
+            key.as_ptr(),
+            val.as_ptr(),
+            0x10,
+            std::ptr::null_mut(),
+            &mut data as *mut u32 as *mut std::ffi::c_void,
+            &mut len,
+        )
+    };
+    (rc == 0).then_some(data)
+}
+
+/// The accent colour from Windows Settings (static, or picked from the wallpaper)
+fn system_accent() -> Color32 {
+    // Explorer\Accent\AccentColorMenu and DWM\AccentColor are stored as 0xAABBGGRR,
+    // DWM\ColorizationColor as 0xAARRGGBB.
+    let rgb = reg_dword(r"Software\Microsoft\Windows\CurrentVersion\Explorer\Accent", "AccentColorMenu")
+        .or_else(|| reg_dword(r"Software\Microsoft\Windows\DWM", "AccentColor"))
+        .map(|v| (v & 0xFF, (v >> 8) & 0xFF, (v >> 16) & 0xFF))
+        .or_else(|| {
+            reg_dword(r"Software\Microsoft\Windows\DWM", "ColorizationColor")
+                .map(|v| ((v >> 16) & 0xFF, (v >> 8) & 0xFF, v & 0xFF))
+        });
+    match rgb {
+        Some((r, g, b)) => readable_accent(Color32::from_rgb(r as u8, g as u8, b as u8)),
+        None => DEFAULT_ACCENT,
+    }
+}
+
+/// Very dark accents would vanish against the video, so lighten them a bit
+fn readable_accent(c: Color32) -> Color32 {
+    let luma = (0.299 * c.r() as f32 + 0.587 * c.g() as f32 + 0.114 * c.b() as f32) / 255.0;
+    const MIN_LUMA: f32 = 0.5;
+    if luma >= MIN_LUMA { return c; }
+    let mix = ((MIN_LUMA - luma) / (1.0 - luma)).clamp(0.0, 0.8);
+    let lift = |v: u8| (v as f32 + (255.0 - v as f32) * mix) as u8;
+    Color32::from_rgb(lift(c.r()), lift(c.g()), lift(c.b()))
+}
+
+// ── Pop-ups ───────────────────────────────────────────────────────────────────
+/// "🔊 55 %" pill in the top right, with a slim level bar
+fn draw_volume_osd(ctx: &egui::Context, volume: f64, muted: bool, accent: Color32, alpha: f32, fullscreen: bool) {
+    let screen = ctx.screen_rect();
+    // Sit below the window buttons (they aren't shown in fullscreen)
+    let top = if fullscreen { 16.0 } else { WIN_BTN_H + 12.0 };
+    let size = vec2(116.0, 42.0);
+    let rect = Rect::from_min_size(pos2(screen.right() - 16.0 - size.x, screen.top() + top), size);
+
+    let p = ctx.layer_painter(egui::LayerId::new(egui::Order::Tooltip, egui::Id::new("vol_osd")));
+    p.rect_filled(rect, 8.0, Color32::from_rgba_unmultiplied(24, 24, 24, (225.0 * alpha) as u8));
+
+    let white = Color32::WHITE.gamma_multiply(alpha);
+    icon_volume(&p, pos2(rect.left() + 26.0, rect.center().y - 3.0), white, volume, muted);
+    let label = if muted { "Muted".to_owned() } else { format!("{}%", volume.round() as i32) };
+    p.text(
+        pos2(rect.right() - 16.0, rect.center().y - 3.0),
+        Align2::RIGHT_CENTER,
+        label,
+        FontId::new(17.0, FontFamily::Name("semibold".into())),
+        white,
+    );
+
+    let bar = Rect::from_min_max(
+        pos2(rect.left() + 14.0, rect.bottom() - 9.0),
+        pos2(rect.right() - 14.0, rect.bottom() - 6.0),
+    );
+    p.rect_filled(bar, 1.5, VOL_TRACK.gamma_multiply(alpha * 0.6));
+    let frac = if muted { 0.0 } else { (volume / 100.0).clamp(0.0, 1.0) as f32 };
+    p.rect_filled(
+        Rect::from_min_max(bar.min, pos2(bar.left() + bar.width() * frac, bar.max.y)),
+        1.5,
+        accent.gamma_multiply(alpha),
+    );
+}
+
+/// Decoder / video details (toggle with I) — shows whether hardware decoding is active
+fn draw_info_overlay(ctx: &egui::Context, lines: &[String]) {
+    if lines.is_empty() { return; }
+    let p = ctx.layer_painter(egui::LayerId::new(egui::Order::Tooltip, egui::Id::new("info_osd")));
+    let font = FontId::proportional(13.0);
+    let line_h = 20.0;
+    let text_w = lines
+        .iter()
+        .map(|l| p.layout_no_wrap(l.clone(), font.clone(), Color32::WHITE).size().x)
+        .fold(0.0_f32, f32::max);
+    let screen = ctx.screen_rect();
+    let rect = Rect::from_min_size(
+        pos2(screen.left() + 20.0, screen.top() + 64.0),
+        vec2(text_w + 28.0, lines.len() as f32 * line_h + 16.0),
+    );
+    p.rect_filled(rect, 8.0, Color32::from_rgba_unmultiplied(24, 24, 24, 215));
+    for (i, line) in lines.iter().enumerate() {
+        p.text(
+            pos2(rect.left() + 14.0, rect.top() + 8.0 + line_h * (i as f32 + 0.5)),
+            Align2::LEFT_CENTER,
+            line,
+            font.clone(),
+            Color32::WHITE,
+        );
+    }
+}
+
 fn fmt_time(secs: f64) -> String {
     let s = if secs.is_finite() && secs > 0.0 { secs as u64 } else { 0 };
     let (h, m, s) = (s / 3600, (s % 3600) / 60, s % 60);
@@ -1016,14 +1121,19 @@ fn is_video_file(path: &str) -> bool {
 }
 
 fn main() -> eframe::Result<()> {
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_title("Media Player")
+        .with_inner_size([960.0, 540.0])
+        .with_min_inner_size([480.0, 300.0])
+        // We draw our own title bar and window buttons
+        .with_decorations(false)
+        .with_drag_and_drop(true);
+    // Window / taskbar icon
+    if let Ok(icon) = eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png")) {
+        viewport = viewport.with_icon(icon);
+    }
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title("Media Player")
-            .with_inner_size([960.0, 540.0])
-            .with_min_inner_size([480.0, 300.0])
-            // We draw our own title bar and window buttons
-            .with_decorations(false)
-            .with_drag_and_drop(true),
+        viewport,
         renderer: eframe::Renderer::Glow,
         ..Default::default()
     };
