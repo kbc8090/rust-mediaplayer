@@ -32,9 +32,31 @@ unsafe extern "system" {
     fn TerminateProcess(process: isize, exit_code: u32) -> i32;
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct RectI {
+    left: i32,
+    top: i32,
+    right: i32,
+    bottom: i32,
+}
+
+#[repr(C)]
+struct MonitorInfo {
+    size: u32,
+    monitor: RectI,
+    work: RectI,
+    flags: u32,
+}
+
 #[link(name = "user32")]
 unsafe extern "system" {
     fn GetSystemMetrics(index: i32) -> i32;
+    fn GetActiveWindow() -> isize;
+    fn GetWindowRect(hwnd: isize, rect: *mut RectI) -> i32;
+    fn MonitorFromWindow(hwnd: isize, flags: u32) -> isize;
+    fn GetMonitorInfoW(monitor: isize, info: *mut MonitorInfo) -> i32;
+    fn SetWindowPos(hwnd: isize, insert_after: isize, x: i32, y: i32, cx: i32, cy: i32, flags: u32) -> i32;
 }
 
 thread_local! {
@@ -63,6 +85,30 @@ struct WinState {
 
 impl WinState {
     const DEFAULT: WinState = WinState { x: 0.0, y: 0.0, w: 960.0, h: 540.0, ppp: 1.0, maximized: false };
+}
+
+fn settings_path() -> Option<PathBuf> {
+    std::env::var_os("APPDATA").map(|d| PathBuf::from(d).join("rust-mediaplayer").join("settings.txt"))
+}
+
+fn save_settings(volume: i32, muted: bool) {
+    let Some(path) = settings_path() else { return };
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(path, format!("{} {}", volume, muted as u8));
+}
+
+/// (volume 0-100, muted) from last time; 80 % and not muted on first run
+fn load_settings() -> (f64, bool) {
+    let text = settings_path().and_then(|p| std::fs::read_to_string(p).ok()).unwrap_or_default();
+    let mut it = text.split_whitespace();
+    let volume = it.next().and_then(|t| t.parse::<f64>().ok());
+    let muted = it.next().and_then(|t| t.parse::<u8>().ok()) == Some(1);
+    match volume {
+        Some(v) => (v.clamp(0.0, 100.0), muted),
+        None => (80.0, false),
+    }
 }
 
 fn state_path() -> Option<PathBuf> {
@@ -106,16 +152,16 @@ fn load_window_state() -> Option<WinState> {
 // ── Palette ───────────────────────────────────────────────────────────────────
 /// Used only if the Windows accent colour can't be read
 const DEFAULT_ACCENT: Color32 = Color32::from_rgb(0, 120, 212);
-const KNOB_RING:  Color32 = Color32::from_rgb(70, 70, 70);    // dark ring around the knob
+const KNOB_RING:  Color32 = Color32::from_rgb(214, 214, 214); // light ring around the knob
 const TRACK:      Color32 = Color32::from_rgb(190, 184, 180); // unplayed seek track
 const VOL_TRACK:  Color32 = Color32::from_rgb(160, 158, 155); // unplayed volume track
 
 // ── Layout (points) ───────────────────────────────────────────────────────────
 const TOP_H: f32 = 64.0;              // title strip + gradient height
-const BOTTOM_H: f32 = 120.0;          // control area + gradient height
+const BOTTOM_H: f32 = 104.0;          // control area + gradient height
 const SIDE: f32 = 20.0;               // left/right margin of the seek bar
-const SEEK_FROM_BOTTOM: f32 = 69.0;   // seek bar centre line
-const ROW_FROM_BOTTOM: f32 = 33.0;    // button row centre line
+const SEEK_FROM_BOTTOM: f32 = 57.0;   // seek bar centre line
+const ROW_FROM_BOTTOM: f32 = 27.0;    // button row centre line
 const WIN_BTN_W: f32 = 46.0;
 const WIN_BTN_H: f32 = 34.0;
 const MORE_POPUP: &str = "more_popup";
@@ -156,6 +202,12 @@ struct FluentMediaPlayer {
     info_lines: Vec<String>,
     /// Hardware decoding on/off (toggle with H)
     hw_decode: bool,
+    /// Window rectangle (screen pixels) to go back to when leaving fullscreen
+    fs_restore: Option<RectI>,
+    /// Volume / mute: last seen, last written, and when they last changed
+    settings_last: (i32, bool),
+    settings_saved: (i32, bool),
+    settings_changed: std::time::Instant,
     /// Current and last-written window geometry
     win_state: WinState,
     win_saved: WinState,
@@ -166,6 +218,7 @@ impl FluentMediaPlayer {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         install_fonts(&cc.egui_ctx);
         let saved = load_window_state().unwrap_or(WinState::DEFAULT);
+        let (volume, muted) = load_settings();
 
         // video-timing-offset = 0 stops mpv from blocking the UI thread inside
         // render() while it waits for each frame's display time (the default 50 ms
@@ -184,7 +237,8 @@ impl FluentMediaPlayer {
         .expect("Failed to initialize libmpv!");
         let _ = mpv.set_property("osc", "no");
         let _ = mpv.set_property("keep-open", "yes");
-        let _ = mpv.set_property("volume", 80_i64);
+        let _ = mpv.set_property("volume", volume);
+        let _ = mpv.set_property("mute", muted);
         // Let mpv decide its own frame pacing — do NOT tell egui to repaint every frame.
         // Instead we use a channel: mpv signals us when a new frame is ready.
         let _ = mpv.set_property("video-sync", "display-resample");
@@ -207,8 +261,8 @@ impl FluentMediaPlayer {
             is_fullscreen: false,
             time_pos: 0.0,
             duration: 0.0,
-            volume: 80.0,
-            muted: false,
+            volume,
+            muted,
             repeat: false,
             on_top: false,
             speed: 1.0,
@@ -226,6 +280,10 @@ impl FluentMediaPlayer {
             show_info: false,
             info_lines: Vec::new(),
             hw_decode: true,
+            fs_restore: None,
+            settings_last: (volume.round() as i32, muted),
+            settings_saved: (volume.round() as i32, muted),
+            settings_changed: std::time::Instant::now(),
             win_state: saved,
             win_saved: saved,
             win_changed: std::time::Instant::now(),
@@ -282,6 +340,10 @@ impl FluentMediaPlayer {
     fn quit(&mut self) -> ! {
         if self.win_state != self.win_saved {
             save_window_state(&self.win_state);
+        }
+        let cur = (self.volume.round() as i32, self.muted);
+        if cur != self.settings_saved {
+            save_settings(cur.0, cur.1);
         }
         terminate_now()
     }
@@ -382,8 +444,58 @@ impl FluentMediaPlayer {
     }
 
     fn toggle_fullscreen(&mut self, ctx: &egui::Context) {
-        self.is_fullscreen = !self.is_fullscreen;
-        ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.is_fullscreen));
+        if self.is_fullscreen {
+            self.exit_fullscreen(ctx);
+        } else {
+            self.enter_fullscreen(ctx);
+        }
+    }
+
+    /// Our window has no frame, so "fullscreen" is just: cover the whole monitor in one
+    /// single resize. The OS fullscreen mode switch (several style + size changes in a
+    /// row) is what made the picture flicker and lag. Windows hides the taskbar by
+    /// itself for a frameless window that covers its monitor.
+    fn enter_fullscreen(&mut self, ctx: &egui::Context) {
+        unsafe {
+            let hwnd = GetActiveWindow();
+            if hwnd != 0 {
+                let mut window = RectI::default();
+                let mut info = MonitorInfo {
+                    size: std::mem::size_of::<MonitorInfo>() as u32,
+                    monitor: RectI::default(),
+                    work: RectI::default(),
+                    flags: 0,
+                };
+                let monitor = MonitorFromWindow(hwnd, 2); // MONITOR_DEFAULTTONEAREST
+                if monitor != 0 && GetWindowRect(hwnd, &mut window) != 0 && GetMonitorInfoW(monitor, &mut info) != 0 {
+                    self.fs_restore = Some(window);
+                    self.is_fullscreen = true;
+                    let m = info.monitor;
+                    SetWindowPos(hwnd, 0, m.left, m.top, m.right - m.left, m.bottom - m.top, 0x0200); // SWP_NOOWNERZORDER
+                    ctx.request_repaint();
+                    return;
+                }
+            }
+        }
+        // Fallback: let egui/winit do the normal fullscreen switch
+        self.fs_restore = None;
+        self.is_fullscreen = true;
+        ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(true));
+    }
+
+    fn exit_fullscreen(&mut self, ctx: &egui::Context) {
+        self.is_fullscreen = false;
+        if let Some(r) = self.fs_restore.take() {
+            unsafe {
+                let hwnd = GetActiveWindow();
+                if hwnd != 0 {
+                    SetWindowPos(hwnd, 0, r.left, r.top, r.right - r.left, r.bottom - r.top, 0x0200);
+                    ctx.request_repaint();
+                    return;
+                }
+            }
+        }
+        ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
     }
 
     fn toggle_maximize(&mut self, ctx: &egui::Context) {
@@ -464,6 +576,21 @@ impl eframe::App for FluentMediaPlayer {
             }
         }
 
+        // Same for volume / mute
+        let cur = (self.volume.round() as i32, self.muted);
+        if cur != self.settings_last {
+            self.settings_last = cur;
+            self.settings_changed = std::time::Instant::now();
+        }
+        if self.settings_last != self.settings_saved {
+            if self.settings_changed.elapsed() > std::time::Duration::from_secs(1) {
+                save_settings(self.settings_last.0, self.settings_last.1);
+                self.settings_saved = self.settings_last;
+            } else {
+                ctx.request_repaint_after(std::time::Duration::from_millis(1100));
+            }
+        }
+
         // ── Initialize mpv OpenGL render context once GL is ready ─────────────
         if !self.render_ctx_initialized && frame.gl().is_some() {
             let init_params = OpenGLInitParams {
@@ -527,12 +654,15 @@ impl eframe::App for FluentMediaPlayer {
         let near_edge = inp.pointer
             .map_or(false, |p| p.y < TOP_H || p.y > screen.bottom() - BOTTOM_H);
         let menu_open = ctx.memory(|m| m.is_popup_open(egui::Id::new(MORE_POPUP)));
-        self.show_controls = !self.has_file
-            || !self.is_playing
-            || menu_open
-            || near_edge
-            || self.last_mouse_move.elapsed().as_secs_f32() < 2.5;
-        if !self.show_controls {
+        let idle = self.last_mouse_move.elapsed().as_secs_f32();
+        self.show_controls = if self.is_fullscreen && self.has_file {
+            // Fullscreen: everything stays hidden until the mouse goes to the top/bottom edge
+            near_edge || menu_open
+        } else {
+            !self.has_file || !self.is_playing || menu_open || near_edge || idle < 2.5
+        };
+        // Hide the mouse cursor too once it has been still for a moment
+        if !self.show_controls && self.has_file && idle > 2.0 {
             ctx.set_cursor_icon(egui::CursorIcon::None);
         }
 
@@ -562,8 +692,7 @@ impl eframe::App for FluentMediaPlayer {
 
         if inp.f     { self.toggle_fullscreen(ctx); }
         if inp.esc && self.is_fullscreen {
-            self.is_fullscreen = false;
-            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+            self.exit_fullscreen(ctx);
         }
 
         // ── Resize from the window edges (we have no OS frame) ────────────────
@@ -823,6 +952,17 @@ fn icon_more(p: &egui::Painter, c: Pos2, col: Color32) {
     }
 }
 
+/// Slider thumb: light ring with an accent dot, both circles share one centre that is
+/// snapped to the physical pixel grid so the dot can never look off-centre.
+fn draw_knob(p: &egui::Painter, ppp: f32, centre: Pos2, hot: bool, accent: Color32, t: f32) {
+    let snap = |v: f32| (v * ppp).round() / ppp;
+    let c = pos2(snap(centre.x), snap(centre.y));
+    let (ring, dot) = if hot { (8.5, 5.0) } else { (7.5, 4.2) };
+    p.circle_filled(pos2(c.x, c.y + 1.0), ring + 1.0, Color32::from_black_alpha((90.0 * t) as u8));
+    p.circle_filled(c, ring, KNOB_RING.gamma_multiply(t));
+    p.circle_filled(c, dot, accent);
+}
+
 // ── Title bar (overlaid on the video) ─────────────────────────────────────────
 fn draw_top_bar(app: &mut FluentMediaPlayer, ctx: &egui::Context, t: f32) {
     let screen = ctx.screen_rect();
@@ -856,10 +996,10 @@ fn draw_top_bar(app: &mut FluentMediaPlayer, ctx: &egui::Context, t: f32) {
             }
 
             // Left: file name
-            let y = 29.0;
+            let y = 28.0;
             let right_limit = if fullscreen { screen.right() - 20.0 } else { screen.right() - WIN_BTN_W * 3.0 - 10.0 };
             let clip = p.with_clip_rect(Rect::from_min_max(pos2(20.0, 0.0), pos2(right_limit, TOP_H)));
-            let font = FontId::new(17.0, FontFamily::Name("semibold".into()));
+            let font = FontId::new(14.5, FontFamily::Name("semibold".into()));
             clip.text(pos2(21.0, y + 1.0), Align2::LEFT_CENTER, &title, font.clone(), black(170, t));
             clip.text(pos2(20.0, y), Align2::LEFT_CENTER, &title, font, white);
 
@@ -959,9 +1099,7 @@ fn draw_bottom_bar(app: &mut FluentMediaPlayer, ctx: &egui::Context, t: f32) {
                 Rect::from_min_max(pos2(sr.left(), seek_y - 1.5), pos2(fill_x, seek_y + 1.5)),
                 1.0, accent,
             );
-            let (ro, ri) = if hot { (9.0, 5.0) } else { (8.0, 4.5) };
-            p.circle_filled(pos2(fill_x, seek_y), ro, KNOB_RING.gamma_multiply(t));
-            p.circle_filled(pos2(fill_x, seek_y), ri, accent);
+            draw_knob(&p, ctx.pixels_per_point(), pos2(fill_x, seek_y), hot, accent, t);
 
             // Hover / drag time preview
             let preview = if dragging { app.drag_frac }
@@ -1035,9 +1173,7 @@ fn draw_bottom_bar(app: &mut FluentMediaPlayer, ctx: &egui::Context, t: f32) {
                 Rect::from_min_max(pos2(vl, row_y - 1.5), pos2(vl + vw * vf, row_y + 1.5)),
                 1.0, accent,
             );
-            let (ro, ri) = if vhot { (8.0, 4.5) } else { (7.0, 4.0) };
-            p.circle_filled(pos2(vl + vw * vf, row_y), ro, KNOB_RING.gamma_multiply(t));
-            p.circle_filled(pos2(vl + vw * vf, row_y), ri, accent);
+            draw_knob(&p, ctx.pixels_per_point(), pos2(vl + vw * vf, row_y), vhot, accent, t);
 
             // Right-hand buttons
             let tint = |on: bool| if on { accent } else { white };
