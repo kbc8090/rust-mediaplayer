@@ -112,6 +112,8 @@ struct Settings {
     muted: bool,
     repeat: bool,
     on_top: bool,
+    /// Hardware decoding (H). Off by default, like mpv itself.
+    hwdec: bool,
 }
 
 fn save_settings(st: &Settings) {
@@ -121,7 +123,10 @@ fn save_settings(st: &Settings) {
     }
     let _ = std::fs::write(
         path,
-        format!("{} {} {} {}", st.volume, st.muted as u8, st.repeat as u8, st.on_top as u8),
+        format!(
+            "{} {} {} {} {}",
+            st.volume, st.muted as u8, st.repeat as u8, st.on_top as u8, st.hwdec as u8
+        ),
     );
 }
 
@@ -132,12 +137,13 @@ fn load_settings() -> Settings {
     let mut it = text.split_whitespace();
     let volume = it.next().and_then(|t| t.parse::<f64>().ok());
     let mut flag = || it.next().and_then(|t| t.parse::<u8>().ok()) == Some(1);
-    let (muted, repeat, on_top) = (flag(), flag(), flag());
+    let (muted, repeat, on_top, hwdec) = (flag(), flag(), flag(), flag());
     Settings {
         volume: volume.map_or(80.0, |v| v.clamp(0.0, VOL_MAX)).round() as i32,
         muted,
         repeat,
         on_top,
+        hwdec,
     }
 }
 
@@ -304,10 +310,10 @@ impl FluentMediaPlayer {
                 let _ = init.set_property("log-file", log.to_string_lossy().as_ref());
             }
             let _ = init.set_property("video-timing-offset", 0.0_f64);
-            // Hardware decoding with copy-back: the GPU decodes, frames are copied to
-            // system memory and uploaded as normal textures. The direct GPU-sharing
-            // modes ("auto") can show corrupted frames with OpenGL on some drivers.
-            let _ = init.set_property("hwdec", "auto-copy");
+            // Decoding: software by default (mpv's own default, and the newer mpv's
+            // hardware decoder garbled frames on this setup). H switches to hardware
+            // decoding with copy-back ("auto-copy"); the choice is remembered.
+            let _ = init.set_property("hwdec", if st.hwdec { "auto-copy" } else { "no" });
             // Don't decode straight into GPU-mapped buffers (another known source of
             // garbled frames on some drivers).
             let _ = init.set_property("vd-lavc-dr", "no");
@@ -315,7 +321,7 @@ impl FluentMediaPlayer {
             // newer mpv runs the hardware decoder multithreaded, which produced
             // garbled blocks with copy-back decoding on AMD. (Software decoding gets
             // automatic threads again, see toggle_hw_decode.)
-            let _ = init.set_property("vd-lavc-threads", 1_i64);
+            let _ = init.set_property("vd-lavc-threads", if st.hwdec { "1" } else { "0" });
             // Subtitles start off; the captions button turns them on
             let _ = init.set_property("sid", "no");
             let _ = init.set_property("volume-max", VOL_MAX);
@@ -374,7 +380,7 @@ impl FluentMediaPlayer {
             volume_osd: None,
             show_info: false,
             info_lines: Vec::new(),
-            hw_decode: true,
+            hw_decode: st.hwdec,
             startup_file,
             start_max: saved.maximized,
             start_max_done: false,
@@ -444,7 +450,7 @@ impl FluentMediaPlayer {
         self.hw_decode = !self.hw_decode;
         if let Ok(mpv) = self.mpv.lock() {
             // Threads must be set before the decoder is re-opened by the hwdec change
-            let _ = mpv.set_property("vd-lavc-threads", if self.hw_decode { 1_i64 } else { 0_i64 });
+            let _ = mpv.set_property("vd-lavc-threads", if self.hw_decode { "1" } else { "0" });
             let _ = mpv.set_property("hwdec", if self.hw_decode { "auto-copy" } else { "no" });
         }
         self.show_info = true;
@@ -486,6 +492,7 @@ impl FluentMediaPlayer {
             muted: self.muted,
             repeat: self.repeat,
             on_top: self.on_top,
+            hwdec: self.hw_decode,
         }
     }
 
