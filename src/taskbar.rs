@@ -354,11 +354,13 @@ pub fn take_forwarded() -> Option<String> {
 /// Called at startup, before any window exists. If the player is already running,
 /// hand it `file` (it opens it in place of what's playing), bring it to the front and
 /// return true: this process should then just exit.
-pub fn forward_to_running_instance(file: Option<&str>) -> bool {
+/// With `forward` false (multiple windows allowed) it never hands over, but still
+/// marks this player as running for later launches.
+pub fn forward_to_running_instance(file: Option<&str>, forward: bool) -> bool {
     unsafe {
         // The mutex lives as long as this process; a second process finds it taken
         let mutex = CreateMutexW(std::ptr::null(), 0, wide("Local\\RustMediaPlayer.SingleWindow").as_ptr());
-        if mutex == 0 || GetLastError() != 183 /* ERROR_ALREADY_EXISTS */ {
+        if !forward || mutex == 0 || GetLastError() != 183 /* ERROR_ALREADY_EXISTS */ {
             return false;
         }
         // The other player may still be starting up: give its window a moment

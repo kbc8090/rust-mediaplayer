@@ -126,6 +126,11 @@ struct Settings {
     sort_desc: bool,
     /// Window edges snap to the screen edges (menu). On by default.
     snap: bool,
+    /// Opening a file starts another player window instead of reusing this one
+    /// (menu). Off by default.
+    multi: bool,
+    /// Even out loud and quiet parts (menu). Off by default.
+    normalize: bool,
 }
 
 /// Order of the files that previous / next step through, like Explorer's "Sort by"
@@ -165,9 +170,9 @@ fn save_settings(st: &Settings) {
     let _ = std::fs::write(
         path,
         format!(
-            "{} {} {} {} {} {} {} {} {}",
+            "{} {} {} {} {} {} {} {} {} {} {}",
             st.volume, st.muted as u8, st.repeat as u8, st.on_top as u8, st.hwdec as u8, st.autoplay as u8,
-            st.sort_by.code(), st.sort_desc as u8, st.snap as u8
+            st.sort_by.code(), st.sort_desc as u8, st.snap as u8, st.multi as u8, st.normalize as u8
         ),
     );
 }
@@ -183,6 +188,8 @@ fn load_settings() -> Settings {
     let sort_by = SortBy::from_code(it.next().and_then(|t| t.parse::<u8>().ok()).unwrap_or(0));
     let sort_desc = it.next().and_then(|t| t.parse::<u8>().ok()) == Some(1);
     let snap = it.next().and_then(|t| t.parse::<u8>().ok()) != Some(0);
+    let multi = it.next().and_then(|t| t.parse::<u8>().ok()) == Some(1);
+    let normalize = it.next().and_then(|t| t.parse::<u8>().ok()) == Some(1);
     Settings {
         volume: volume.map_or(80.0, |v| v.clamp(0.0, VOL_MAX)).round() as i32,
         muted,
@@ -193,6 +200,8 @@ fn load_settings() -> Settings {
         sort_by,
         sort_desc,
         snap,
+        multi,
+        normalize,
     }
 }
 
@@ -266,6 +275,10 @@ enum SeekOsd {
     Step(f64),
     Drag(f64),
 }
+/// Volume normalizer: FFmpeg's "dynamic audio normalizer" (built into mpv). It looks
+/// ~1 s ahead and smoothly raises quiet passages / lowers loud ones, so dialogue and
+/// explosions (or songs from different albums) come out at a more even level.
+const NORMALIZER: &str = "lavfi=[dynaudnorm=f=150:g=15]";
 /// Highest volume (percent). mpv allows up to 130 by default.
 const VOL_MAX: f64 = 130.0;
 
@@ -375,6 +388,10 @@ struct FluentMediaPlayer {
     mirror: bool,
     /// Window edges snap to the screen edges
     snap: bool,
+    /// Multiple player windows allowed (takes effect for the next file opened from Explorer)
+    multi: bool,
+    /// Volume normalizer on
+    normalize: bool,
 }
 
 /// Buttons fire when the mouse button is released anywhere over them, like Windows'
@@ -463,6 +480,9 @@ impl FluentMediaPlayer {
         .expect("Failed to initialize libmpv!");
         let _ = mpv.set_property("osc", "no");
         let _ = mpv.set_property("keep-open", "yes");
+        if st.normalize {
+            let _ = mpv.set_property("af", NORMALIZER);
+        }
         let _ = mpv.set_property("volume", volume);
         let _ = mpv.set_property("mute", muted);
         if st.repeat {
@@ -551,6 +571,8 @@ impl FluentMediaPlayer {
             rotation: 0,
             mirror: false,
             snap: st.snap,
+            multi: st.multi,
+            normalize: st.normalize,
         }
     }
 
@@ -616,6 +638,16 @@ impl FluentMediaPlayer {
             let current = PathBuf::from(&self.current_file);
             sort_files(&mut self.folder_files, by, desc);
             self.folder_index = self.folder_files.iter().position(|p| *p == current);
+        }
+    }
+
+    /// Volume normalizer on / off
+    fn toggle_normalize(&mut self) {
+        self.normalize = !self.normalize;
+        if self.normalize {
+            self.link.command("af", &["set", NORMALIZER]);
+        } else {
+            self.link.command("af", &["clr", ""]);
         }
     }
 
@@ -708,6 +740,8 @@ impl FluentMediaPlayer {
             sort_by: self.sort_by,
             sort_desc: self.sort_desc,
             snap: self.snap,
+            multi: self.multi,
+            normalize: self.normalize,
         }
     }
 
@@ -2488,7 +2522,9 @@ fn draw_main_menu(app: &mut FluentMediaPlayer, ctx: &egui::Context) {
         MenuRow::Item { key: "open", label: "Open file\u{2026}", hint: Some("Ctrl+O"), mark: Mark::None },
         MenuRow::Sep,
         MenuRow::Item { key: "autoplay", label: "Auto-play next file in folder", hint: None, mark: Mark::Check(app.autoplay) },
+        MenuRow::Item { key: "normalize", label: "Normalize volume", hint: None, mark: Mark::Check(app.normalize) },
         MenuRow::Item { key: "snap", label: "Snap to screen edges", hint: None, mark: Mark::Check(app.snap) },
+        MenuRow::Item { key: "multi", label: "Allow multiple windows", hint: None, mark: Mark::Check(app.multi) },
         MenuRow::Sep,
         MenuRow::Header("Previous / next order"),
     ];
@@ -2593,6 +2629,8 @@ fn draw_main_menu(app: &mut FluentMediaPlayer, ctx: &egui::Context) {
     match picked {
         Some("open") => app.show_open_dialog(),
         Some("autoplay") => app.autoplay = !app.autoplay,
+        Some("normalize") => app.toggle_normalize(),
+        Some("multi") => app.multi = !app.multi,
         Some("snap") => {
             app.snap = !app.snap;
             taskbar::set_snap(app.snap);
@@ -2771,7 +2809,8 @@ fn main() -> eframe::Result<()> {
         .map(PathBuf::from)
         .find(|p| p.is_file())
         .map(|p| p.to_string_lossy().into_owned());
-    if taskbar::forward_to_running_instance(arg_file.as_deref()) {
+    // (unless multiple windows are allowed in the menu)
+    if taskbar::forward_to_running_instance(arg_file.as_deref(), !load_settings().multi) {
         return Ok(());
     }
 
