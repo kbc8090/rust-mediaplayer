@@ -173,6 +173,8 @@ unsafe extern "system" {
         result: *mut usize,
     ) -> isize;
     fn SetForegroundWindow(hwnd: isize) -> i32;
+    fn MonitorFromRect(rect: *const RectI, flags: u32) -> isize;
+    fn GetDpiForWindow(hwnd: isize) -> u32;
 }
 
 #[link(name = "kernel32")]
@@ -189,6 +191,7 @@ unsafe extern "system" {
 #[link(name = "dwmapi")]
 unsafe extern "system" {
     fn DwmSetWindowAttribute(hwnd: isize, attribute: u32, value: *const c_void, size: u32) -> i32;
+    fn DwmGetWindowAttribute(hwnd: isize, attribute: u32, value: *mut c_void, size: u32) -> i32;
 }
 
 #[link(name = "gdi32")]
@@ -204,6 +207,8 @@ const WM_COMMAND: u32 = 0x0111;
 const WM_COPYDATA: u32 = 0x004A;
 const WM_KEYDOWN: u32 = 0x0100;
 const WM_APPCOMMAND: u32 = 0x0319;
+const WM_MOVING: u32 = 0x0216;
+const WM_SIZING: u32 = 0x0214;
 /// Marks our WM_COPYDATA messages ("RMP1")
 const COPYDATA_MAGIC: usize = 0x524D_5031;
 const WM_TIMER: u32 = 0x0113;
@@ -370,6 +375,67 @@ pub fn forward_to_running_instance(file: Option<&str>) -> bool {
         }
         SetForegroundWindow(hwnd);
         true
+    }
+}
+
+// ── Snap to screen edges ──────────────────────────────────────────────────────
+static SNAP: AtomicBool = AtomicBool::new(true);
+
+/// Moving / resizing the window pulls its edges onto the screen's edges when they
+/// come within 8 px (menu setting)
+pub fn set_snap(on: bool) {
+    SNAP.store(on, Ordering::Relaxed);
+}
+
+/// Adjust the proposed window rectangle of a move (`sizing` = None) or a resize
+/// (`sizing` = which edge is being dragged, WMSZ_*)
+unsafe fn snap_rect(hwnd: isize, r: &mut RectI, sizing: Option<usize>) {
+    let mut mi: MonitorInfo = std::mem::zeroed();
+    mi.size = std::mem::size_of::<MonitorInfo>() as u32;
+    if GetMonitorInfoW(MonitorFromRect(r, 2 /* MONITOR_DEFAULTTONEAREST */), &mut mi) == 0 {
+        return;
+    }
+    // The screen area without the taskbar
+    let w = mi.work;
+    // Any invisible border around the window shouldn't count: snap what you see
+    let (mut il, mut it, mut ir, mut ib) = (0, 0, 0, 0);
+    let (mut win, mut vis) = (RectI::default(), RectI::default());
+    if GetWindowRect(hwnd, &mut win) != 0
+        && DwmGetWindowAttribute(hwnd, 9 /* DWMWA_EXTENDED_FRAME_BOUNDS */, &mut vis as *mut RectI as *mut c_void, 16) == 0
+    {
+        (il, it, ir, ib) = (vis.left - win.left, vis.top - win.top, win.right - vis.right, win.bottom - vis.bottom);
+        if il.abs() > 32 || it.abs() > 32 || ir.abs() > 32 || ib.abs() > 32 {
+            (il, it, ir, ib) = (0, 0, 0, 0);
+        }
+    }
+    let (l, t, rt, b) = (r.left + il, r.top + it, r.right - ir, r.bottom - ib);
+    // 8 px at 100 % display scaling, more on high-DPI screens
+    let reach = (8 * GetDpiForWindow(hwnd).max(96) as i32 + 48) / 96;
+    let pull = |edge: i32, target: i32| ((edge - target).abs() <= reach).then_some(target - edge);
+    match sizing {
+        None => {
+            let dx = pull(l, w.left).or_else(|| pull(rt, w.right)).unwrap_or(0);
+            let dy = pull(t, w.top).or_else(|| pull(b, w.bottom)).unwrap_or(0);
+            r.left += dx;
+            r.right += dx;
+            r.top += dy;
+            r.bottom += dy;
+        }
+        // WMSZ_LEFT 1, RIGHT 2, TOP 3, TOPLEFT 4, TOPRIGHT 5, BOTTOM 6, BOTTOMLEFT 7, BOTTOMRIGHT 8
+        Some(edge) => {
+            if matches!(edge, 1 | 4 | 7) {
+                r.left += pull(l, w.left).unwrap_or(0);
+            }
+            if matches!(edge, 2 | 5 | 8) {
+                r.right += pull(rt, w.right).unwrap_or(0);
+            }
+            if matches!(edge, 3 | 4 | 5) {
+                r.top += pull(t, w.top).unwrap_or(0);
+            }
+            if matches!(edge, 6 | 7 | 8) {
+                r.bottom += pull(b, w.bottom).unwrap_or(0);
+            }
+        }
     }
 }
 
@@ -632,6 +698,10 @@ unsafe extern "system" fn subclass_proc(
     _subclass_id: usize,
     _ref_data: usize,
 ) -> isize {
+    if (msg == WM_MOVING || msg == WM_SIZING) && lparam != 0 && SNAP.load(Ordering::Relaxed) {
+        // (then carries on to the normal handling with the adjusted rectangle)
+        snap_rect(hwnd, &mut *(lparam as *mut RectI), (msg == WM_SIZING).then_some(wparam));
+    }
     if msg == WM_COPYDATA && lparam != 0 {
         let cds = &*(lparam as *const CopyDataStruct);
         if cds.data == COPYDATA_MAGIC {

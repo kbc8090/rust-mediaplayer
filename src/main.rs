@@ -124,6 +124,8 @@ struct Settings {
     /// Order of previous / next in a folder (menu)
     sort_by: SortBy,
     sort_desc: bool,
+    /// Window edges snap to the screen edges (menu). On by default.
+    snap: bool,
 }
 
 /// Order of the files that previous / next step through, like Explorer's "Sort by"
@@ -163,9 +165,9 @@ fn save_settings(st: &Settings) {
     let _ = std::fs::write(
         path,
         format!(
-            "{} {} {} {} {} {} {} {}",
+            "{} {} {} {} {} {} {} {} {}",
             st.volume, st.muted as u8, st.repeat as u8, st.on_top as u8, st.hwdec as u8, st.autoplay as u8,
-            st.sort_by.code(), st.sort_desc as u8
+            st.sort_by.code(), st.sort_desc as u8, st.snap as u8
         ),
     );
 }
@@ -180,6 +182,7 @@ fn load_settings() -> Settings {
     let (muted, repeat, on_top, hwdec, autoplay) = (flag(), flag(), flag(), flag(), flag());
     let sort_by = SortBy::from_code(it.next().and_then(|t| t.parse::<u8>().ok()).unwrap_or(0));
     let sort_desc = it.next().and_then(|t| t.parse::<u8>().ok()) == Some(1);
+    let snap = it.next().and_then(|t| t.parse::<u8>().ok()) != Some(0);
     Settings {
         volume: volume.map_or(80.0, |v| v.clamp(0.0, VOL_MAX)).round() as i32,
         muted,
@@ -189,6 +192,7 @@ fn load_settings() -> Settings {
         autoplay,
         sort_by,
         sort_desc,
+        snap,
     }
 }
 
@@ -369,6 +373,8 @@ struct FluentMediaPlayer {
     /// mirrored left-right. Both go back to normal for the next file.
     rotation: i32,
     mirror: bool,
+    /// Window edges snap to the screen edges
+    snap: bool,
 }
 
 /// Buttons fire when the mouse button is released anywhere over them, like Windows'
@@ -401,6 +407,7 @@ fn gl_proc_address(_ctx: &*mut std::ffi::c_void, name: &str) -> *mut std::ffi::c
 impl FluentMediaPlayer {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let caption_font = install_fonts(&cc.egui_ctx);
+        taskbar::set_snap(load_settings().snap);
         let saved = load_window_state().unwrap_or(WinState::DEFAULT);
         let st = load_settings();
         let (volume, muted) = (st.volume as f64, st.muted);
@@ -543,6 +550,7 @@ impl FluentMediaPlayer {
             sort_desc: st.sort_desc,
             rotation: 0,
             mirror: false,
+            snap: st.snap,
         }
     }
 
@@ -699,6 +707,7 @@ impl FluentMediaPlayer {
             autoplay: self.autoplay,
             sort_by: self.sort_by,
             sort_desc: self.sort_desc,
+            snap: self.snap,
         }
     }
 
@@ -1747,7 +1756,7 @@ fn draw_top_bar(app: &mut FluentMediaPlayer, ctx: &egui::Context, t: f32) {
             }
 
             // (text centred on its line box sits a little low next to the icon)
-            let y = MENU_Y - 2.0;
+            let y = MENU_Y - 1.0;
             let right_limit = if fullscreen { screen.right() - 20.0 } else { screen.right() - WIN_BTN_W * 3.0 - 10.0 };
             let tx = MENU_X + BTN_BOX / 2.0 + 8.0;
             let clip = p.with_clip_rect(Rect::from_min_max(pos2(tx, 0.0), pos2(right_limit, TOP_H)));
@@ -1951,8 +1960,8 @@ fn draw_bottom_bar(app: &mut FluentMediaPlayer, ctx: &egui::Context, t: f32) {
                     for (e, a) in [(1.0, 60.0), (2.5, 30.0), (4.0, 14.0)] {
                         tp.rect_filled(tr.expand(e), 4.0 + e, Color32::from_black_alpha((a * t) as u8));
                     }
-                    app.thumbs.paint(&tp, tr, 2.0);
-                    tp.rect_stroke(tr.expand(0.5), 2.5, Stroke::new(1.0_f32, { let a = (70.0 * t) as u8; Color32::from_rgba_premultiplied(a, a, a, a) }));
+                    app.thumbs.paint(&tp, tr, 4.0);
+                    tp.rect_stroke(tr.expand(0.5), 4.5, Stroke::new(1.0_f32, { let a = (70.0 * t) as u8; Color32::from_rgba_premultiplied(a, a, a, a) }));
                 }
             }
 
@@ -2479,6 +2488,7 @@ fn draw_main_menu(app: &mut FluentMediaPlayer, ctx: &egui::Context) {
         MenuRow::Item { key: "open", label: "Open file\u{2026}", hint: Some("Ctrl+O"), mark: Mark::None },
         MenuRow::Sep,
         MenuRow::Item { key: "autoplay", label: "Auto-play next file in folder", hint: None, mark: Mark::Check(app.autoplay) },
+        MenuRow::Item { key: "snap", label: "Snap to screen edges", hint: None, mark: Mark::Check(app.snap) },
         MenuRow::Sep,
         MenuRow::Header("Previous / next order"),
     ];
@@ -2576,13 +2586,17 @@ fn draw_main_menu(app: &mut FluentMediaPlayer, ctx: &egui::Context) {
         });
     ctx.move_to_top(egui::LayerId::new(egui::Order::Foreground, id));
 
-    // Settings keep the menu open (so the change can be seen); "Open file…" closes it
+    // Any choice closes the menu
+    if picked.is_some() {
+        app.main_menu = false;
+    }
     match picked {
-        Some("open") => {
-            app.main_menu = false;
-            app.show_open_dialog();
-        }
+        Some("open") => app.show_open_dialog(),
         Some("autoplay") => app.autoplay = !app.autoplay,
+        Some("snap") => {
+            app.snap = !app.snap;
+            taskbar::set_snap(app.snap);
+        }
         Some("asc") => app.set_sort(app.sort_by, false),
         Some("desc") => app.set_sort(app.sort_by, true),
         Some(key) => {
