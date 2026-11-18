@@ -110,6 +110,18 @@ impl Thumbs {
         }
     }
 
+    /// Turn / mirror the thumbnails like the main picture
+    pub fn set_view(&self, rotation: i32, mirror: bool) {
+        if let Some((_, link)) = &self.mpv {
+            link.set("video-rotate", rotation);
+            if mirror {
+                link.command("vf", &["set", "lavfi=[hflip]"]);
+            } else {
+                link.command("vf", &["clr", ""]);
+            }
+        }
+    }
+
     /// Width / height of the current video, once the thumbnail player has it
     /// (None for audio-only files, or while still opening)
     pub fn aspect(&self) -> Option<f32> {

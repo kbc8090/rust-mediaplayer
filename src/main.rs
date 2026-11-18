@@ -121,6 +121,38 @@ struct Settings {
     hwdec: bool,
     /// Play the next video in the folder when one ends (menu). Off by default.
     autoplay: bool,
+    /// Order of previous / next in a folder (menu)
+    sort_by: SortBy,
+    sort_desc: bool,
+}
+
+/// Order of the files that previous / next step through, like Explorer's "Sort by"
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum SortBy {
+    Name,
+    Modified,
+    Created,
+    Size,
+}
+
+impl SortBy {
+    fn code(self) -> u8 {
+        match self {
+            SortBy::Name => 0,
+            SortBy::Modified => 1,
+            SortBy::Created => 2,
+            SortBy::Size => 3,
+        }
+    }
+
+    fn from_code(c: u8) -> Self {
+        match c {
+            1 => SortBy::Modified,
+            2 => SortBy::Created,
+            3 => SortBy::Size,
+            _ => SortBy::Name,
+        }
+    }
 }
 
 fn save_settings(st: &Settings) {
@@ -131,8 +163,9 @@ fn save_settings(st: &Settings) {
     let _ = std::fs::write(
         path,
         format!(
-            "{} {} {} {} {} {}",
-            st.volume, st.muted as u8, st.repeat as u8, st.on_top as u8, st.hwdec as u8, st.autoplay as u8
+            "{} {} {} {} {} {} {} {}",
+            st.volume, st.muted as u8, st.repeat as u8, st.on_top as u8, st.hwdec as u8, st.autoplay as u8,
+            st.sort_by.code(), st.sort_desc as u8
         ),
     );
 }
@@ -145,6 +178,8 @@ fn load_settings() -> Settings {
     let volume = it.next().and_then(|t| t.parse::<f64>().ok());
     let mut flag = || it.next().and_then(|t| t.parse::<u8>().ok()) == Some(1);
     let (muted, repeat, on_top, hwdec, autoplay) = (flag(), flag(), flag(), flag(), flag());
+    let sort_by = SortBy::from_code(it.next().and_then(|t| t.parse::<u8>().ok()).unwrap_or(0));
+    let sort_desc = it.next().and_then(|t| t.parse::<u8>().ok()) == Some(1);
     Settings {
         volume: volume.map_or(80.0, |v| v.clamp(0.0, VOL_MAX)).round() as i32,
         muted,
@@ -152,6 +187,8 @@ fn load_settings() -> Settings {
         on_top,
         hwdec,
         autoplay,
+        sort_by,
+        sort_desc,
     }
 }
 
@@ -325,6 +362,13 @@ struct FluentMediaPlayer {
     menu_anchor: Rect,
     /// Previous frame, for moving the time display on smoothly
     last_tick: std::time::Instant,
+    /// Order of previous / next in a folder
+    sort_by: SortBy,
+    sort_desc: bool,
+    /// Picture turned clockwise by this many degrees (0 / 90 / 180 / 270), and
+    /// mirrored left-right. Both go back to normal for the next file.
+    rotation: i32,
+    mirror: bool,
 }
 
 /// Buttons fire when the mouse button is released anywhere over them, like Windows'
@@ -495,6 +539,10 @@ impl FluentMediaPlayer {
             main_menu: false,
             menu_anchor: Rect::NOTHING,
             last_tick: std::time::Instant::now(),
+            sort_by: st.sort_by,
+            sort_desc: st.sort_desc,
+            rotation: 0,
+            mirror: false,
         }
     }
 
@@ -511,7 +559,7 @@ impl FluentMediaPlayer {
             self.load_entry(&first);
         } else {
             self.playlist = None;
-            self.folder_files = scan_folder(Path::new(path));
+            self.folder_files = scan_folder(Path::new(path), self.sort_by, self.sort_desc);
             self.folder_index = self.folder_files.iter().position(|p| p == Path::new(path));
             self.load_entry(path);
         }
@@ -521,6 +569,11 @@ impl FluentMediaPlayer {
     fn load_entry(&mut self, path: &str) {
         self.current_file = path.to_owned();
         self.has_file = true;
+        if self.rotation != 0 || self.mirror {
+            self.rotation = 0;
+            self.mirror = false;
+            self.apply_view();
+        }
         // Back to "subtitles off" for every new file, even if they were switched on
         // for the previous one
         self.link.set("sid", "no");
@@ -545,6 +598,47 @@ impl FluentMediaPlayer {
         } else {
             self.startup_file = Some(path);
         }
+    }
+
+    /// New previous / next order (menu): re-sort the current folder right away
+    fn set_sort(&mut self, by: SortBy, desc: bool) {
+        self.sort_by = by;
+        self.sort_desc = desc;
+        if self.playlist.is_none() && self.has_file {
+            let current = PathBuf::from(&self.current_file);
+            sort_files(&mut self.folder_files, by, desc);
+            self.folder_index = self.folder_files.iter().position(|p| *p == current);
+        }
+    }
+
+    /// Turn the picture another 90° clockwise
+    fn rotate_90(&mut self) {
+        if !self.has_file {
+            return;
+        }
+        self.rotation = (self.rotation + 90) % 360;
+        self.apply_view();
+    }
+
+    /// Mirror the picture left-right (a left-handed golf swing becomes right-handed)
+    fn toggle_mirror(&mut self) {
+        if !self.has_file {
+            return;
+        }
+        self.mirror = !self.mirror;
+        self.apply_view();
+    }
+
+    /// Send rotation / mirroring to mpv (and the thumbnail player, so previews match)
+    fn apply_view(&mut self) {
+        // video-rotate adds to any rotation the file itself asks for (phone videos)
+        self.link.set("video-rotate", self.rotation);
+        if self.mirror {
+            self.link.command("vf", &["set", "lavfi=[hflip]"]);
+        } else {
+            self.link.command("vf", &["clr", ""]);
+        }
+        self.thumbs.set_view(self.rotation, self.mirror);
     }
 
     /// Windows' "Open" dialog, starting in the current video's folder
@@ -603,6 +697,8 @@ impl FluentMediaPlayer {
             on_top: self.on_top,
             hwdec: self.hw_decode,
             autoplay: self.autoplay,
+            sort_by: self.sort_by,
+            sort_desc: self.sort_desc,
         }
     }
 
@@ -1060,6 +1156,7 @@ impl eframe::App for FluentMediaPlayer {
             hw:    i.key_pressed(egui::Key::H),
             esc:   i.key_pressed(egui::Key::Escape),
             open:  i.modifiers.ctrl && i.key_pressed(egui::Key::O),
+            rotate: !i.modifiers.ctrl && i.key_pressed(egui::Key::R),
             scroll_y: i.raw_scroll_delta.y,
             pressed: i.pointer.primary_pressed(),
             moved: i.pointer.delta().length_sq() > 0.5,
@@ -1113,6 +1210,7 @@ impl eframe::App for FluentMediaPlayer {
         if inp.info  { self.show_info = !self.show_info; }
         if inp.hw    { self.toggle_hw_decode(); }
         if inp.open  { self.main_menu = false; self.show_open_dialog(); }
+        if inp.rotate { self.rotate_90(); }
 
 
         // Mouse wheel anywhere in the window = volume, 5 % per notch
@@ -1257,7 +1355,7 @@ impl eframe::App for FluentMediaPlayer {
 struct InputSnapshot {
     dropped: Vec<String>,
     space: bool, right: bool, left: bool, up: bool, down: bool,
-    f: bool, m: bool, n: bool, p: bool, info: bool, hw: bool, esc: bool, open: bool,
+    f: bool, m: bool, n: bool, p: bool, info: bool, hw: bool, esc: bool, open: bool, rotate: bool,
     scroll_y: f32,
     pressed: bool,
     moved: bool, active: bool,
@@ -1524,6 +1622,45 @@ fn icon_fullscreen(p: &egui::Painter, c: Pos2, col: Color32) {
     kpoly(p, c, &[(6.5, -1.5), (6.5, -6.5), (1.5, -6.5)], col, SW);
     kpoly(p, c, &[(-6.5, 1.5), (-6.5, 6.5), (-1.5, 6.5)], col, SW);
 }
+/// Rotate: a curved arrow turning clockwise over a small rectangle
+fn icon_rotate(p: &egui::Painter, c: Pos2, col: Color32) {
+    let c = pos2(c.x, c.y - 1.5 * K);
+    p.rect_stroke(
+        Rect::from_min_max(pos2(c.x - 7.5 * K, c.y), pos2(c.x - 0.5 * K, c.y + 8.0 * K)),
+        1.5,
+        Stroke::new(SW, col),
+    );
+    let (ox, oy, r) = (0.5_f32, 1.5_f32, 6.5_f32);
+    let arc: Vec<(f32, f32)> = (0..=16)
+        .map(|i| {
+            let a = (225.0 + 130.0 * i as f32 / 16.0_f32).to_radians();
+            (ox + r * a.cos(), oy + r * a.sin())
+        })
+        .collect();
+    kpoly(p, c, &arc, col, SW);
+    // arrowhead at the end, pointing down (the way the arc turns)
+    let (ex, ey) = *arc.last().unwrap();
+    kpoly(p, c, &[(ex - 2.8, ey - 2.2), (ex, ey + 0.6), (ex + 2.6, ey - 2.4)], col, SW);
+}
+
+/// Mirror: two triangles facing each other across a dashed line
+fn icon_mirror(p: &egui::Painter, c: Pos2, col: Color32) {
+    for i in 0..4 {
+        let y0 = -8.0 + i as f32 * 4.5;
+        kpoly(p, c, &[(0.0, y0), (0.0, y0 + 2.2)], col, SW);
+    }
+    p.add(egui::Shape::convex_polygon(
+        vec![
+            pos2(c.x - 2.5 * K, c.y - 6.0 * K),
+            pos2(c.x - 2.5 * K, c.y + 6.0 * K),
+            pos2(c.x - 8.5 * K, c.y + 6.0 * K),
+        ],
+        col,
+        Stroke::NONE,
+    ));
+    kclosed(p, c, &[(2.5, -6.0), (2.5, 6.0), (8.5, 6.0)], col, SW);
+}
+
 /// Playback speed: a speedometer, an open dial with a needle pointing up-right
 fn icon_speed(p: &egui::Painter, c: Pos2, col: Color32) {
     let c = pos2(c.x, c.y + 1.5 * K); // the dial is open at the bottom: sit it a little lower
@@ -1609,7 +1746,8 @@ fn draw_top_bar(app: &mut FluentMediaPlayer, ctx: &egui::Context, t: f32) {
                 app.main_menu = !app.main_menu;
             }
 
-            let y = MENU_Y;
+            // (text centred on its line box sits a little low next to the icon)
+            let y = MENU_Y - 2.0;
             let right_limit = if fullscreen { screen.right() - 20.0 } else { screen.right() - WIN_BTN_W * 3.0 - 10.0 };
             let tx = MENU_X + BTN_BOX / 2.0 + 8.0;
             let clip = p.with_clip_rect(Rect::from_min_max(pos2(tx, 0.0), pos2(right_limit, TOP_H)));
@@ -1893,6 +2031,17 @@ fn draw_bottom_bar(app: &mut FluentMediaPlayer, ctx: &egui::Context, t: f32) {
             // Right-hand buttons
             let tint = |on: bool| if on { accent } else { white };
 
+            // Rotate / mirror (left out when the window is too narrow)
+            if let (Some(rx), Some(mx)) = (lay.rotate, lay.mirror) {
+                let c = pos2(rx, row_y);
+                if hit(ui, c, "rotate", "Rotate 90\u{b0} (R)", t).activated() { app.rotate_90(); }
+                icon_rotate(&p, c, tint(app.rotation != 0));
+
+                let c = pos2(mx, row_y);
+                if hit(ui, c, "mirror", "Mirror", t).activated() { app.toggle_mirror(); }
+                icon_mirror(&p, c, tint(app.mirror));
+            }
+
             let c = pos2(lay.repeat, row_y);
             if hit(ui, c, "repeat", "Repeat this video", t).activated() { app.toggle_repeat(); }
             icon_repeat(&p, c, tint(app.repeat));
@@ -1943,6 +2092,9 @@ struct RowLayout {
     mute: f32,
     /// Left end of the volume slider track, or None when there's no room for it
     vol_x: Option<f32>,
+    /// Rotate / mirror buttons, None when there's no room for them
+    rotate: Option<f32>,
+    mirror: Option<f32>,
     repeat: f32,
     captions: f32,
     ontop: f32,
@@ -1965,22 +2117,34 @@ fn row_layout(left: f32, right: f32, time_w: f32) -> RowLayout {
     let captions = ontop - BTN_STEP;
     let repeat = captions - BTN_STEP;
 
-    // Slider sits between the volume icon and the repeat button
-    let vol_x = repeat - half - 12.0 - VOL_W;
-    let mute_with_slider = vol_x - 14.0 - half; // room for the knob at 0 %
-    let (mute, vol_x) = if mute_with_slider - half >= time_end + 14.0 {
-        (mute_with_slider, Some(vol_x))
-    } else {
-        (repeat - BTN_STEP, None)
+    // Then, right to left: mirror, rotate, the volume slider, the volume icon.
+    // When the window is too narrow the slider goes first (the wheel and arrow
+    // keys still set the volume), then rotate / mirror.
+    let mirror = repeat - BTN_STEP;
+    let rotate = mirror - BTN_STEP;
+    let fits = |mute: f32| mute - half >= time_end + 14.0;
+    let with_slider = |first: f32| {
+        let vol_x = first - half - 12.0 - VOL_W;
+        (vol_x - 14.0 - half, vol_x) // room for the knob at 0 %
     };
-    RowLayout { play, prev, next, time_x, mute, vol_x, repeat, captions, ontop, speed, fullscreen }
+    let (mute, vol_x, rotate, mirror) = {
+        let (m, v) = with_slider(rotate);
+        if fits(m) {
+            (m, Some(v), Some(rotate), Some(mirror))
+        } else if fits(rotate - BTN_STEP) {
+            (rotate - BTN_STEP, None, Some(rotate), Some(mirror))
+        } else {
+            (repeat - BTN_STEP, None, None, None)
+        }
+    };
+    RowLayout { play, prev, next, time_x, mute, vol_x, rotate, mirror, repeat, captions, ontop, speed, fullscreen }
 }
 
 // ── Folder navigation ─────────────────────────────────────────────────────────
 /// Video files in the same folder as `path`, in Explorer-like (natural) order
 /// (only files of the same kind: a video steps through videos, a picture through
 /// pictures, a song through music)
-fn scan_folder(path: &Path) -> Vec<PathBuf> {
+fn scan_folder(path: &Path, by: SortBy, desc: bool) -> Vec<PathBuf> {
     let Some(dir) = path.parent() else { return vec![path.to_owned()] };
     let kind = media_kind(&path.to_string_lossy());
     let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
@@ -1994,11 +2158,37 @@ fn scan_folder(path: &Path) -> Vec<PathBuf> {
                 .collect()
         })
         .unwrap_or_default();
-    files.sort_by(|a, b| {
-        let name = |p: &PathBuf| p.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-        natural_cmp(&name(a), &name(b))
-    });
+    sort_files(&mut files, by, desc);
     files
+}
+
+/// Sort like Explorer: by name (natural order), date or size; ties go by name
+fn sort_files(files: &mut Vec<PathBuf>, by: SortBy, desc: bool) {
+    let name = |p: &PathBuf| p.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    if by == SortBy::Name {
+        files.sort_by(|a, b| natural_cmp(&name(a), &name(b)));
+    } else {
+        // Read each file's date / size once
+        let key = |p: &PathBuf| -> u128 {
+            let Ok(md) = std::fs::metadata(p) else { return 0 };
+            let since = |t: std::io::Result<std::time::SystemTime>| {
+                t.ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map_or(0, |d| d.as_nanos())
+            };
+            match by {
+                SortBy::Modified => since(md.modified()),
+                SortBy::Created => since(md.created()),
+                _ => md.len() as u128,
+            }
+        };
+        let mut keyed: Vec<(u128, String, PathBuf)> = files.drain(..).map(|p| (key(&p), name(&p), p)).collect();
+        keyed.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| natural_cmp(&a.1, &b.1)));
+        files.extend(keyed.into_iter().map(|(_, _, p)| p));
+    }
+    if desc {
+        files.reverse();
+    }
 }
 
 /// Case-insensitive compare where digit runs compare by value ("2" < "10"),
@@ -2254,18 +2444,60 @@ fn icon_seek(p: &egui::Painter, c: Pos2, col: Color32, forward: bool) {
 }
 
 // ── Main menu (top left) ──────────────────────────────────────────────────────
+enum MenuRow {
+    Item { key: &'static str, label: &'static str, hint: Option<&'static str>, mark: Mark },
+    Header(&'static str),
+    Sep,
+}
+
+/// What's drawn in front of a menu item: nothing, a check mark (on/off setting) or a
+/// dot (one choice out of several, like Explorer's "Sort by")
+enum Mark {
+    None,
+    Check(bool),
+    Dot(bool),
+}
+
+const SORT_CHOICES: [(SortBy, &str); 4] = [
+    (SortBy::Name, "Name"),
+    (SortBy::Modified, "Date modified"),
+    (SortBy::Created, "Date created"),
+    (SortBy::Size, "Size"),
+];
+
 fn draw_main_menu(app: &mut FluentMediaPlayer, ctx: &egui::Context) {
     if !app.main_menu {
         return;
     }
     const W: f32 = 228.0;
     const ITEM_H: f32 = 28.0;
+    const HEAD_H: f32 = 24.0;
     const PAD: f32 = 3.0;
     const SEP_H: f32 = 7.0;
+
+    let mut rows = vec![
+        MenuRow::Item { key: "open", label: "Open file\u{2026}", hint: Some("Ctrl+O"), mark: Mark::None },
+        MenuRow::Sep,
+        MenuRow::Item { key: "autoplay", label: "Auto-play next file in folder", hint: None, mark: Mark::Check(app.autoplay) },
+        MenuRow::Sep,
+        MenuRow::Header("Previous / next order"),
+    ];
+    for (by, label) in SORT_CHOICES {
+        rows.push(MenuRow::Item { key: label, label, hint: None, mark: Mark::Dot(app.sort_by == by) });
+    }
+    rows.push(MenuRow::Sep);
+    rows.push(MenuRow::Item { key: "asc", label: "Ascending", hint: None, mark: Mark::Dot(!app.sort_desc) });
+    rows.push(MenuRow::Item { key: "desc", label: "Descending", hint: None, mark: Mark::Dot(app.sort_desc) });
+    let row_h = |r: &MenuRow| match r {
+        MenuRow::Item { .. } => ITEM_H,
+        MenuRow::Header(_) => HEAD_H,
+        MenuRow::Sep => SEP_H,
+    };
+
     let box_left = MENU_X - BTN_BOX / 2.0;
     let rect = Rect::from_min_size(
         pos2(box_left, MENU_Y + BTN_BOX / 2.0 + 4.0),
-        vec2(W, PAD * 2.0 + ITEM_H * 2.0 + SEP_H),
+        vec2(W, PAD * 2.0 + rows.iter().map(row_h).sum::<f32>()),
     );
 
     // Any press outside the menu (and its button, which toggles it) closes it
@@ -2280,6 +2512,7 @@ fn draw_main_menu(app: &mut FluentMediaPlayer, ctx: &egui::Context) {
     }
 
     let id = egui::Id::new("main_menu");
+    let mut picked: Option<&'static str> = None;
     egui::Area::new(id)
         .order(egui::Order::Foreground)
         .fixed_pos(rect.min)
@@ -2295,54 +2528,70 @@ fn draw_main_menu(app: &mut FluentMediaPlayer, ctx: &egui::Context) {
             p.rect_stroke(rect.shrink(0.5), r, Stroke::new(1.0_f32, Color32::from_rgba_premultiplied(30, 30, 30, 30)));
 
             let text = Color32::from_rgb(240, 240, 240);
+            let dim = Color32::from_rgb(160, 160, 160);
             let font = FontId::proportional(13.5);
-            let item = |ui: &mut egui::Ui, top: f32, key: &str| {
-                let ir = Rect::from_min_size(pos2(rect.left() + PAD, top), vec2(W - 2.0 * PAD, ITEM_H));
-                let resp = ui.interact(ir, ui.id().with(key), Sense::click_and_drag());
-                if resp.hovered() {
-                    p.rect_filled(ir, 4.0, Color32::from_rgba_premultiplied(14, 14, 14, 14));
-                }
-                resp
-            };
             let text_x = rect.left() + PAD + 28.0;
+            let mark_x = rect.left() + PAD + 14.0;
 
-            // Open file…
-            let top = rect.top() + PAD;
-            let open = item(ui, top, "open");
-            let cy = top + ITEM_H / 2.0;
-            p.text(pos2(text_x, cy), Align2::LEFT_CENTER, "Open file\u{2026}", font.clone(), text);
-            p.text(
-                pos2(rect.right() - PAD - 10.0, cy),
-                Align2::RIGHT_CENTER,
-                "Ctrl+O",
-                FontId::proportional(12.5),
-                Color32::from_rgb(160, 160, 160),
-            );
-            if open.activated() {
-                app.main_menu = false;
-                app.show_open_dialog();
-            }
-
-            // separator
-            let sep_y = top + ITEM_H + SEP_H / 2.0;
-            p.line_segment(
-                [pos2(rect.left() + 1.0, sep_y), pos2(rect.right() - 1.0, sep_y)],
-                Stroke::new(1.0_f32, Color32::from_rgba_premultiplied(26, 26, 26, 26)),
-            );
-
-            // Auto-play next file (a check mark when on); the menu stays open
-            let top = top + ITEM_H + SEP_H;
-            let auto = item(ui, top, "autoplay");
-            let cy = top + ITEM_H / 2.0;
-            if app.autoplay {
-                poly(&p, pos2(rect.left() + PAD + 14.0, cy), &[(-4.5, 0.0), (-1.5, 3.2), (4.5, -3.5)], text, 1.5);
-            }
-            p.text(pos2(text_x, cy), Align2::LEFT_CENTER, "Auto-play next file in folder", font, text);
-            if auto.activated() {
-                app.autoplay = !app.autoplay;
+            let mut top = rect.top() + PAD;
+            for row in &rows {
+                let h = row_h(row);
+                let cy = top + h / 2.0;
+                match row {
+                    MenuRow::Sep => {
+                        p.line_segment(
+                            [pos2(rect.left() + 1.0, cy), pos2(rect.right() - 1.0, cy)],
+                            Stroke::new(1.0_f32, Color32::from_rgba_premultiplied(26, 26, 26, 26)),
+                        );
+                    }
+                    MenuRow::Header(label) => {
+                        p.text(pos2(text_x, cy + 2.0), Align2::LEFT_CENTER, *label, FontId::proportional(12.0), dim);
+                    }
+                    MenuRow::Item { key, label, hint, mark } => {
+                        let ir = Rect::from_min_size(pos2(rect.left() + PAD, top), vec2(W - 2.0 * PAD, h));
+                        let resp = ui.interact(ir, ui.id().with(*key), Sense::click_and_drag());
+                        if resp.hovered() {
+                            p.rect_filled(ir, 4.0, Color32::from_rgba_premultiplied(14, 14, 14, 14));
+                        }
+                        match mark {
+                            Mark::Check(true) => {
+                                poly(&p, pos2(mark_x, cy), &[(-4.5, 0.0), (-1.5, 3.2), (4.5, -3.5)], text, 1.5);
+                            }
+                            Mark::Dot(true) => {
+                                p.circle_filled(pos2(mark_x, cy), 3.0, text);
+                            }
+                            _ => {}
+                        }
+                        p.text(pos2(text_x, cy), Align2::LEFT_CENTER, *label, font.clone(), text);
+                        if let Some(hint) = hint {
+                            p.text(pos2(rect.right() - PAD - 10.0, cy), Align2::RIGHT_CENTER, *hint, FontId::proportional(12.5), dim);
+                        }
+                        if resp.activated() {
+                            picked = Some(key);
+                        }
+                    }
+                }
+                top += h;
             }
         });
     ctx.move_to_top(egui::LayerId::new(egui::Order::Foreground, id));
+
+    // Settings keep the menu open (so the change can be seen); "Open file…" closes it
+    match picked {
+        Some("open") => {
+            app.main_menu = false;
+            app.show_open_dialog();
+        }
+        Some("autoplay") => app.autoplay = !app.autoplay,
+        Some("asc") => app.set_sort(app.sort_by, false),
+        Some("desc") => app.set_sort(app.sort_by, true),
+        Some(key) => {
+            if let Some((by, _)) = SORT_CHOICES.iter().find(|(_, label)| *label == key) {
+                app.set_sort(*by, app.sort_desc);
+            }
+        }
+        None => {}
+    }
 }
 
 /// Decoder / video details (toggle with I) — shows whether hardware decoding is active
