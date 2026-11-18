@@ -383,6 +383,8 @@ struct FluentMediaPlayer {
     snap_eof: bool,
     /// The top-left menu is open, and where its button is
     main_menu: bool,
+    /// The keyboard shortcuts panel is open
+    show_keys: bool,
     menu_anchor: Rect,
     /// Previous frame, for moving the time display on smoothly
     last_tick: std::time::Instant,
@@ -574,6 +576,7 @@ impl FluentMediaPlayer {
             autoplay: st.autoplay,
             snap_eof: false,
             main_menu: false,
+            show_keys: false,
             menu_anchor: Rect::NOTHING,
             last_tick: std::time::Instant::now(),
             sort_by: st.sort_by,
@@ -650,6 +653,16 @@ impl FluentMediaPlayer {
             sort_files(&mut self.folder_files, by, desc);
             self.folder_index = self.folder_files.iter().position(|p| *p == current);
         }
+    }
+
+    /// One frame forward / back (pauses, like mpv's own frame stepping)
+    fn frame_step(&mut self, forward: bool) {
+        if !self.has_file {
+            return;
+        }
+        self.link.command(if forward { "frame-step" } else { "frame-back-step" }, &[]);
+        self.is_playing = false;
+        self.touch();
     }
 
     /// Volume normalizer on / off
@@ -1205,6 +1218,8 @@ impl eframe::App for FluentMediaPlayer {
             up:    i.key_pressed(egui::Key::ArrowUp),
             down:  i.key_pressed(egui::Key::ArrowDown),
             f:     i.key_pressed(egui::Key::F),
+            d:     i.key_pressed(egui::Key::D),
+            enter: i.key_pressed(egui::Key::Enter),
             m:     i.key_pressed(egui::Key::M),
             n:     i.key_pressed(egui::Key::N),
             p:     i.key_pressed(egui::Key::P),
@@ -1227,7 +1242,7 @@ impl eframe::App for FluentMediaPlayer {
         }
         let near_edge = inp.pointer
             .map_or(false, |p| p.y < TOP_H || p.y > screen.bottom() - BOTTOM_H);
-        let menu_open = self.main_menu || ctx.memory(|m| m.is_popup_open(egui::Id::new(MORE_POPUP)));
+        let menu_open = self.main_menu || self.show_keys || ctx.memory(|m| m.is_popup_open(egui::Id::new(MORE_POPUP)));
         let idle = self.last_mouse_move.elapsed().as_secs_f32();
         let settling = self.fs_settle.map_or(false, |t0| t0.elapsed().as_secs_f32() < 0.45);
         if !settling {
@@ -1278,9 +1293,13 @@ impl eframe::App for FluentMediaPlayer {
             self.nudge_volume(steps as f64 * 5.0);
         }
 
-        if inp.f     { self.toggle_fullscreen(ctx); }
+        if inp.f     { self.frame_step(true); }
+        if inp.d     { self.frame_step(false); }
+        if inp.enter { self.toggle_fullscreen(ctx); }
         if inp.esc {
-            if self.main_menu {
+            if self.show_keys {
+                self.show_keys = false;
+            } else if self.main_menu {
                 self.main_menu = false;
             } else if self.is_fullscreen {
                 self.exit_fullscreen(ctx);
@@ -1357,6 +1376,7 @@ impl eframe::App for FluentMediaPlayer {
         } else {
             self.main_menu = false;
         }
+        draw_shortcuts(self, ctx);
 
         // Resize cursor wins over any other cursor set this frame
         if let Some((_, icon)) = edge {
@@ -1421,7 +1441,7 @@ impl eframe::App for FluentMediaPlayer {
 struct InputSnapshot {
     dropped: Vec<String>,
     space: bool, right: bool, left: bool, up: bool, down: bool,
-    f: bool, m: bool, n: bool, p: bool, info: bool, hw: bool, esc: bool, open: bool, rotate: bool,
+    f: bool, d: bool, enter: bool, m: bool, n: bool, p: bool, info: bool, hw: bool, esc: bool, open: bool, rotate: bool,
     scroll_y: f32,
     pressed: bool,
     moved: bool, active: bool,
@@ -2121,7 +2141,7 @@ fn draw_bottom_bar(app: &mut FluentMediaPlayer, ctx: &egui::Context, t: f32) {
             icon_compact(&p, c, tint(app.on_top));
 
             let c = pos2(lay.fullscreen, row_y);
-            if hit(ui, c, "fs", "Full screen (F)", t).activated() { app.toggle_fullscreen(ctx); }
+            if hit(ui, c, "fs", "Full screen (Enter)", t).activated() { app.toggle_fullscreen(ctx); }
             icon_fullscreen(&p, c, white);
 
             // "More" → playback speed menu
@@ -2521,6 +2541,132 @@ fn icon_seek(p: &egui::Painter, c: Pos2, col: Color32, forward: bool) {
     }
 }
 
+// ── Keyboard shortcuts panel (menu) ───────────────────────────────────────────
+/// Keys (each drawn as a key cap) and what they do
+const SHORTCUTS: &[(&[&str], &str)] = &[
+    (&["Space"], "Play / pause"),
+    (&["\u{2190}", "\u{2192}"], "Back / forward 10 seconds"),
+    (&["D"], "Previous frame"),
+    (&["F"], "Next frame"),
+    (&["\u{2191}", "\u{2193}"], "Volume up / down"),
+    (&["Mouse wheel"], "Volume up / down"),
+    (&["M"], "Mute"),
+    (&["P"], "Previous file"),
+    (&["N"], "Next file"),
+    (&["Enter"], "Full screen"),
+    (&["Double-click"], "Full screen"),
+    (&["Esc"], "Leave full screen / close menu"),
+    (&["R"], "Rotate 90\u{b0}"),
+    (&["Ctrl+O"], "Open file"),
+    (&["I"], "Video info"),
+    (&["H"], "Hardware decoding on / off"),
+    (&["Media keys"], "Play / pause, next, previous"),
+];
+
+fn draw_shortcuts(app: &mut FluentMediaPlayer, ctx: &egui::Context) {
+    if !app.show_keys {
+        return;
+    }
+    const W: f32 = 380.0;
+    const HEAD_H: f32 = 48.0;
+    const ROW_H: f32 = 28.0;
+    const PAD: f32 = 10.0;
+    let screen = ctx.screen_rect();
+    let full_h = HEAD_H + SHORTCUTS.len() as f32 * ROW_H + PAD;
+    let size = vec2(W.min(screen.width() - 24.0), full_h.min(screen.height() - 40.0));
+    let ppp = ctx.pixels_per_point();
+    let r0 = Rect::from_center_size(screen.center(), size);
+    let rect = Rect::from_min_size(pos2((r0.left() * ppp).round() / ppp, (r0.top() * ppp).round() / ppp), size);
+
+    // A click anywhere outside the panel closes it
+    let pressed_outside = ctx.input(|i| {
+        i.pointer.any_pressed() && i.pointer.press_origin().map_or(false, |o| !rect.contains(o))
+    });
+    if pressed_outside {
+        app.show_keys = false;
+        return;
+    }
+
+    let id = egui::Id::new("shortcuts");
+    let mut close = false;
+    egui::Area::new(id)
+        .order(egui::Order::Foreground)
+        .fixed_pos(screen.min)
+        .show(ctx, |ui| {
+            // Dim the player behind, and keep its clicks / drags away from the video
+            ui.allocate_rect(screen, Sense::click_and_drag());
+            let p = ui.painter().clone();
+            p.rect_filled(screen, 0.0, Color32::from_black_alpha(110));
+            let r = 8.0;
+            for (e, a) in [(1.0, 40.0), (3.0, 22.0), (6.0, 10.0)] {
+                p.rect_filled(rect.expand(e).translate(vec2(0.0, 2.0)), r + e, Color32::from_black_alpha(a as u8));
+            }
+            p.rect_filled(rect, r, Color32::from_rgb(44, 44, 44));
+            p.rect_stroke(rect.shrink(0.5), r, Stroke::new(1.0_f32, Color32::from_rgba_premultiplied(30, 30, 30, 30)));
+            ui.interact(rect, ui.id().with("panel"), Sense::click_and_drag());
+
+            let text = Color32::from_rgb(240, 240, 240);
+            p.text(
+                pos2(rect.left() + 18.0, rect.top() + HEAD_H / 2.0),
+                Align2::LEFT_CENTER,
+                "Keyboard shortcuts",
+                FontId::new(15.0, FontFamily::Name("semibold".into())),
+                text,
+            );
+
+            // Close button (top right)
+            let xr = Rect::from_center_size(pos2(rect.right() - 24.0, rect.top() + HEAD_H / 2.0), vec2(30.0, 30.0));
+            let xb = ui.interact(xr, ui.id().with("close"), Sense::click_and_drag());
+            if xb.hovered() {
+                p.rect_filled(xr, 4.0, Color32::from_rgba_premultiplied(14, 14, 14, 14));
+            }
+            let c = xr.center();
+            for (a, b) in [((-5.0, -5.0), (5.0, 5.0)), ((-5.0, 5.0), (5.0, -5.0))] {
+                p.line_segment([c + vec2(a.0, a.1), c + vec2(b.0, b.1)], Stroke::new(1.2_f32, text));
+            }
+            if xb.activated() {
+                close = true;
+            }
+            p.line_segment(
+                [pos2(rect.left() + 1.0, rect.top() + HEAD_H - 0.5), pos2(rect.right() - 1.0, rect.top() + HEAD_H - 0.5)],
+                Stroke::new(1.0_f32, Color32::from_rgba_premultiplied(26, 26, 26, 26)),
+            );
+
+            // The list (scrolls if the window is too short for all of it)
+            let list = Rect::from_min_max(pos2(rect.left(), rect.top() + HEAD_H + 4.0), pos2(rect.right(), rect.bottom() - 6.0));
+            let mut child = ui.child_ui(list, egui::Layout::top_down(egui::Align::Min));
+            egui::ScrollArea::vertical().max_height(list.height()).show(&mut child, |ui| {
+                ui.spacing_mut().item_spacing = vec2(0.0, 0.0);
+                for (keys, what) in SHORTCUTS {
+                    let (row, _) = ui.allocate_exact_size(vec2(list.width() - 8.0, ROW_H), Sense::hover());
+                    let p = ui.painter();
+                    let mut x = row.left() + 18.0;
+                    for key in keys.iter() {
+                        let g = p.layout_no_wrap(
+                            key.to_string(),
+                            FontId::new(12.5, FontFamily::Name("semibold".into())),
+                            text,
+                        );
+                        let cap = Rect::from_min_size(pos2(x, row.center().y - 10.5), vec2((g.size().x + 14.0).max(24.0), 21.0));
+                        p.rect_filled(cap, 4.0, Color32::from_rgb(64, 64, 66));
+                        p.rect_filled(
+                            Rect::from_min_max(pos2(cap.left() + 1.0, cap.bottom() - 2.0), pos2(cap.right() - 1.0, cap.bottom())),
+                            2.0,
+                            Color32::from_rgb(52, 52, 54),
+                        );
+                        p.galley(cap.center() - g.size() / 2.0 - vec2(0.0, 0.5), g, text);
+                        x = cap.right() + 6.0;
+                    }
+                    p.text(pos2(row.left() + 150.0, row.center().y), Align2::LEFT_CENTER, *what, FontId::proportional(13.5), text);
+                }
+            });
+        });
+    ctx.move_to_top(egui::LayerId::new(egui::Order::Foreground, id));
+    if close {
+        app.show_keys = false;
+    }
+}
+
 // ── Main menu (top left) ──────────────────────────────────────────────────────
 enum MenuRow {
     Item { key: &'static str, label: &'static str, hint: Option<&'static str>, mark: Mark },
@@ -2555,6 +2701,7 @@ fn draw_main_menu(app: &mut FluentMediaPlayer, ctx: &egui::Context) {
 
     let mut rows = vec![
         MenuRow::Item { key: "open", label: "Open file\u{2026}", hint: Some("Ctrl+O"), mark: Mark::None },
+        MenuRow::Item { key: "keys", label: "Keyboard shortcuts", hint: None, mark: Mark::None },
         MenuRow::Sep,
         MenuRow::Item { key: "autoplay", label: "Auto-play next file in folder", hint: None, mark: Mark::Check(app.autoplay) },
         MenuRow::Item { key: "normalize", label: "Normalize volume", hint: None, mark: Mark::Check(app.normalize) },
@@ -2664,6 +2811,7 @@ fn draw_main_menu(app: &mut FluentMediaPlayer, ctx: &egui::Context) {
     }
     match picked {
         Some("open") => app.show_open_dialog(),
+        Some("keys") => app.show_keys = true,
         Some("autoplay") => app.autoplay = !app.autoplay,
         Some("normalize") => app.toggle_normalize(),
         Some("multi") => app.multi = !app.multi,
