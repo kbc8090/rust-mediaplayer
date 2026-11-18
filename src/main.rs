@@ -187,7 +187,7 @@ const VOL_TRACK:  Color32 = Color32::from_rgb(160, 158, 155); // unplayed volume
 // ── Layout (points) ───────────────────────────────────────────────────────────
 const TOP_H: f32 = 64.0;              // title strip + gradient height
 const BOTTOM_H: f32 = 104.0;          // control area + gradient height
-const SIDE: f32 = 16.0;               // left/right margin of the seek bar (and the button row)
+const SIDE: f32 = 20.0;               // left/right margin of the seek bar (and the button row)
 const SEEK_FROM_BOTTOM: f32 = 53.0;   // seek bar centre line
 const ROW_FROM_BOTTOM: f32 = 27.0;    // button row centre line
 /// Control-row buttons: hover highlight size and centre-to-centre spacing
@@ -254,6 +254,8 @@ struct FluentMediaPlayer {
     resize_until: Option<std::time::Instant>,
     /// mpv scaler settings saved while cheap ones are used during a resize
     fast_scale_saved: Option<Vec<(String, String)>>,
+    /// Q: use fast rendering all the time
+    fast_always: bool,
     /// Native window handle and the taskbar integration built on it
     hwnd: isize,
     taskbar: Option<taskbar::Taskbar>,
@@ -367,6 +369,7 @@ impl FluentMediaPlayer {
             last_size: egui::Vec2::ZERO,
             resize_until: None,
             fast_scale_saved: None,
+            fast_always: false,
             hwnd: 0,
             taskbar: None,
             taskbar_tried: false,
@@ -451,6 +454,17 @@ impl FluentMediaPlayer {
         saved
     }
 
+    /// Put back the scaler settings saved by `set_fast_scaling`
+    fn restore_scaling(&mut self) {
+        if let Some(saved) = self.fast_scale_saved.take() {
+            if let Ok(mpv) = self.mpv.lock() {
+                for (k, v) in &saved {
+                    let _ = mpv.set_property(k, v.as_str());
+                }
+            }
+        }
+    }
+
     fn current_settings(&self) -> Settings {
         Settings {
             volume: self.volume.round() as i32,
@@ -519,8 +533,8 @@ impl FluentMediaPlayer {
         }
         let render_ms = RENDER_MS.with(|r| r.get());
         lines.push(format!(
-            "Render: {render_ms:.1} ms per frame{}",
-            if self.fast_scale_saved.is_some() { " (fast scaling while resizing)" } else { "" }
+            "Render: {render_ms:.1} ms per frame, quality: {}  (Q to switch)",
+            if self.fast_always { "fast" } else if self.fast_scale_saved.is_some() { "fast while resizing" } else { "high" }
         ));
         if let Some((ws, private)) = process_memory_mb() {
             lines.push(format!("Memory: {ws:.0} MB working set, {private:.0} MB private"));
@@ -827,12 +841,8 @@ impl eframe::App for FluentMediaPlayer {
         if let Some(until) = self.resize_until {
             if std::time::Instant::now() >= until {
                 self.resize_until = None;
-                if let Some(saved) = self.fast_scale_saved.take() {
-                    if let Ok(mpv) = self.mpv.lock() {
-                        for (k, v) in &saved {
-                            let _ = mpv.set_property(k, v.as_str());
-                        }
-                    }
+                if !self.fast_always {
+                    self.restore_scaling();
                 }
             } else {
                 ctx.request_repaint_after(std::time::Duration::from_millis(60));
@@ -855,6 +865,7 @@ impl eframe::App for FluentMediaPlayer {
             n:     i.key_pressed(egui::Key::N),
             p:     i.key_pressed(egui::Key::P),
             info:  i.key_pressed(egui::Key::I),
+            q:     i.key_pressed(egui::Key::Q),
             hw:    i.key_pressed(egui::Key::H),
             esc:   i.key_pressed(egui::Key::Escape),
             scroll_y: i.raw_scroll_delta.y,
@@ -909,6 +920,19 @@ impl eframe::App for FluentMediaPlayer {
         if inp.p     { self.play_adjacent(-1); }
         if inp.info  { self.show_info = !self.show_info; }
         if inp.hw    { self.toggle_hw_decode(); }
+        if inp.q {
+            // Fast rendering all the time vs. mpv's high-quality default. Handy to
+            // tell mpv's drawing cost apart from the cost of resizing the window.
+            self.fast_always = !self.fast_always;
+            if self.fast_always {
+                if self.fast_scale_saved.is_none() {
+                    self.fast_scale_saved = Some(self.set_fast_scaling());
+                }
+            } else if self.resize_until.is_none() {
+                self.restore_scaling();
+            }
+            self.show_info = true;
+        }
 
         // Mouse wheel anywhere in the window = volume, 5 % per notch
         // (egui reports one wheel notch as 50 points)
@@ -1030,7 +1054,7 @@ impl eframe::App for FluentMediaPlayer {
 struct InputSnapshot {
     dropped: Vec<String>,
     space: bool, right: bool, left: bool, up: bool, down: bool,
-    f: bool, m: bool, n: bool, p: bool, info: bool, hw: bool, esc: bool,
+    f: bool, m: bool, n: bool, p: bool, info: bool, hw: bool, q: bool, esc: bool,
     scroll_y: f32,
     pressed: bool,
     moved: bool, active: bool,
@@ -1141,10 +1165,117 @@ fn hit(ui: &mut egui::Ui, centre: Pos2, id: &str, tip: &str, t: f32) -> egui::Re
         ui.painter().rect_filled(
             Rect::from_center_size(centre, vec2(BTN_BOX, BTN_BOX)),
             8.0,
-            Color32::from_white_alpha((13.0 * t) as u8),
+            Color32::from_white_alpha((8.0 * t) as u8),
         );
     }
-    r.on_hover_text(tip)
+    hover_tooltip(ui.ctx(), &r, Rect::from_center_size(centre, vec2(BTN_BOX, BTN_BOX)), tip, true);
+    r
+}
+
+// ── Tooltips ──────────────────────────────────────────────────────────────────
+/// Show `text` near `anchor` once the pointer has rested on `resp` for a moment.
+/// Placed above (bottom controls) or below (window buttons) from the start, instead
+/// of egui's default of trying below the pointer and flipping when it doesn't fit.
+fn hover_tooltip(ctx: &egui::Context, resp: &egui::Response, anchor: Rect, text: &str, above: bool) {
+    const DELAY: f64 = 0.5;
+    let key = resp.id.with("tip_since");
+    if !resp.hovered() {
+        ctx.data_mut(|d| d.remove::<f64>(key));
+        return;
+    }
+    if resp.is_pointer_button_down_on() {
+        // Clicked: no tooltip until the pointer leaves and comes back (like Windows)
+        ctx.data_mut(|d| d.insert_temp(key, f64::INFINITY));
+        return;
+    }
+    let now = ctx.input(|i| i.time);
+    let since = ctx.data_mut(|d| *d.get_temp_mut_or_insert_with(key, || now));
+    if !since.is_finite() {
+        return;
+    }
+    let age = now - since;
+    if age < DELAY {
+        ctx.request_repaint_after(std::time::Duration::from_secs_f64(DELAY - age));
+        return;
+    }
+    let alpha = ((age - DELAY) / 0.12).min(1.0) as f32; // quick fade-in
+    if alpha < 1.0 {
+        ctx.request_repaint();
+    }
+    draw_tooltip(ctx, anchor, text, above, alpha);
+}
+
+/// Fine grain for the acrylic look, made once and kept in egui's memory
+fn noise_texture(ctx: &egui::Context) -> egui::TextureHandle {
+    let id = egui::Id::new("rmp_noise_texture");
+    if let Some(tex) = ctx.data(|d| d.get_temp::<egui::TextureHandle>(id)) {
+        return tex;
+    }
+    const N: usize = 64;
+    let mut img = egui::ColorImage::new([N, N], Color32::TRANSPARENT);
+    let mut x: u32 = 0x9E37_79B9;
+    for px in img.pixels.iter_mut() {
+        // xorshift: cheap, good-enough random grain
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+        *px = Color32::from_white_alpha((x >> 24) as u8);
+    }
+    let tex = ctx.load_texture("rmp_noise", img, egui::TextureOptions::NEAREST);
+    ctx.data_mut(|d| d.insert_temp(id, tex.clone()));
+    tex
+}
+
+/// Windows 11-style flyout: translucent dark tint with fine grain (the "acrylic"
+/// look), hairline light border and a soft shadow.
+fn draw_tooltip(ctx: &egui::Context, anchor: Rect, text: &str, above: bool, alpha: f32) {
+    let p = ctx.layer_painter(egui::LayerId::new(egui::Order::Tooltip, egui::Id::new("rmp_tooltip")));
+    let galley = p.layout_no_wrap(
+        text.to_owned(),
+        FontId::proportional(12.5),
+        Color32::from_rgb(242, 242, 245).gamma_multiply(alpha),
+    );
+    let pad = vec2(10.0, 6.0);
+    let size = galley.size() + pad * 2.0;
+    let screen = ctx.screen_rect();
+    let x = (anchor.center().x - size.x / 2.0)
+        .min(screen.right() - 6.0 - size.x)
+        .max(screen.left() + 6.0);
+    let y = if above { anchor.top() - 6.0 - size.y } else { anchor.bottom() + 6.0 };
+    let rect = Rect::from_min_size(pos2(x, y), size);
+    let r = 6.0;
+
+    // soft shadow
+    for i in 1..=6 {
+        let e = i as f32 * 1.5;
+        let a = 16.0 * alpha * (1.0 - i as f32 / 7.0);
+        p.rect_filled(rect.expand(e).translate(vec2(0.0, 2.0)), r + e, Color32::from_black_alpha(a as u8));
+    }
+    // tinted, translucent body
+    p.rect_filled(rect, r, Color32::from_rgba_unmultiplied(38, 38, 42, (212.0 * alpha) as u8));
+    // a faint lighter top half, like the acrylic luminosity layer
+    let top = Rect::from_min_max(rect.min, pos2(rect.right(), rect.center().y));
+    p.rect_filled(top, egui::Rounding { nw: r, ne: r, sw: 0.0, se: 0.0 }, Color32::from_white_alpha((5.0 * alpha) as u8));
+    // grain
+    let tex = noise_texture(ctx);
+    let grain = p.with_clip_rect(rect.shrink(2.0));
+    let mut ty = rect.top();
+    while ty < rect.bottom() {
+        let mut tx = rect.left();
+        while tx < rect.right() {
+            grain.image(
+                tex.id(),
+                Rect::from_min_size(pos2(tx, ty), vec2(64.0, 64.0)),
+                Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
+                Color32::from_white_alpha((9.0 * alpha) as u8),
+            );
+            tx += 64.0;
+        }
+        ty += 64.0;
+    }
+    // hairline border
+    p.rect_stroke(rect, r, Stroke::new(1.0_f32, Color32::from_white_alpha((28.0 * alpha) as u8)));
+    p.galley(rect.min + pad, galley, Color32::WHITE);
 }
 
 // ── Icons (drawn with shapes so they never depend on font coverage) ───────────
@@ -1287,6 +1418,13 @@ fn draw_top_bar(app: &mut FluentMediaPlayer, ctx: &egui::Context, t: f32) {
                         vec2(WIN_BTN_W, WIN_BTN_H),
                     );
                     let resp = ui.interact(r, ui.id().with(("winbtn", k)), Sense::click());
+                    let label = match k {
+                        0 => "Minimize",
+                        1 if maximized => "Restore Down",
+                        1 => "Maximize",
+                        _ => "Close",
+                    };
+                    hover_tooltip(ctx, &resp, r, label, false);
                     if resp.hovered() {
                         // Windows' own hover colours (the close red differs on 10 and 11)
                         let fill = if k == 2 {
