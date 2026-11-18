@@ -26,8 +26,81 @@ unsafe extern "system" {
     ) -> i32;
 }
 
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn GetCurrentProcess() -> isize;
+    fn TerminateProcess(process: isize, exit_code: u32) -> i32;
+}
+
+#[link(name = "user32")]
+unsafe extern "system" {
+    fn GetSystemMetrics(index: i32) -> i32;
+}
+
 thread_local! {
     static TLS_RENDER_CTX: RefCell<Option<RenderContext<'static>>> = const { RefCell::new(None) };
+}
+
+/// End the process immediately, without running any DLL or runtime shutdown code.
+/// `std::process::exit` crashed while a video was open: it ran libmpv's DLL shutdown
+/// while mpv's decoder/audio threads and the GL context were still alive.
+fn terminate_now() -> ! {
+    unsafe { TerminateProcess(GetCurrentProcess(), 0); }
+    std::process::exit(0)
+}
+
+// ── Remembered window position / size ─────────────────────────────────────────
+#[derive(Clone, Copy, PartialEq)]
+struct WinState {
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    /// pixels_per_point (display scaling) when it was saved
+    ppp: f32,
+    maximized: bool,
+}
+
+impl WinState {
+    const DEFAULT: WinState = WinState { x: 0.0, y: 0.0, w: 960.0, h: 540.0, ppp: 1.0, maximized: false };
+}
+
+fn state_path() -> Option<PathBuf> {
+    std::env::var_os("APPDATA").map(|d| PathBuf::from(d).join("rust-mediaplayer").join("window.txt"))
+}
+
+fn save_window_state(s: &WinState) {
+    let Some(path) = state_path() else { return };
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(
+        path,
+        format!("{} {} {} {} {} {}", s.x, s.y, s.w, s.h, s.ppp, s.maximized as u8),
+    );
+}
+
+/// The saved state, if it exists and the window would still be on a connected monitor
+fn load_window_state() -> Option<WinState> {
+    let text = std::fs::read_to_string(state_path()?).ok()?;
+    let v: Vec<f32> = text.split_whitespace().filter_map(|t| t.parse().ok()).collect();
+    if v.len() < 6 { return None; }
+    let s = WinState { x: v[0], y: v[1], w: v[2], h: v[3], ppp: v[4], maximized: v[5] != 0.0 };
+    if !(s.w >= 200.0 && s.h >= 150.0 && s.w <= 20000.0 && s.h <= 20000.0 && s.ppp > 0.0) {
+        return None;
+    }
+
+    // Is (most of) the title area inside the virtual desktop? (monitor unplugged → no)
+    let (vx, vy, vw, vh) = unsafe {
+        (GetSystemMetrics(76), GetSystemMetrics(77), GetSystemMetrics(78), GetSystemMetrics(79))
+    };
+    if vw > 0 && vh > 0 {
+        let (px, py, pw) = (s.x * s.ppp, s.y * s.ppp, s.w * s.ppp);
+        let (vx, vy, vw, vh) = (vx as f32, vy as f32, vw as f32, vh as f32);
+        let visible = px + pw > vx + 100.0 && px < vx + vw - 100.0 && py > vy - 20.0 && py < vy + vh - 80.0;
+        if !visible { return None; }
+    }
+    Some(s)
 }
 
 // ── Palette ───────────────────────────────────────────────────────────────────
@@ -81,21 +154,34 @@ struct FluentMediaPlayer {
     /// Technical info overlay (toggle with I)
     show_info: bool,
     info_lines: Vec<String>,
+    /// Hardware decoding on/off (toggle with H)
+    hw_decode: bool,
+    /// Current and last-written window geometry
+    win_state: WinState,
+    win_saved: WinState,
+    win_changed: std::time::Instant,
 }
 
 impl FluentMediaPlayer {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         install_fonts(&cc.egui_ctx);
+        let saved = load_window_state().unwrap_or(WinState::DEFAULT);
 
         // video-timing-offset = 0 stops mpv from blocking the UI thread inside
         // render() while it waits for each frame's display time (the default 50 ms
         // wait made window moves/resizes follow the video's frame rate).
         let mpv = Mpv::with_initializer(|init| {
             init.set_property("video-timing-offset", 0.0_f64)?;
+            // Hardware decoding with copy-back: the GPU decodes, frames are copied to
+            // system memory and uploaded as normal textures. The direct GPU-sharing
+            // modes ("auto") can show corrupted frames with OpenGL on some drivers.
+            let _ = init.set_property("hwdec", "auto-copy");
+            // Don't decode straight into GPU-mapped buffers (another known source of
+            // garbled frames on some drivers).
+            let _ = init.set_property("vd-lavc-dr", "no");
             Ok(())
         })
         .expect("Failed to initialize libmpv!");
-        let _ = mpv.set_property("hwdec", "auto");
         let _ = mpv.set_property("osc", "no");
         let _ = mpv.set_property("keep-open", "yes");
         let _ = mpv.set_property("volume", 80_i64);
@@ -139,6 +225,10 @@ impl FluentMediaPlayer {
             volume_osd: None,
             show_info: false,
             info_lines: Vec::new(),
+            hw_decode: true,
+            win_state: saved,
+            win_saved: saved,
+            win_changed: std::time::Instant::now(),
         }
     }
 
@@ -155,10 +245,45 @@ impl FluentMediaPlayer {
     }
 
     fn toggle_play_pause(&mut self) {
+        // Finished playing (mpv sits on the last frame): Play / Space starts it over
+        let ended = self.has_file
+            && self
+                .mpv
+                .lock()
+                .ok()
+                .and_then(|m| m.get_property::<bool>("eof-reached").ok())
+                .unwrap_or(false);
+        if ended {
+            if let Ok(mpv) = self.mpv.lock() {
+                let _ = mpv.command("seek", &["0", "absolute"]);
+                let _ = mpv.set_property("pause", false);
+            }
+            self.time_pos = 0.0;
+            self.is_playing = true;
+            return;
+        }
+
         self.is_playing = !self.is_playing;
         if let Ok(mpv) = self.mpv.lock() {
             let _ = mpv.set_property("pause", !self.is_playing);
         }
+    }
+
+    /// Switch hardware decoding on/off (handy if a video shows glitches)
+    fn toggle_hw_decode(&mut self) {
+        self.hw_decode = !self.hw_decode;
+        if let Ok(mpv) = self.mpv.lock() {
+            let _ = mpv.set_property("hwdec", if self.hw_decode { "auto-copy" } else { "no" });
+        }
+        self.show_info = true;
+    }
+
+    /// Remember the window geometry, then end the process at once
+    fn quit(&mut self) -> ! {
+        if self.win_state != self.win_saved {
+            save_window_state(&self.win_state);
+        }
+        terminate_now()
     }
 
     fn seek_to(&mut self, secs: f64) {
@@ -199,6 +324,10 @@ impl FluentMediaPlayer {
             let dropped = mpv.get_property::<i64>("frame-drop-count").unwrap_or(0);
             let dec_dropped = mpv.get_property::<i64>("decoder-frame-drop-count").unwrap_or(0);
             lines.push(format!("Dropped frames: {dropped} (decoder: {dec_dropped})"));
+            lines.push(format!(
+                "Hardware decoding: {}  (H to switch)",
+                if self.hw_decode { "on" } else { "off" }
+            ));
         }
         self.info_lines = lines;
     }
@@ -300,6 +429,41 @@ impl eframe::App for FluentMediaPlayer {
             self.refresh_info();
         }
 
+        // ── Track window geometry so it can be restored next launch ───────────
+        if !self.is_fullscreen {
+            let (outer, inner, maximized, minimized) = ctx.input(|i| {
+                let v = i.viewport();
+                (v.outer_rect, v.inner_rect, v.maximized.unwrap_or(false), v.minimized.unwrap_or(false))
+            });
+            if let (Some(o), Some(i), false) = (outer, inner, minimized) {
+                // (a minimised window reports a position around -32000)
+                if o.min.x > -10000.0 && o.min.y > -10000.0 {
+                    let mut s = self.win_state;
+                    s.maximized = maximized;
+                    if !maximized {
+                        s.x = o.min.x.round();
+                        s.y = o.min.y.round();
+                        s.w = i.width().round();
+                        s.h = i.height().round();
+                        s.ppp = ctx.pixels_per_point();
+                    }
+                    if s != self.win_state {
+                        self.win_state = s;
+                        self.win_changed = std::time::Instant::now();
+                    }
+                }
+            }
+        }
+        // Write it once the window has stopped moving/resizing for a second
+        if self.win_state != self.win_saved {
+            if self.win_changed.elapsed() > std::time::Duration::from_secs(1) {
+                save_window_state(&self.win_state);
+                self.win_saved = self.win_state;
+            } else {
+                ctx.request_repaint_after(std::time::Duration::from_millis(1100));
+            }
+        }
+
         // ── Initialize mpv OpenGL render context once GL is ready ─────────────
         if !self.render_ctx_initialized && frame.gl().is_some() {
             let init_params = OpenGLInitParams {
@@ -346,6 +510,7 @@ impl eframe::App for FluentMediaPlayer {
             n:     i.key_pressed(egui::Key::N),
             p:     i.key_pressed(egui::Key::P),
             info:  i.key_pressed(egui::Key::I),
+            hw:    i.key_pressed(egui::Key::H),
             esc:   i.key_pressed(egui::Key::Escape),
             scroll_y: i.raw_scroll_delta.y,
             pressed: i.pointer.primary_pressed(),
@@ -384,6 +549,7 @@ impl eframe::App for FluentMediaPlayer {
         if inp.n     { self.play_adjacent(1); }
         if inp.p     { self.play_adjacent(-1); }
         if inp.info  { self.show_info = !self.show_info; }
+        if inp.hw    { self.toggle_hw_decode(); }
 
         // Mouse wheel anywhere in the window = volume, 5 % per notch
         // (egui reports one wheel notch as 50 points)
@@ -487,18 +653,18 @@ impl eframe::App for FluentMediaPlayer {
         }
     }
 
-    /// Quit immediately. Letting Rust tear down mpv, the GL context and the audio
-    /// device the normal way takes a noticeable moment (busy cursor); there is
-    /// nothing to save, so just end the process.
+    /// Reached when the window is closed some way other than our own close button
+    /// (Alt+F4, taskbar). Normal teardown of mpv / GL / audio is slow and crashed
+    /// while a video was open, so save the window position and end the process.
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
-        std::process::exit(0);
+        self.quit();
     }
 }
 
 struct InputSnapshot {
     dropped: Vec<String>,
     space: bool, right: bool, left: bool, up: bool, down: bool,
-    f: bool, m: bool, n: bool, p: bool, info: bool, esc: bool,
+    f: bool, m: bool, n: bool, p: bool, info: bool, hw: bool, esc: bool,
     scroll_y: f32,
     pressed: bool,
     moved: bool, active: bool,
@@ -734,11 +900,10 @@ fn draw_top_bar(app: &mut FluentMediaPlayer, ctx: &egui::Context, t: f32) {
                         match k {
                             0 => ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true)),
                             1 => app.toggle_maximize(ctx),
-                            // End the process right here. (Hiding the window and asking
-                            // egui to close it later doesn't work: a hidden window gets
-                            // no more redraws, so the close was never processed and the
-                            // player kept running — and playing — in the background.)
-                            _ => std::process::exit(0),
+                            // End the process right here (see `quit`). Hiding the window
+                            // and asking egui to close it later doesn't work: a hidden
+                            // window gets no more redraws, so the close was never handled.
+                            _ => app.quit(),
                         }
                     }
                 }
@@ -996,8 +1161,11 @@ fn hit_edge(p: Pos2, screen: Rect) -> Option<(egui::viewport::ResizeDirection, e
 }
 
 // ── Windows accent colour ─────────────────────────────────────────────────────
+fn wide(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
 fn reg_dword(sub_key: &str, value: &str) -> Option<u32> {
-    let wide = |s: &str| s.encode_utf16().chain(std::iter::once(0)).collect::<Vec<u16>>();
     let (key, val) = (wide(sub_key), wide(value));
     let mut data: u32 = 0;
     let mut len: u32 = 4;
@@ -1016,31 +1184,95 @@ fn reg_dword(sub_key: &str, value: &str) -> Option<u32> {
     (rc == 0).then_some(data)
 }
 
+/// Reads a REG_BINARY value into `buf`, returning how many bytes were read
+fn reg_binary(sub_key: &str, value: &str, buf: &mut [u8]) -> Option<usize> {
+    let (key, val) = (wide(sub_key), wide(value));
+    let mut len = buf.len() as u32;
+    // RRF_RT_REG_BINARY = 0x08
+    let rc = unsafe {
+        RegGetValueW(
+            0x8000_0001_u32 as i32 as isize,
+            key.as_ptr(),
+            val.as_ptr(),
+            0x08,
+            std::ptr::null_mut(),
+            buf.as_mut_ptr() as *mut std::ffi::c_void,
+            &mut len,
+        )
+    };
+    (rc == 0).then_some(len as usize)
+}
+
 /// The accent colour from Windows Settings (static, or picked from the wallpaper)
 fn system_accent() -> Color32 {
-    // Explorer\Accent\AccentColorMenu and DWM\AccentColor are stored as 0xAABBGGRR,
-    // DWM\ColorizationColor as 0xAARRGGBB.
-    let rgb = reg_dword(r"Software\Microsoft\Windows\CurrentVersion\Explorer\Accent", "AccentColorMenu")
-        .or_else(|| reg_dword(r"Software\Microsoft\Windows\DWM", "AccentColor"))
-        .map(|v| (v & 0xFF, (v >> 8) & 0xFF, (v >> 16) & 0xFF))
+    const ACCENT_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Explorer\Accent";
+
+    // AccentPalette holds 8 RGBA colours: Light3, Light2, Light1, *Accent*, Dark1, Dark2, Dark3, —.
+    // Entry 3 is the accent exactly as Settings shows it.
+    let mut palette = [0u8; 32];
+    let from_palette = reg_binary(ACCENT_KEY, "AccentPalette", &mut palette)
+        .filter(|&n| n >= 16)
+        .map(|_| (palette[12], palette[13], palette[14]));
+
+    // Fallbacks. AccentColorMenu / DWM\AccentColor are 0xAABBGGRR, ColorizationColor is 0xAARRGGBB.
+    let rgb = from_palette
+        .or_else(|| {
+            reg_dword(ACCENT_KEY, "AccentColorMenu")
+                .or_else(|| reg_dword(r"Software\Microsoft\Windows\DWM", "AccentColor"))
+                .map(|v| ((v & 0xFF) as u8, ((v >> 8) & 0xFF) as u8, ((v >> 16) & 0xFF) as u8))
+        })
         .or_else(|| {
             reg_dword(r"Software\Microsoft\Windows\DWM", "ColorizationColor")
-                .map(|v| ((v >> 16) & 0xFF, (v >> 8) & 0xFF, v & 0xFF))
+                .map(|v| (((v >> 16) & 0xFF) as u8, ((v >> 8) & 0xFF) as u8, (v & 0xFF) as u8))
         });
+
     match rgb {
-        Some((r, g, b)) => readable_accent(Color32::from_rgb(r as u8, g as u8, b as u8)),
+        Some((r, g, b)) => vivid_accent(r, g, b),
         None => DEFAULT_ACCENT,
     }
 }
 
-/// Very dark accents would vanish against the video, so lighten them a bit
-fn readable_accent(c: Color32) -> Color32 {
-    let luma = (0.299 * c.r() as f32 + 0.587 * c.g() as f32 + 0.114 * c.b() as f32) / 255.0;
-    const MIN_LUMA: f32 = 0.5;
-    if luma >= MIN_LUMA { return c; }
-    let mix = ((MIN_LUMA - luma) / (1.0 - luma)).clamp(0.0, 0.8);
-    let lift = |v: u8| (v as f32 + (255.0 - v as f32) * mix) as u8;
-    Color32::from_rgb(lift(c.r()), lift(c.g()), lift(c.b()))
+/// Make the accent punchy on a dark video background: keep the hue, raise saturation
+/// and brightness (never mix with white — that washes the colour out).
+fn vivid_accent(r: u8, g: u8, b: u8) -> Color32 {
+    let (h, s, v) = rgb_to_hsv(r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0);
+    // Genuinely grey accents stay grey; anything with colour gets pushed
+    let s = if s < 0.12 { s } else { (s * 1.25).clamp(0.65, 1.0) };
+    let v = v.max(0.96);
+    let (r, g, b) = hsv_to_rgb(h, s, v);
+    Color32::from_rgb((r * 255.0).round() as u8, (g * 255.0).round() as u8, (b * 255.0).round() as u8)
+}
+
+/// h in 0..360, s and v in 0..1
+fn rgb_to_hsv(r: f32, g: f32, b: f32) -> (f32, f32, f32) {
+    let max = r.max(g).max(b);
+    let min = r.min(g).min(b);
+    let d = max - min;
+    let h = if d == 0.0 {
+        0.0
+    } else if max == r {
+        60.0 * (((g - b) / d).rem_euclid(6.0))
+    } else if max == g {
+        60.0 * ((b - r) / d + 2.0)
+    } else {
+        60.0 * ((r - g) / d + 4.0)
+    };
+    (h, if max == 0.0 { 0.0 } else { d / max }, max)
+}
+
+fn hsv_to_rgb(h: f32, s: f32, v: f32) -> (f32, f32, f32) {
+    let c = v * s;
+    let x = c * (1.0 - ((h / 60.0).rem_euclid(2.0) - 1.0).abs());
+    let m = v - c;
+    let (r, g, b) = match (h / 60.0) as u32 % 6 {
+        0 => (c, x, 0.0),
+        1 => (x, c, 0.0),
+        2 => (0.0, c, x),
+        3 => (0.0, x, c),
+        4 => (x, 0.0, c),
+        _ => (c, 0.0, x),
+    };
+    (r + m, g + m, b + m)
 }
 
 // ── Pop-ups ───────────────────────────────────────────────────────────────────
@@ -1128,6 +1360,15 @@ fn main() -> eframe::Result<()> {
         // We draw our own title bar and window buttons
         .with_decorations(false)
         .with_drag_and_drop(true);
+    // Reopen where (and how big) the window was last time
+    if let Some(w) = load_window_state() {
+        viewport = viewport
+            .with_inner_size([w.w.max(480.0), w.h.max(300.0)])
+            .with_position([w.x, w.y]);
+        if w.maximized {
+            viewport = viewport.with_maximized(true);
+        }
+    }
     // Window / taskbar icon
     if let Ok(icon) = eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png")) {
         viewport = viewport.with_icon(icon);
