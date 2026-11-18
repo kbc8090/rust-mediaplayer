@@ -13,16 +13,29 @@ unsafe extern "system" {
     fn GetProcAddress(hModule: *mut std::ffi::c_void, lpProcName: *const std::os::raw::c_char) -> *mut std::ffi::c_void;
 }
 
+#[link(name = "advapi32")]
+unsafe extern "system" {
+    fn RegGetValueW(
+        hkey: isize,
+        sub_key: *const u16,
+        value: *const u16,
+        flags: u32,
+        value_type: *mut u32,
+        data: *mut std::ffi::c_void,
+        data_len: *mut u32,
+    ) -> i32;
+}
+
 thread_local! {
     static TLS_RENDER_CTX: RefCell<Option<RenderContext<'static>>> = const { RefCell::new(None) };
 }
 
-// ── Palette (sampled from the reference screenshot) ───────────────────────────
-const ACCENT:     Color32 = Color32::from_rgb(254, 188, 127); // seek / volume fill
+// ── Palette ───────────────────────────────────────────────────────────────────
+/// Used only if the Windows accent colour can't be read
+const DEFAULT_ACCENT: Color32 = Color32::from_rgb(0, 120, 212);
 const KNOB_RING:  Color32 = Color32::from_rgb(70, 70, 70);    // dark ring around the knob
 const TRACK:      Color32 = Color32::from_rgb(190, 184, 180); // unplayed seek track
 const VOL_TRACK:  Color32 = Color32::from_rgb(160, 158, 155); // unplayed volume track
-const WIN_BORDER: Color32 = Color32::from_rgb(88, 66, 44);
 
 // ── Layout (points) ───────────────────────────────────────────────────────────
 const TOP_H: f32 = 64.0;              // title strip + gradient height
@@ -45,8 +58,6 @@ struct FluentMediaPlayer {
     volume: f64,
     muted: bool,
     repeat: bool,
-    /// Visual toggle only for now (there is no playlist yet)
-    shuffle: bool,
     on_top: bool,
     speed: f64,
     show_controls: bool,
@@ -62,6 +73,14 @@ struct FluentMediaPlayer {
     folder_index: Option<usize>,
     /// Accumulated mouse-wheel scroll (points) not yet converted into volume steps
     scroll_accum: f32,
+    /// Windows accent colour (re-read every couple of seconds so changes follow live)
+    accent: Color32,
+    accent_checked: std::time::Instant,
+    /// When the volume was last changed by wheel/keys — drives the volume pop-up
+    volume_osd: Option<std::time::Instant>,
+    /// Technical info overlay (toggle with I)
+    show_info: bool,
+    info_lines: Vec<String>,
 }
 
 impl FluentMediaPlayer {
@@ -105,7 +124,6 @@ impl FluentMediaPlayer {
             volume: 80.0,
             muted: false,
             repeat: false,
-            shuffle: false,
             on_top: false,
             speed: 1.0,
             show_controls: true,
@@ -116,6 +134,11 @@ impl FluentMediaPlayer {
             folder_files: Vec::new(),
             folder_index: None,
             scroll_accum: 0.0,
+            accent: system_accent(),
+            accent_checked: std::time::Instant::now(),
+            volume_osd: None,
+            show_info: false,
+            info_lines: Vec::new(),
         }
     }
 
@@ -149,6 +172,35 @@ impl FluentMediaPlayer {
         if let Ok(mpv) = self.mpv.lock() {
             let _ = mpv.set_property("volume", self.volume);
         }
+    }
+
+    /// Change the volume by `delta` percent and show the volume pop-up
+    fn nudge_volume(&mut self, delta: f64) {
+        self.set_volume(self.volume + delta);
+        if delta > 0.0 && self.muted { self.set_mute(false); }
+        self.volume_osd = Some(std::time::Instant::now());
+    }
+
+    /// Gather decoder / video details for the info overlay
+    fn refresh_info(&mut self) {
+        let mut lines = Vec::new();
+        if let Ok(mpv) = self.mpv.lock() {
+            let hw = mpv.get_property::<String>("hwdec-current").unwrap_or_default();
+            lines.push(match hw.as_str() {
+                "" => "Decoder: starting…".to_owned(),
+                "no" => "Decoder: software (CPU)".to_owned(),
+                other => format!("Decoder: hardware ({other})"),
+            });
+            let fmt = mpv.get_property::<String>("video-format").unwrap_or_default();
+            let w = mpv.get_property::<i64>("width").unwrap_or(0);
+            let h = mpv.get_property::<i64>("height").unwrap_or(0);
+            let fps = mpv.get_property::<f64>("estimated-vf-fps").unwrap_or(0.0);
+            lines.push(format!("Video: {fmt} {w}x{h} @ {fps:.1} fps"));
+            let dropped = mpv.get_property::<i64>("frame-drop-count").unwrap_or(0);
+            let dec_dropped = mpv.get_property::<i64>("decoder-frame-drop-count").unwrap_or(0);
+            lines.push(format!("Dropped frames: {dropped} (decoder: {dec_dropped})"));
+        }
+        self.info_lines = lines;
     }
 
     fn set_mute(&mut self, mute: bool) {
@@ -239,6 +291,15 @@ impl eframe::App for FluentMediaPlayer {
             if let Ok(m) = mpv.get_property::<bool>("mute")    { self.muted = m; }
         }
 
+        // Follow the Windows accent colour (changes with wallpaper / Settings)
+        if self.accent_checked.elapsed() > std::time::Duration::from_secs(2) {
+            self.accent = system_accent();
+            self.accent_checked = std::time::Instant::now();
+        }
+        if self.show_info {
+            self.refresh_info();
+        }
+
         // ── Initialize mpv OpenGL render context once GL is ready ─────────────
         if !self.render_ctx_initialized && frame.gl().is_some() {
             let init_params = OpenGLInitParams {
@@ -284,6 +345,7 @@ impl eframe::App for FluentMediaPlayer {
             m:     i.key_pressed(egui::Key::M),
             n:     i.key_pressed(egui::Key::N),
             p:     i.key_pressed(egui::Key::P),
+            info:  i.key_pressed(egui::Key::I),
             esc:   i.key_pressed(egui::Key::Escape),
             scroll_y: i.raw_scroll_delta.y,
             pressed: i.pointer.primary_pressed(),
@@ -316,11 +378,12 @@ impl eframe::App for FluentMediaPlayer {
         if inp.space { self.toggle_play_pause(); }
         if inp.right { self.skip(10.0); }
         if inp.left  { self.skip(-10.0); }
-        if inp.up    { self.set_volume(self.volume + 5.0); }
-        if inp.down  { self.set_volume(self.volume - 5.0); }
-        if inp.m     { let m = !self.muted; self.set_mute(m); }
+        if inp.up    { self.nudge_volume(5.0); }
+        if inp.down  { self.nudge_volume(-5.0); }
+        if inp.m     { let m = !self.muted; self.set_mute(m); self.volume_osd = Some(std::time::Instant::now()); }
         if inp.n     { self.play_adjacent(1); }
         if inp.p     { self.play_adjacent(-1); }
+        if inp.info  { self.show_info = !self.show_info; }
 
         // Mouse wheel anywhere in the window = volume, 5 % per notch
         // (egui reports one wheel notch as 50 points)
@@ -328,8 +391,7 @@ impl eframe::App for FluentMediaPlayer {
         let steps = (self.scroll_accum / 50.0).trunc();
         if steps != 0.0 {
             self.scroll_accum -= steps * 50.0;
-            self.set_volume(self.volume + steps as f64 * 5.0);
-            if steps > 0.0 && self.muted { self.set_mute(false); }
+            self.nudge_volume(steps as f64 * 5.0);
         }
 
         if inp.f     { self.toggle_fullscreen(ctx); }
@@ -399,12 +461,22 @@ impl eframe::App for FluentMediaPlayer {
             ctx.set_cursor_icon(icon);
         }
 
-        // Thin window border (we have no OS frame any more)
-        if !self.is_fullscreen {
-            if !maximized {
-                ctx.layer_painter(egui::LayerId::new(egui::Order::Tooltip, egui::Id::new("border")))
-                    .rect_stroke(screen.shrink(0.5), 0.0, Stroke::new(1.0_f32, WIN_BORDER));
+        // Volume pop-up (top right) for a moment after the volume changes
+        if let Some(t0) = self.volume_osd {
+            let age = t0.elapsed().as_secs_f32();
+            if age < 1.6 {
+                let alpha = if age > 1.2 { 1.0 - (age - 1.2) / 0.4 } else { 1.0 };
+                draw_volume_osd(ctx, self.volume, self.muted, self.accent, alpha, self.is_fullscreen);
+                ctx.request_repaint_after(std::time::Duration::from_millis(30));
+            } else {
+                self.volume_osd = None;
             }
+        }
+
+        // Technical info overlay (I)
+        if self.show_info && self.has_file {
+            draw_info_overlay(ctx, &self.info_lines);
+            ctx.request_repaint_after(std::time::Duration::from_millis(500));
         }
 
         // Schedule a time-display refresh every ~250ms while playing.
@@ -426,7 +498,7 @@ impl eframe::App for FluentMediaPlayer {
 struct InputSnapshot {
     dropped: Vec<String>,
     space: bool, right: bool, left: bool, up: bool, down: bool,
-    f: bool, m: bool, n: bool, p: bool, esc: bool,
+    f: bool, m: bool, n: bool, p: bool, info: bool, esc: bool,
     scroll_y: f32,
     pressed: bool,
     moved: bool, active: bool,
@@ -668,11 +740,11 @@ fn draw_top_bar(app: &mut FluentMediaPlayer, ctx: &egui::Context, t: f32) {
                         match k {
                             0 => ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true)),
                             1 => app.toggle_maximize(ctx),
-                            _ => {
-                                // Hide first so the window vanishes instantly
-                                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
-                                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                            }
+                            // End the process right here. (Hiding the window and asking
+                            // egui to close it later doesn't work: a hidden window gets
+                            // no more redraws, so the close was never processed and the
+                            // player kept running — and playing — in the background.)
+                            _ => std::process::exit(0),
                         }
                     }
                 }
@@ -685,7 +757,7 @@ fn draw_bottom_bar(app: &mut FluentMediaPlayer, ctx: &egui::Context, t: f32) {
     let screen = ctx.screen_rect();
     let bar = Rect::from_min_max(pos2(screen.left(), screen.bottom() - BOTTOM_H), screen.right_bottom());
     let white = Color32::WHITE.gamma_multiply(t);
-    let accent = ACCENT.gamma_multiply(t);
+    let accent = app.accent.gamma_multiply(t);
 
     egui::Area::new(egui::Id::new("bottom_bar"))
         .order(egui::Order::Foreground)
@@ -810,12 +882,6 @@ fn draw_bottom_bar(app: &mut FluentMediaPlayer, ctx: &egui::Context, t: f32) {
 
             // Right-hand buttons
             let tint = |on: bool| if on { accent } else { white };
-
-            let c = pos2(right - 248.0, row_y);
-            if hit(ui, c, "shuffle", "Shuffle (needs a playlist — not wired up yet)", t).clicked() {
-                app.shuffle = !app.shuffle;
-            }
-            icon_shuffle(&p, c, tint(app.shuffle));
 
             let c = pos2(right - 203.0, row_y);
             if hit(ui, c, "repeat", "Repeat this video", t).clicked() { app.toggle_repeat(); }
