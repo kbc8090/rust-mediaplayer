@@ -328,6 +328,8 @@ struct FluentMediaPlayer {
     scroll_accum: f32,
     /// Windows accent colour (re-read every couple of seconds so changes follow live)
     accent: Color32,
+    /// The accent as Windows draws title bars / window borders (not boosted)
+    border_color: Color32,
     accent_checked: std::time::Instant,
     /// When the volume was last changed by wheel/keys — drives the volume pop-up
     volume_osd: Option<std::time::Instant>,
@@ -539,6 +541,7 @@ impl FluentMediaPlayer {
             playlist: None,
             scroll_accum: 0.0,
             accent: system_accent(),
+            border_color: border_accent(),
             accent_checked: std::time::Instant::now(),
             volume_osd: None,
             show_info: false,
@@ -1048,6 +1051,7 @@ impl eframe::App for FluentMediaPlayer {
         // Follow the Windows accent colour (changes with wallpaper / Settings)
         if self.accent_checked.elapsed() > std::time::Duration::from_secs(2) {
             self.accent = system_accent();
+            self.border_color = border_accent();
             self.accent_checked = std::time::Instant::now();
         }
         if self.show_info {
@@ -1386,7 +1390,7 @@ impl eframe::App for FluentMediaPlayer {
         // like Windows' own borders); grey while another window is active
         if self.border && !self.is_fullscreen && !(self.hwnd != 0 && unsafe { IsZoomed(self.hwnd) != 0 }) {
             let focused = ctx.input(|i| i.viewport().focused.unwrap_or(true));
-            let col = if focused { self.accent } else { Color32::from_rgb(70, 70, 72) };
+            let col = if focused { self.border_color } else { Color32::from_rgb(70, 70, 72) };
             let px = 1.0 / ctx.pixels_per_point(); // exactly one screen pixel
             ctx.layer_painter(egui::LayerId::new(egui::Order::Tooltip, egui::Id::new("window_border")))
                 .rect_stroke(screen.shrink(px / 2.0), 0.0, Stroke::new(px, col));
@@ -2385,6 +2389,18 @@ fn system_accent() -> Color32 {
         Some((r, g, b)) => vivid_accent(r, g, b),
         None => DEFAULT_ACCENT,
     }
+}
+
+/// The window border colour: Windows' title-bar accent (what Explorer's title bar
+/// shows), lifted slightly the way Windows draws its own 1 px borders. Much calmer
+/// than the boosted accent the controls use.
+fn border_accent() -> Color32 {
+    const ACCENT_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Explorer\Accent";
+    let abgr = reg_dword(ACCENT_KEY, "AccentColorMenu")
+        .or_else(|| reg_dword(r"Software\Microsoft\Windows\DWM", "AccentColor"));
+    let Some(v) = abgr else { return Color32::from_rgb(0, 95, 184) };
+    let ch = |c: u32| ((c & 0xFF) as f32 * 0.9 + 223.0 * 0.1).round() as u8;
+    Color32::from_rgb(ch(v), ch(v >> 8), ch(v >> 16))
 }
 
 /// Make the accent punchy on a dark video background: keep the hue, raise saturation
