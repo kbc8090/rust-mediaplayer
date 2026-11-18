@@ -40,11 +40,14 @@ unsafe extern "system" {
 #[link(name = "user32")]
 unsafe extern "system" {
     fn GetSystemMetrics(index: i32) -> i32;
+    fn MessageBoxW(hwnd: isize, text: *const u16, caption: *const u16, kind: u32) -> i32;
     fn IsZoomed(hwnd: isize) -> i32;
     fn ShowWindow(hwnd: isize, cmd: i32) -> i32;
 }
 
 thread_local! {
+    /// How long mpv's last render calls took (smoothed), shown in the info overlay
+    static RENDER_MS: std::cell::Cell<f32> = const { std::cell::Cell::new(0.0) };
     static TLS_RENDER_CTX: RefCell<Option<RenderContext<'static>>> = const { RefCell::new(None) };
 }
 
@@ -100,23 +103,39 @@ fn settings_path() -> Option<PathBuf> {
     std::env::var_os("APPDATA").map(|d| PathBuf::from(d).join("rust-mediaplayer").join("settings.txt"))
 }
 
-fn save_settings(volume: i32, muted: bool) {
+/// What's remembered between runs (besides window position)
+#[derive(Clone, Copy, PartialEq)]
+struct Settings {
+    volume: i32,
+    muted: bool,
+    repeat: bool,
+    on_top: bool,
+}
+
+fn save_settings(st: &Settings) {
     let Some(path) = settings_path() else { return };
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    let _ = std::fs::write(path, format!("{} {}", volume, muted as u8));
+    let _ = std::fs::write(
+        path,
+        format!("{} {} {} {}", st.volume, st.muted as u8, st.repeat as u8, st.on_top as u8),
+    );
 }
 
-/// (volume 0-100, muted) from last time; 80 % and not muted on first run
-fn load_settings() -> (f64, bool) {
+/// Settings from last time (older files with fewer fields still load);
+/// 80 % volume and everything off on first run
+fn load_settings() -> Settings {
     let text = settings_path().and_then(|p| std::fs::read_to_string(p).ok()).unwrap_or_default();
     let mut it = text.split_whitespace();
     let volume = it.next().and_then(|t| t.parse::<f64>().ok());
-    let muted = it.next().and_then(|t| t.parse::<u8>().ok()) == Some(1);
-    match volume {
-        Some(v) => (v.clamp(0.0, VOL_MAX), muted),
-        None => (80.0, false),
+    let mut flag = || it.next().and_then(|t| t.parse::<u8>().ok()) == Some(1);
+    let (muted, repeat, on_top) = (flag(), flag(), flag());
+    Settings {
+        volume: volume.map_or(80.0, |v| v.clamp(0.0, VOL_MAX)).round() as i32,
+        muted,
+        repeat,
+        on_top,
     }
 }
 
@@ -230,13 +249,18 @@ struct FluentMediaPlayer {
     fs_armed: bool,
     /// Icon font used for the window buttons
     caption_font: CaptionFont,
+    /// Window size last frame, and the end of the current live-resize (if any)
+    last_size: egui::Vec2,
+    resize_until: Option<std::time::Instant>,
+    /// mpv scaler settings saved while cheap ones are used during a resize
+    fast_scale_saved: Option<Vec<(String, String)>>,
     /// Native window handle and the taskbar integration built on it
     hwnd: isize,
     taskbar: Option<taskbar::Taskbar>,
     taskbar_tried: bool,
     /// Volume / mute: last seen, last written, and when they last changed
-    settings_last: (i32, bool),
-    settings_saved: (i32, bool),
+    settings_last: Settings,
+    settings_saved: Settings,
     settings_changed: std::time::Instant,
     /// Current and last-written window geometry
     win_state: WinState,
@@ -248,7 +272,8 @@ impl FluentMediaPlayer {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let caption_font = install_fonts(&cc.egui_ctx);
         let saved = load_window_state().unwrap_or(WinState::DEFAULT);
-        let (volume, muted) = load_settings();
+        let st = load_settings();
+        let (volume, muted) = (st.volume as f64, st.muted);
         // A file passed on the command line: drag a video onto the .exe, double-click an
         // associated file, or "Open with". (Explorer passes the path as the first argument.)
         let startup_file = std::env::args_os()
@@ -288,9 +313,12 @@ impl FluentMediaPlayer {
         let _ = mpv.set_property("keep-open", "yes");
         let _ = mpv.set_property("volume", volume);
         let _ = mpv.set_property("mute", muted);
-        // Let mpv decide its own frame pacing — do NOT tell egui to repaint every frame.
-        // Instead we use a channel: mpv signals us when a new frame is ready.
-        let _ = mpv.set_property("video-sync", "display-resample");
+        if st.repeat {
+            let _ = mpv.set_property("loop-file", "inf");
+        }
+        // Frame pacing: mpv's default (sync video to audio). "display-resample" needs
+        // per-frame vsync reports that this embedding doesn't provide.
+        // Repaints: mpv signals us through a channel when a new frame is ready.
 
         // Channel: mpv render thread → egui repaint
         let (tx, rx) = std::sync::mpsc::sync_channel::<()>(1);
@@ -312,8 +340,8 @@ impl FluentMediaPlayer {
             duration: 0.0,
             volume,
             muted,
-            repeat: false,
-            on_top: false,
+            repeat: st.repeat,
+            on_top: st.on_top,
             speed: 1.0,
             show_controls: true,
             drag_frac: None,
@@ -336,11 +364,14 @@ impl FluentMediaPlayer {
             fs_settle: None,
             fs_armed: true,
             caption_font,
+            last_size: egui::Vec2::ZERO,
+            resize_until: None,
+            fast_scale_saved: None,
             hwnd: 0,
             taskbar: None,
             taskbar_tried: false,
-            settings_last: (volume.round() as i32, muted),
-            settings_saved: (volume.round() as i32, muted),
+            settings_last: st,
+            settings_saved: st,
             settings_changed: std::time::Instant::now(),
             win_state: saved,
             win_saved: saved,
@@ -397,14 +428,46 @@ impl FluentMediaPlayer {
         self.show_info = true;
     }
 
+    /// Switch mpv to cheap scaling, returning the previous values to restore later
+    fn set_fast_scaling(&self) -> Vec<(String, String)> {
+        const FAST: [(&str, &str); 6] = [
+            ("scale", "bilinear"),
+            ("dscale", "bilinear"),
+            ("cscale", "bilinear"),
+            ("correct-downscaling", "no"),
+            ("linear-downscaling", "no"),
+            ("sigmoid-upscaling", "no"),
+        ];
+        let mut saved = Vec::new();
+        if let Ok(mpv) = self.mpv.lock() {
+            for (k, v) in FAST {
+                if let Ok(old) = mpv.get_property::<String>(k) {
+                    if mpv.set_property(k, v).is_ok() {
+                        saved.push((k.to_owned(), old));
+                    }
+                }
+            }
+        }
+        saved
+    }
+
+    fn current_settings(&self) -> Settings {
+        Settings {
+            volume: self.volume.round() as i32,
+            muted: self.muted,
+            repeat: self.repeat,
+            on_top: self.on_top,
+        }
+    }
+
     /// Remember the window geometry, then end the process at once
     fn quit(&mut self) -> ! {
         if self.win_state != self.win_saved {
             save_window_state(&self.win_state);
         }
-        let cur = (self.volume.round() as i32, self.muted);
+        let cur = self.current_settings();
         if cur != self.settings_saved {
-            save_settings(cur.0, cur.1);
+            save_settings(&cur);
         }
         terminate_now()
     }
@@ -454,6 +517,11 @@ impl FluentMediaPlayer {
             let ahead = mpv.get_property::<f64>("demuxer-cache-duration").unwrap_or(0.0);
             lines.push(format!("Buffered ahead: {ahead:.1} s"));
         }
+        let render_ms = RENDER_MS.with(|r| r.get());
+        lines.push(format!(
+            "Render: {render_ms:.1} ms per frame{}",
+            if self.fast_scale_saved.is_some() { " (fast scaling while resizing)" } else { "" }
+        ));
         if let Some((ws, private)) = process_memory_mb() {
             lines.push(format!("Memory: {ws:.0} MB working set, {private:.0} MB private"));
         }
@@ -682,15 +750,15 @@ impl eframe::App for FluentMediaPlayer {
             }
         }
 
-        // Same for volume / mute
-        let cur = (self.volume.round() as i32, self.muted);
+        // Same for volume / mute / repeat / always-on-top
+        let cur = self.current_settings();
         if cur != self.settings_last {
             self.settings_last = cur;
             self.settings_changed = std::time::Instant::now();
         }
         if self.settings_last != self.settings_saved {
             if self.settings_changed.elapsed() > std::time::Duration::from_secs(1) {
-                save_settings(self.settings_last.0, self.settings_last.1);
+                save_settings(&self.settings_last);
                 self.settings_saved = self.settings_last;
             } else {
                 ctx.request_repaint_after(std::time::Duration::from_millis(1100));
@@ -738,6 +806,37 @@ impl eframe::App for FluentMediaPlayer {
         let sc = ctx.screen_rect();
         if minimized || sc.width() < 64.0 || sc.height() < 64.0 {
             return;
+        }
+
+        // ── Live resize: cheap scalers while the size keeps changing ──────────
+        // Since mpv 0.37 the default rendering is "high quality" (more expensive
+        // scaling), and while you drag a window edge every frame is drawn at a new
+        // size. Use bilinear scaling until the size has been stable for 300 ms,
+        // then switch the quality settings back.
+        let size = sc.size();
+        if size != self.last_size {
+            let first = self.last_size == egui::Vec2::ZERO;
+            self.last_size = size;
+            if !first && self.has_file && self.fs_settle.is_none() {
+                self.resize_until = Some(std::time::Instant::now() + std::time::Duration::from_millis(300));
+                if self.fast_scale_saved.is_none() {
+                    self.fast_scale_saved = Some(self.set_fast_scaling());
+                }
+            }
+        }
+        if let Some(until) = self.resize_until {
+            if std::time::Instant::now() >= until {
+                self.resize_until = None;
+                if let Some(saved) = self.fast_scale_saved.take() {
+                    if let Ok(mpv) = self.mpv.lock() {
+                        for (k, v) in &saved {
+                            let _ = mpv.set_property(k, v.as_str());
+                        }
+                    }
+                }
+            } else {
+                ctx.request_repaint_after(std::time::Duration::from_millis(60));
+            }
         }
 
         // ── Read all input first (no viewport commands inside the closure) ────
@@ -862,6 +961,7 @@ impl eframe::App for FluentMediaPlayer {
                         callback: Arc::new(egui_glow::CallbackFn::new(move |info, _painter| {
                             // Render at the real pixel size so HiDPI scaling stays correct
                             let vp = info.viewport_in_pixels();
+                            let started = std::time::Instant::now();
                             TLS_RENDER_CTX.with(|c| {
                                 if let Some(rc) = c.borrow_mut().as_mut() {
                                     let _ = rc.render::<*mut std::os::raw::c_void>(
@@ -869,6 +969,8 @@ impl eframe::App for FluentMediaPlayer {
                                     );
                                 }
                             });
+                            let ms = started.elapsed().as_secs_f32() * 1000.0;
+                            RENDER_MS.with(|r| r.set(r.get() * 0.8 + ms * 0.2));
                         })),
                     });
                 }
@@ -958,7 +1060,6 @@ fn install_fonts(ctx: &egui::Context) -> CaptionFont {
     ] {
         if let Ok(bytes) = std::fs::read(path) {
             fonts.font_data.insert("caption".into(), egui::FontData::from_owned(bytes));
-            fonts.families.insert(FontFamily::Name("caption".into()), vec!["caption".into()]);
             caption = kind;
             break;
         }
@@ -979,6 +1080,15 @@ fn install_fonts(ctx: &egui::Context) -> CaptionFont {
         semibold.insert(0, "segoe_sb".into());
     }
     fonts.families.insert(FontFamily::Name("semibold".into()), semibold);
+
+    // The icon font has no ordinary characters, and egui refuses (panics) to build
+    // a font family that lacks a "?" / "◻" glyph. So the caption family is the icon
+    // font first, then the normal fonts as fallback.
+    if caption != CaptionFont::None {
+        let mut family: Vec<String> = vec!["caption".into()];
+        family.extend(fonts.families.get(&FontFamily::Proportional).cloned().unwrap_or_default());
+        fonts.families.insert(FontFamily::Name("caption".into()), family);
+    }
 
     ctx.set_fonts(fonts);
     caption
@@ -1319,7 +1429,7 @@ fn draw_bottom_bar(app: &mut FluentMediaPlayer, ctx: &egui::Context, t: f32) {
             let right = screen.right();
 
             let time_text = format!("{} / {}", fmt_time(app.time_pos), fmt_time(app.duration));
-            let time_font = FontId::proportional(14.5);
+            let time_font = FontId::new(14.5, FontFamily::Name("semibold".into()));
             let time_w = p.layout_no_wrap(time_text.clone(), time_font.clone(), white).size().x;
             let lay = row_layout(left, right, time_w);
 
@@ -1363,6 +1473,7 @@ fn draw_bottom_bar(app: &mut FluentMediaPlayer, ctx: &egui::Context, t: f32) {
                     if (v - 100.0).abs() < 2.5 { v = 100.0; }
                     app.set_volume(v.round());
                     if app.muted { app.set_mute(false); }
+                    app.volume_osd = Some(std::time::Instant::now());
                 }
             }
             let vf = (app.volume / VOL_MAX).clamp(0.0, 1.0) as f32;
@@ -1743,6 +1854,20 @@ fn is_video_file(path: &str) -> bool {
 }
 
 fn main() -> eframe::Result<()> {
+    // If anything ever panics, say so (and keep a log) instead of vanishing silently
+    std::panic::set_hook(Box::new(|info| {
+        let msg = format!("{info}");
+        if let Some(path) = settings_path().map(|p| p.with_file_name("crash.log")) {
+            if let Some(dir) = path.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            let _ = std::fs::write(&path, &msg);
+        }
+        let text = wide(&format!("Rust Media Player hit an error and has to close:\n\n{msg}"));
+        let title = wide("Rust Media Player");
+        unsafe { MessageBoxW(0, text.as_ptr(), title.as_ptr(), 0x10 /* MB_ICONERROR */); }
+    }));
+
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("Rust Media Player")
         .with_inner_size([960.0, 540.0])
@@ -1758,6 +1883,9 @@ fn main() -> eframe::Result<()> {
         if w.maximized {
             viewport = viewport.with_maximized(true);
         }
+    }
+    if load_settings().on_top {
+        viewport = viewport.with_window_level(egui::WindowLevel::AlwaysOnTop);
     }
     // Window / taskbar icon
     if let Ok(icon) = eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png")) {
