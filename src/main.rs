@@ -168,9 +168,14 @@ const VOL_TRACK:  Color32 = Color32::from_rgb(160, 158, 155); // unplayed volume
 // ── Layout (points) ───────────────────────────────────────────────────────────
 const TOP_H: f32 = 64.0;              // title strip + gradient height
 const BOTTOM_H: f32 = 104.0;          // control area + gradient height
-const SIDE: f32 = 20.0;               // left/right margin of the seek bar
+const SIDE: f32 = 16.0;               // left/right margin of the seek bar (and the button row)
 const SEEK_FROM_BOTTOM: f32 = 53.0;   // seek bar centre line
 const ROW_FROM_BOTTOM: f32 = 27.0;    // button row centre line
+/// Control-row buttons: hover highlight size and centre-to-centre spacing
+const BTN_BOX: f32 = 28.0;
+const BTN_STEP: f32 = 32.0;
+/// Volume slider track length
+const VOL_W: f32 = 90.0;
 const WIN_BTN_W: f32 = 46.0;
 const WIN_BTN_H: f32 = 34.0;
 const MORE_POPUP: &str = "more_popup";
@@ -223,6 +228,8 @@ struct FluentMediaPlayer {
     fs_settle: Option<std::time::Instant>,
     /// In fullscreen the overlays only appear once the mouse has left the screen edges
     fs_armed: bool,
+    /// Icon font used for the window buttons
+    caption_font: CaptionFont,
     /// Native window handle and the taskbar integration built on it
     hwnd: isize,
     taskbar: Option<taskbar::Taskbar>,
@@ -239,7 +246,7 @@ struct FluentMediaPlayer {
 
 impl FluentMediaPlayer {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        install_fonts(&cc.egui_ctx);
+        let caption_font = install_fonts(&cc.egui_ctx);
         let saved = load_window_state().unwrap_or(WinState::DEFAULT);
         let (volume, muted) = load_settings();
         // A file passed on the command line: drag a video onto the .exe, double-click an
@@ -328,6 +335,7 @@ impl FluentMediaPlayer {
             start_time: std::time::Instant::now(),
             fs_settle: None,
             fs_armed: true,
+            caption_font,
             hwnd: 0,
             taskbar: None,
             taskbar_tried: false,
@@ -928,8 +936,33 @@ struct InputSnapshot {
 }
 
 // ── Fonts: use Segoe UI if Windows has it, otherwise egui's defaults ──────────
-fn install_fonts(ctx: &egui::Context) {
+/// Which Windows icon font supplies the minimize / maximize / close glyphs
+#[derive(Clone, Copy, PartialEq)]
+enum CaptionFont {
+    /// Segoe Fluent Icons (Windows 11)
+    Fluent,
+    /// Segoe MDL2 Assets (Windows 10)
+    Mdl2,
+    /// Neither found: draw the glyphs with lines
+    None,
+}
+
+fn install_fonts(ctx: &egui::Context) -> CaptionFont {
     let mut fonts = egui::FontDefinitions::default();
+
+    // The exact icon font Windows draws its own title-bar buttons with
+    let mut caption = CaptionFont::None;
+    for (path, kind) in [
+        (r"C:\Windows\Fonts\SegoeIcons.ttf", CaptionFont::Fluent),
+        (r"C:\Windows\Fonts\segmdl2.ttf", CaptionFont::Mdl2),
+    ] {
+        if let Ok(bytes) = std::fs::read(path) {
+            fonts.font_data.insert("caption".into(), egui::FontData::from_owned(bytes));
+            fonts.families.insert(FontFamily::Name("caption".into()), vec!["caption".into()]);
+            caption = kind;
+            break;
+        }
+    }
 
     if let Ok(bytes) = std::fs::read(r"C:\Windows\Fonts\segoeui.ttf") {
         fonts.font_data.insert("segoe".into(), egui::FontData::from_owned(bytes));
@@ -948,6 +981,7 @@ fn install_fonts(ctx: &egui::Context) {
     fonts.families.insert(FontFamily::Name("semibold".into()), semibold);
 
     ctx.set_fonts(fonts);
+    caption
 }
 
 // ── Small drawing helpers ─────────────────────────────────────────────────────
@@ -984,17 +1018,18 @@ fn kclosed(p: &egui::Painter, c: Pos2, pts: &[(f32, f32)], col: Color32, w: f32)
     p.add(egui::Shape::closed_line(v, Stroke::new(w, col)));
 }
 
-/// 36×36 click target with a faint 30×30 rounded hover highlight (8 px radius). Draw the icon afterwards.
+/// Click target (one full step wide, so neighbours never overlap) with a faint
+/// rounded hover highlight (8 px radius). Draw the icon afterwards.
 fn hit(ui: &mut egui::Ui, centre: Pos2, id: &str, tip: &str, t: f32) -> egui::Response {
     let r = ui.interact(
-        Rect::from_center_size(centre, vec2(36.0, 36.0)),
+        Rect::from_center_size(centre, vec2(BTN_STEP, 34.0)),
         ui.id().with(id),
         Sense::click(),
     );
     if r.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
         ui.painter().rect_filled(
-            Rect::from_center_size(centre, vec2(30.0, 30.0)),
+            Rect::from_center_size(centre, vec2(BTN_BOX, BTN_BOX)),
             8.0,
             Color32::from_white_alpha((13.0 * t) as u8),
         );
@@ -1111,13 +1146,14 @@ fn draw_top_bar(app: &mut FluentMediaPlayer, ctx: &egui::Context, t: f32) {
             }
 
             // Drag region: move the window, double-click to maximise
+            // (The whole strip, not just its top part: the strip covers the video,
+            // so any part of it that doesn't drag is a dead spot.)
             if !fullscreen {
-                let drag = ui.interact(
-                    Rect::from_min_size(bar.min, vec2(bar.width(), 40.0)),
-                    ui.id().with("drag"),
-                    Sense::click_and_drag(),
-                );
-                if drag.drag_started() {
+                let drag = ui.interact(bar, ui.id().with("drag"), Sense::click_and_drag());
+                let pressed_on_edge = ctx
+                    .input(|i| i.pointer.press_origin())
+                    .map_or(false, |o| hit_edge(o, screen).is_some());
+                if drag.drag_started() && !pressed_on_edge {
                     ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
                 }
                 if drag.double_clicked() {
@@ -1128,10 +1164,10 @@ fn draw_top_bar(app: &mut FluentMediaPlayer, ctx: &egui::Context, t: f32) {
             // Left: file name
             let y = 28.0;
             let right_limit = if fullscreen { screen.right() - 20.0 } else { screen.right() - WIN_BTN_W * 3.0 - 10.0 };
-            let clip = p.with_clip_rect(Rect::from_min_max(pos2(20.0, 0.0), pos2(right_limit, TOP_H)));
+            let clip = p.with_clip_rect(Rect::from_min_max(pos2(SIDE, 0.0), pos2(right_limit, TOP_H)));
             let font = FontId::new(14.5, FontFamily::Name("semibold".into()));
-            clip.text(pos2(21.0, y + 1.0), Align2::LEFT_CENTER, &title, font.clone(), black(170, t));
-            clip.text(pos2(20.0, y), Align2::LEFT_CENTER, &title, font, white);
+            clip.text(pos2(SIDE + 1.0, y + 1.0), Align2::LEFT_CENTER, &title, font.clone(), black(170, t));
+            clip.text(pos2(SIDE, y), Align2::LEFT_CENTER, &title, font, white);
 
             // Right: window buttons (not shown in fullscreen)
             if !fullscreen {
@@ -1142,15 +1178,31 @@ fn draw_top_bar(app: &mut FluentMediaPlayer, ctx: &egui::Context, t: f32) {
                     );
                     let resp = ui.interact(r, ui.id().with(("winbtn", k)), Sense::click());
                     if resp.hovered() {
+                        // Windows' own hover colours (the close red differs on 10 and 11)
                         let fill = if k == 2 {
-                            Color32::from_rgb(232, 17, 35).gamma_multiply(t)
+                            if app.caption_font == CaptionFont::Mdl2 {
+                                Color32::from_rgb(232, 17, 35)
+                            } else {
+                                Color32::from_rgb(196, 43, 28)
+                            }
+                            .gamma_multiply(t)
                         } else {
-                            Color32::from_white_alpha((28.0 * t) as u8)
+                            Color32::from_white_alpha((22.0 * t) as u8)
                         };
                         p.rect_filled(r, 0.0, fill);
                     }
                     let c = r.center();
                     let s = Stroke::new(1.1_f32, white);
+                    if app.caption_font != CaptionFont::None {
+                        // ChromeMinimize / ChromeMaximize / ChromeRestore / ChromeClose
+                        let glyph = match k {
+                            0 => "\u{E921}",
+                            1 if maximized => "\u{E923}",
+                            1 => "\u{E922}",
+                            _ => "\u{E8BB}",
+                        };
+                        p.text(c, Align2::CENTER_CENTER, glyph, FontId::new(10.0, FontFamily::Name("caption".into())), white);
+                    } else {
                     match k {
                         0 => { p.line_segment([pos2(c.x - 5.0, c.y), pos2(c.x + 5.0, c.y)], s); }
                         1 => {
@@ -1165,6 +1217,7 @@ fn draw_top_bar(app: &mut FluentMediaPlayer, ctx: &egui::Context, t: f32) {
                             p.line_segment([pos2(c.x - 5.0, c.y - 5.0), pos2(c.x + 5.0, c.y + 5.0)], s);
                             p.line_segment([pos2(c.x - 5.0, c.y + 5.0), pos2(c.x + 5.0, c.y - 5.0)], s);
                         }
+                    }
                     }
                     if resp.clicked() {
                         match k {
@@ -1265,8 +1318,13 @@ fn draw_bottom_bar(app: &mut FluentMediaPlayer, ctx: &egui::Context, t: f32) {
             let left = screen.left();
             let right = screen.right();
 
+            let time_text = format!("{} / {}", fmt_time(app.time_pos), fmt_time(app.duration));
+            let time_font = FontId::proportional(14.5);
+            let time_w = p.layout_no_wrap(time_text.clone(), time_font.clone(), white).size().x;
+            let lay = row_layout(left, right, time_w);
+
             // Play / pause
-            let c = pos2(left + 27.0, row_y);
+            let c = pos2(lay.play, row_y);
             if hit(ui, c, "play", if app.is_playing { "Pause (Space)" } else { "Play (Space)" }, t).clicked() {
                 app.toggle_play_pause();
             }
@@ -1274,31 +1332,28 @@ fn draw_bottom_bar(app: &mut FluentMediaPlayer, ctx: &egui::Context, t: f32) {
 
             // Previous / next file in the same folder (dimmed when there isn't one)
             let dim = white.gamma_multiply(0.4);
-            let c = pos2(left + 71.0, row_y);
+            let c = pos2(lay.prev, row_y);
             if app.has_prev() && hit(ui, c, "prev", "Previous file (P)", t).clicked() { app.play_adjacent(-1); }
             icon_prev(&p, c, if app.has_prev() { white } else { dim });
 
-            let c = pos2(left + 111.0, row_y);
+            let c = pos2(lay.next, row_y);
             if app.has_next() && hit(ui, c, "next", "Next file (N)", t).clicked() { app.play_adjacent(1); }
             icon_next(&p, c, if app.has_next() { white } else { dim });
 
             // Time
-            p.text(
-                pos2(left + 139.0, row_y), Align2::LEFT_CENTER,
-                format!("{} / {}", fmt_time(app.time_pos), fmt_time(app.duration)),
-                FontId::proportional(14.5), white,
-            );
+            p.text(pos2(lay.time_x, row_y), Align2::LEFT_CENTER, time_text, time_font, white);
 
-            // Volume icon (click = mute) + slider
-            let c = pos2(right - 355.0, row_y);
+            // Volume icon (click = mute) + slider (the slider is left out when the
+            // window is too narrow for it; the wheel and arrow keys still work)
+            let c = pos2(lay.mute, row_y);
             if hit(ui, c, "mute", if app.muted { "Unmute (M)" } else { "Mute (M)" }, t).clicked() {
                 let m = !app.muted;
                 app.set_mute(m);
             }
             icon_volume(&p, c, white, app.volume, app.muted);
 
-            let vl = right - 325.0;
-            let vw = 93.0;
+            if let Some(vl) = lay.vol_x {
+            let vw = VOL_W;
             let vr = Rect::from_min_max(pos2(vl - 8.0, row_y - 12.0), pos2(vl + vw + 8.0, row_y + 12.0));
             let vresp = ui.interact(vr, ui.id().with("vol"), Sense::click_and_drag());
             if vresp.is_pointer_button_down_on() || vresp.dragged() {
@@ -1327,28 +1382,29 @@ fn draw_bottom_bar(app: &mut FluentMediaPlayer, ctx: &egui::Context, t: f32) {
                 1.0, accent,
             );
             draw_knob(&p, ctx.pixels_per_point(), pos2(vl + vw * vf, row_y), vhot, accent, t);
+            }
 
             // Right-hand buttons
             let tint = |on: bool| if on { accent } else { white };
 
-            let c = pos2(right - 203.0, row_y);
+            let c = pos2(lay.repeat, row_y);
             if hit(ui, c, "repeat", "Repeat this video", t).clicked() { app.toggle_repeat(); }
             icon_repeat(&p, c, tint(app.repeat));
 
-            let c = pos2(right - 159.0, row_y);
+            let c = pos2(lay.captions, row_y);
             if hit(ui, c, "captions", "Cycle subtitles", t).clicked() { app.cycle_captions(); }
             icon_captions(&p, c, white);
 
-            let c = pos2(right - 115.0, row_y);
+            let c = pos2(lay.ontop, row_y);
             if hit(ui, c, "ontop", "Always on top", t).clicked() { app.toggle_on_top(ctx); }
             icon_compact(&p, c, tint(app.on_top));
 
-            let c = pos2(right - 71.0, row_y);
+            let c = pos2(lay.fs, row_y);
             if hit(ui, c, "fs", "Full screen (F)", t).clicked() { app.toggle_fullscreen(ctx); }
             icon_fullscreen(&p, c, white);
 
             // "More" → playback speed menu
-            let c = pos2(right - 27.0, row_y);
+            let c = pos2(lay.more, row_y);
             let more = hit(ui, c, "more", "Playback speed", t);
             icon_more(&p, c, white);
             let popup_id = egui::Id::new(MORE_POPUP);
@@ -1366,6 +1422,51 @@ fn draw_bottom_bar(app: &mut FluentMediaPlayer, ctx: &egui::Context, t: f32) {
                 }
             });
         });
+}
+
+// ── Control-row layout ────────────────────────────────────────────────────────
+/// Horizontal centres of the control-row items for a window spanning left..right.
+/// The first button's highlight starts exactly where the seek bar starts and the last
+/// one ends where the seek bar ends.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct RowLayout {
+    play: f32,
+    prev: f32,
+    next: f32,
+    time_x: f32,
+    mute: f32,
+    /// Left end of the volume slider track, or None when there's no room for it
+    vol_x: Option<f32>,
+    repeat: f32,
+    captions: f32,
+    ontop: f32,
+    fs: f32,
+    more: f32,
+}
+
+fn row_layout(left: f32, right: f32, time_w: f32) -> RowLayout {
+    let half = BTN_BOX / 2.0;
+    let play = left + SIDE + half;
+    let prev = play + BTN_STEP;
+    let next = prev + BTN_STEP;
+    let time_x = next + half + 10.0;
+    let time_end = time_x + time_w;
+
+    let more = right - SIDE - half;
+    let fs = more - BTN_STEP;
+    let ontop = fs - BTN_STEP;
+    let captions = ontop - BTN_STEP;
+    let repeat = captions - BTN_STEP;
+
+    // Slider sits between the volume icon and the repeat button
+    let vol_x = repeat - half - 12.0 - VOL_W;
+    let mute_with_slider = vol_x - 14.0 - half; // room for the knob at 0 %
+    let (mute, vol_x) = if mute_with_slider - half >= time_end + 14.0 {
+        (mute_with_slider, Some(vol_x))
+    } else {
+        (repeat - BTN_STEP, None)
+    };
+    RowLayout { play, prev, next, time_x, mute, vol_x, repeat, captions, ontop, fs, more }
 }
 
 // ── Folder navigation ─────────────────────────────────────────────────────────
