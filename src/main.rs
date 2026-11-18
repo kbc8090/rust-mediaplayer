@@ -2701,7 +2701,6 @@ fn draw_main_menu(app: &mut FluentMediaPlayer, ctx: &egui::Context) {
 
     let mut rows = vec![
         MenuRow::Item { key: "open", label: "Open file\u{2026}", hint: Some("Ctrl+O"), mark: Mark::None },
-        MenuRow::Item { key: "keys", label: "Keyboard shortcuts", hint: None, mark: Mark::None },
         MenuRow::Sep,
         MenuRow::Item { key: "autoplay", label: "Auto-play next file in folder", hint: None, mark: Mark::Check(app.autoplay) },
         MenuRow::Item { key: "normalize", label: "Normalize volume", hint: None, mark: Mark::Check(app.normalize) },
@@ -2717,6 +2716,9 @@ fn draw_main_menu(app: &mut FluentMediaPlayer, ctx: &egui::Context) {
     rows.push(MenuRow::Sep);
     rows.push(MenuRow::Item { key: "asc", label: "Ascending", hint: None, mark: Mark::Dot(!app.sort_desc) });
     rows.push(MenuRow::Item { key: "desc", label: "Descending", hint: None, mark: Mark::Dot(app.sort_desc) });
+    rows.push(MenuRow::Sep);
+    rows.push(MenuRow::Item { key: "keys", label: "Keyboard shortcuts", hint: None, mark: Mark::None });
+    rows.push(MenuRow::Item { key: "quit", label: "Quit", hint: Some("Alt+F4"), mark: Mark::None });
     let row_h = |r: &MenuRow| match r {
         MenuRow::Item { .. } => ITEM_H,
         MenuRow::Header(_) => HEAD_H,
@@ -2812,6 +2814,7 @@ fn draw_main_menu(app: &mut FluentMediaPlayer, ctx: &egui::Context) {
     match picked {
         Some("open") => app.show_open_dialog(),
         Some("keys") => app.show_keys = true,
+        Some("quit") => app.quit(),
         Some("autoplay") => app.autoplay = !app.autoplay,
         Some("normalize") => app.toggle_normalize(),
         Some("multi") => app.multi = !app.multi,
