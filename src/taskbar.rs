@@ -239,7 +239,11 @@ unsafe fn enter_fullscreen_now(hwnd: isize) {
         }
         FS_WAS_MAX.store(was_max, Ordering::Relaxed);
         let m = info.monitor;
-        SetWindowPos(hwnd, 0, m.left, m.top, m.right - m.left, m.bottom - m.top, 0x0200); // SWP_NOOWNERZORDER
+        // One pixel taller than the monitor: a borderless OpenGL window that exactly
+        // covers the screen gets switched by Windows / the GPU driver into an
+        // "exclusive fullscreen" present mode, and that switch is a visible blink.
+        // The extra row is off-screen; the taskbar still hides as usual.
+        SetWindowPos(hwnd, 0, m.left, m.top, m.right - m.left, m.bottom - m.top + 1, 0x0200); // SWP_NOOWNERZORDER
     } else {
         if was_max {
             ShowWindow(hwnd, 3); // SW_MAXIMIZE — couldn't go fullscreen, put it back

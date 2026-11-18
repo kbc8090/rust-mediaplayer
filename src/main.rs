@@ -2,6 +2,7 @@
 
 use eframe::egui::{self, pos2, vec2, Align2, Color32, FontFamily, FontId, Pos2, Rect, Sense, Stroke};
 use libmpv2::{Mpv, render::{RenderContext, OpenGLInitParams, RenderParam, RenderParamApiType}};
+mod splash;
 mod taskbar;
 
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
@@ -33,6 +34,7 @@ unsafe extern "system" {
 unsafe extern "system" {
     fn GetCurrentProcess() -> isize;
     fn TerminateProcess(process: isize, exit_code: u32) -> i32;
+    fn K32GetProcessMemoryInfo(process: isize, counters: *mut MemCounters, size: u32) -> i32;
 }
 
 #[link(name = "user32")]
@@ -52,6 +54,30 @@ thread_local! {
 fn terminate_now() -> ! {
     unsafe { TerminateProcess(GetCurrentProcess(), 0); }
     std::process::exit(0)
+}
+
+// ── Memory readout for the info overlay ──────────────────────────────────────
+#[repr(C)]
+#[derive(Default)]
+struct MemCounters {
+    cb: u32,
+    page_fault_count: u32,
+    peak_working_set: usize,
+    working_set: usize,
+    quota_peak_paged_pool: usize,
+    quota_paged_pool: usize,
+    quota_peak_non_paged_pool: usize,
+    quota_non_paged_pool: usize,
+    pagefile_usage: usize,
+    peak_pagefile_usage: usize,
+    private_usage: usize,
+}
+
+/// (working set, private bytes) of this process in MB
+fn process_memory_mb() -> Option<(f64, f64)> {
+    let mut c = MemCounters { cb: std::mem::size_of::<MemCounters>() as u32, ..Default::default() };
+    let ok = unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut c, c.cb) } != 0;
+    ok.then(|| (c.working_set as f64 / 1048576.0, c.private_usage as f64 / 1048576.0))
 }
 
 // ── Remembered window position / size ─────────────────────────────────────────
@@ -234,6 +260,11 @@ impl FluentMediaPlayer {
             // Don't decode straight into GPU-mapped buffers (another known source of
             // garbled frames on some drivers).
             let _ = init.set_property("vd-lavc-dr", "no");
+            // Memory: mpv's defaults keep up to 150 MiB of read-ahead plus 50 MiB of
+            // already-played packets. For local files a few seconds is plenty.
+            let _ = init.set_property("cache", "no");
+            let _ = init.set_property("demuxer-max-bytes", "32MiB");
+            let _ = init.set_property("demuxer-max-back-bytes", "8MiB");
             Ok(())
         })
         .expect("Failed to initialize libmpv!");
@@ -400,6 +431,11 @@ impl FluentMediaPlayer {
                 "Hardware decoding: {}  (H to switch)",
                 if self.hw_decode { "on" } else { "off" }
             ));
+            let ahead = mpv.get_property::<f64>("demuxer-cache-duration").unwrap_or(0.0);
+            lines.push(format!("Buffered ahead: {ahead:.1} s"));
+        }
+        if let Some((ws, private)) = process_memory_mb() {
+            lines.push(format!("Memory: {ws:.0} MB working set, {private:.0} MB private"));
         }
         self.info_lines = lines;
     }
@@ -798,7 +834,9 @@ impl eframe::App for FluentMediaPlayer {
                     ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
                 }
 
-                if self.render_ctx_initialized {
+                if !self.has_file {
+                    splash::draw(ui.painter(), rect, self.accent);
+                } else if self.render_ctx_initialized {
                     ui.painter().add(egui::PaintCallback {
                         rect,
                         callback: Arc::new(egui_glow::CallbackFn::new(move |info, _painter| {
@@ -813,8 +851,6 @@ impl eframe::App for FluentMediaPlayer {
                             });
                         })),
                     });
-                } else if !self.has_file {
-                    draw_drop_hint(ui, rect);
                 }
             });
 
@@ -900,28 +936,6 @@ fn install_fonts(ctx: &egui::Context) {
     fonts.families.insert(FontFamily::Name("semibold".into()), semibold);
 
     ctx.set_fonts(fonts);
-}
-
-// ── Drop hint ─────────────────────────────────────────────────────────────────
-fn draw_drop_hint(ui: &mut egui::Ui, rect: Rect) {
-    let c = rect.center();
-    let p = ui.painter();
-    p.circle_stroke(c, 44.0, Stroke::new(2.0_f32, Color32::from_rgb(70, 70, 82)));
-    p.add(egui::Shape::convex_polygon(
-        vec![
-            pos2(c.x - 11.0, c.y - 17.0),
-            pos2(c.x - 11.0, c.y + 17.0),
-            pos2(c.x + 22.0, c.y),
-        ],
-        Color32::from_rgb(70, 70, 82),
-        Stroke::NONE,
-    ));
-    p.text(pos2(c.x, c.y + 68.0), Align2::CENTER_CENTER,
-        "Drop a video file to play", FontId::proportional(17.0),
-        Color32::from_rgb(140, 140, 155));
-    p.text(pos2(c.x, c.y + 92.0), Align2::CENTER_CENTER,
-        "MP4 · MKV · AVI · MOV · WMV · WebM · and more",
-        FontId::proportional(12.0), Color32::from_rgb(90, 90, 105));
 }
 
 // ── Small drawing helpers ─────────────────────────────────────────────────────
@@ -1225,11 +1239,11 @@ fn draw_bottom_bar(app: &mut FluentMediaPlayer, ctx: &egui::Context, t: f32) {
             // Previous / next file in the same folder (dimmed when there isn't one)
             let dim = white.gamma_multiply(0.4);
             let c = pos2(left + 71.0, row_y);
-            if hit(ui, c, "prev", "Previous file (P)", t).clicked() { app.play_adjacent(-1); }
+            if app.has_prev() && hit(ui, c, "prev", "Previous file (P)", t).clicked() { app.play_adjacent(-1); }
             icon_prev(&p, c, if app.has_prev() { white } else { dim });
 
             let c = pos2(left + 111.0, row_y);
-            if hit(ui, c, "next", "Next file (N)", t).clicked() { app.play_adjacent(1); }
+            if app.has_next() && hit(ui, c, "next", "Next file (N)", t).clicked() { app.play_adjacent(1); }
             icon_next(&p, c, if app.has_next() { white } else { dim });
 
             // Time
