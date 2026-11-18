@@ -48,6 +48,8 @@ unsafe extern "system" {
 thread_local! {
     /// How long mpv's last render calls took (smoothed), shown in the info overlay
     static RENDER_MS: std::cell::Cell<f32> = const { std::cell::Cell::new(0.0) };
+    /// The most recent single render call, unsmoothed (for resize statistics)
+    static RENDER_LAST_MS: std::cell::Cell<f32> = const { std::cell::Cell::new(0.0) };
     static TLS_RENDER_CTX: RefCell<Option<RenderContext<'static>>> = const { RefCell::new(None) };
 }
 
@@ -256,6 +258,9 @@ struct FluentMediaPlayer {
     fast_scale_saved: Option<Vec<(String, String)>>,
     /// Q: use fast rendering all the time
     fast_always: bool,
+    /// Live-resize statistics: frames, summed / worst frame interval, worst mpv render (ms)
+    last_frame: std::time::Instant,
+    rs_stats: (u32, f32, f32, f32),
     /// Native window handle and the taskbar integration built on it
     hwnd: isize,
     taskbar: Option<taskbar::Taskbar>,
@@ -292,6 +297,14 @@ impl FluentMediaPlayer {
             // own. Older libmpv builds happened to pick this automatically; newer
             // ones default to their own video output (a separate "mpv" window).
             let _ = init.set_property("vo", "libmpv");
+            // mpv's own detailed log (overwritten every launch), for diagnosing
+            // differences between libmpv versions
+            if let Some(log) = settings_path().map(|p| p.with_file_name("mpv.log")) {
+                if let Some(dir) = log.parent() {
+                    let _ = std::fs::create_dir_all(dir);
+                }
+                let _ = init.set_property("log-file", log.to_string_lossy().as_ref());
+            }
             let _ = init.set_property("video-timing-offset", 0.0_f64);
             // Hardware decoding with copy-back: the GPU decodes, frames are copied to
             // system memory and uploaded as normal textures. The direct GPU-sharing
@@ -370,6 +383,8 @@ impl FluentMediaPlayer {
             resize_until: None,
             fast_scale_saved: None,
             fast_always: false,
+            last_frame: std::time::Instant::now(),
+            rs_stats: (0, 0.0, 0.0, 0.0),
             hwnd: 0,
             taskbar: None,
             taskbar_tried: false,
@@ -536,6 +551,13 @@ impl FluentMediaPlayer {
             "Render: {render_ms:.1} ms per frame, quality: {}  (Q to switch)",
             if self.fast_always { "fast" } else if self.fast_scale_saved.is_some() { "fast while resizing" } else { "high" }
         ));
+        let (n, sum, worst, worst_render) = self.rs_stats;
+        if n > 0 {
+            lines.push(format!(
+                "Last resize: {n} frames, avg {:.0} ms, worst {worst:.0} ms (mpv render worst {worst_render:.0} ms)",
+                sum / n as f32
+            ));
+        }
         if let Some((ws, private)) = process_memory_mb() {
             lines.push(format!("Memory: {ws:.0} MB working set, {private:.0} MB private"));
         }
@@ -827,8 +849,19 @@ impl eframe::App for FluentMediaPlayer {
         // scaling), and while you drag a window edge every frame is drawn at a new
         // size. Use bilinear scaling until the size has been stable for 300 ms,
         // then switch the quality settings back.
+        let now = std::time::Instant::now();
+        let frame_ms = now.duration_since(self.last_frame).as_secs_f32() * 1000.0;
+        self.last_frame = now;
+        if self.resize_until.is_some() {
+            let render_ms = RENDER_LAST_MS.with(|r| r.get());
+            let st = &mut self.rs_stats;
+            *st = (st.0 + 1, st.1 + frame_ms, st.2.max(frame_ms), st.3.max(render_ms));
+        }
         let size = sc.size();
         if size != self.last_size {
+            if self.resize_until.is_none() {
+                self.rs_stats = (0, 0.0, 0.0, 0.0); // a new resize begins
+            }
             let first = self.last_size == egui::Vec2::ZERO;
             self.last_size = size;
             if !first && self.has_file && self.fs_settle.is_none() {
@@ -995,6 +1028,7 @@ impl eframe::App for FluentMediaPlayer {
                             });
                             let ms = started.elapsed().as_secs_f32() * 1000.0;
                             RENDER_MS.with(|r| r.set(r.get() * 0.8 + ms * 0.2));
+                            RENDER_LAST_MS.with(|r| r.set(ms));
                         })),
                     });
                 }
@@ -1205,76 +1239,32 @@ fn hover_tooltip(ctx: &egui::Context, resp: &egui::Response, anchor: Rect, text:
     draw_tooltip(ctx, anchor, text, above, alpha);
 }
 
-/// Fine grain for the acrylic look, made once and kept in egui's memory
-fn noise_texture(ctx: &egui::Context) -> egui::TextureHandle {
-    let id = egui::Id::new("rmp_noise_texture");
-    if let Some(tex) = ctx.data(|d| d.get_temp::<egui::TextureHandle>(id)) {
-        return tex;
-    }
-    const N: usize = 64;
-    let mut img = egui::ColorImage::new([N, N], Color32::TRANSPARENT);
-    let mut x: u32 = 0x9E37_79B9;
-    for px in img.pixels.iter_mut() {
-        // xorshift: cheap, good-enough random grain
-        x ^= x << 13;
-        x ^= x >> 17;
-        x ^= x << 5;
-        *px = Color32::from_white_alpha((x >> 24) as u8);
-    }
-    let tex = ctx.load_texture("rmp_noise", img, egui::TextureOptions::NEAREST);
-    ctx.data_mut(|d| d.insert_temp(id, tex.clone()));
-    tex
-}
-
-/// Windows 11-style flyout: translucent dark tint with fine grain (the "acrylic"
-/// look), hairline light border and a soft shadow.
+/// Windows 11-style dark tooltip: near-opaque dark grey, hairline border,
+/// small corner radius and a faint shadow.
 fn draw_tooltip(ctx: &egui::Context, anchor: Rect, text: &str, above: bool, alpha: f32) {
     let p = ctx.layer_painter(egui::LayerId::new(egui::Order::Tooltip, egui::Id::new("rmp_tooltip")));
     let galley = p.layout_no_wrap(
         text.to_owned(),
         FontId::proportional(12.5),
-        Color32::from_rgb(242, 242, 245).gamma_multiply(alpha),
+        Color32::from_rgb(235, 235, 235).gamma_multiply(alpha),
     );
-    let pad = vec2(10.0, 6.0);
+    let pad = vec2(9.0, 5.0);
     let size = galley.size() + pad * 2.0;
     let screen = ctx.screen_rect();
     let x = (anchor.center().x - size.x / 2.0)
         .min(screen.right() - 6.0 - size.x)
-        .max(screen.left() + 6.0);
-    let y = if above { anchor.top() - 6.0 - size.y } else { anchor.bottom() + 6.0 };
+        .max(screen.left() + 6.0)
+        .round();
+    let y = if above { anchor.top() - 6.0 - size.y } else { anchor.bottom() + 6.0 }.round();
     let rect = Rect::from_min_size(pos2(x, y), size);
-    let r = 6.0;
+    let r = 5.0;
 
-    // soft shadow
-    for i in 1..=6 {
-        let e = i as f32 * 1.5;
-        let a = 16.0 * alpha * (1.0 - i as f32 / 7.0);
-        p.rect_filled(rect.expand(e).translate(vec2(0.0, 2.0)), r + e, Color32::from_black_alpha(a as u8));
+    // faint shadow
+    for (e, a) in [(1.0, 22.0), (2.5, 12.0), (4.0, 6.0)] {
+        p.rect_filled(rect.expand(e).translate(vec2(0.0, 1.5)), r + e, Color32::from_black_alpha((a * alpha) as u8));
     }
-    // tinted, translucent body
-    p.rect_filled(rect, r, Color32::from_rgba_unmultiplied(38, 38, 42, (212.0 * alpha) as u8));
-    // a faint lighter top half, like the acrylic luminosity layer
-    let top = Rect::from_min_max(rect.min, pos2(rect.right(), rect.center().y));
-    p.rect_filled(top, egui::Rounding { nw: r, ne: r, sw: 0.0, se: 0.0 }, Color32::from_white_alpha((5.0 * alpha) as u8));
-    // grain
-    let tex = noise_texture(ctx);
-    let grain = p.with_clip_rect(rect.shrink(2.0));
-    let mut ty = rect.top();
-    while ty < rect.bottom() {
-        let mut tx = rect.left();
-        while tx < rect.right() {
-            grain.image(
-                tex.id(),
-                Rect::from_min_size(pos2(tx, ty), vec2(64.0, 64.0)),
-                Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
-                Color32::from_white_alpha((9.0 * alpha) as u8),
-            );
-            tx += 64.0;
-        }
-        ty += 64.0;
-    }
-    // hairline border
-    p.rect_stroke(rect, r, Stroke::new(1.0_f32, Color32::from_white_alpha((28.0 * alpha) as u8)));
+    p.rect_filled(rect, r, Color32::from_rgba_unmultiplied(43, 43, 43, (245.0 * alpha) as u8));
+    p.rect_stroke(rect.shrink(0.5), r, Stroke::new(1.0_f32, Color32::from_white_alpha((20.0 * alpha) as u8)));
     p.galley(rect.min + pad, galley, Color32::WHITE);
 }
 
@@ -1519,7 +1509,11 @@ fn draw_bottom_bar(app: &mut FluentMediaPlayer, ctx: &egui::Context, t: f32) {
                 pos2(screen.right() - SIDE, seek_y + 10.0),
             );
             let seek = ui.interact(sr, ui.id().with("seek"), Sense::click_and_drag());
-            let frac_at = |x: f32| ((x - sr.left()) / sr.width()).clamp(0.0, 1.0);
+            // The knob travels inset by its radius, so at 0 % / 100 % it sits inside
+            // the bar's ends (flush with the play / "more" buttons) instead of poking out.
+            const KNOB_INSET: f32 = 7.5;
+            let (k0, kw) = (sr.left() + KNOB_INSET, sr.width() - 2.0 * KNOB_INSET);
+            let frac_at = |x: f32| ((x - k0) / kw).clamp(0.0, 1.0);
             let dragging = seek.is_pointer_button_down_on() || seek.dragged();
             if dragging {
                 if let Some(pos) = seek.interact_pointer_pos() {
@@ -1540,7 +1534,7 @@ fn draw_bottom_bar(app: &mut FluentMediaPlayer, ctx: &egui::Context, t: f32) {
                 Rect::from_min_max(pos2(sr.left(), seek_y - track_h / 2.0), pos2(sr.right(), seek_y + track_h / 2.0)),
                 1.0, TRACK.gamma_multiply(t),
             );
-            let fill_x = sr.left() + sr.width() * frac;
+            let fill_x = k0 + kw * frac;
             p.rect_filled(
                 Rect::from_min_max(pos2(sr.left(), seek_y - 1.5), pos2(fill_x, seek_y + 1.5)),
                 1.0, accent,
@@ -1555,7 +1549,7 @@ fn draw_bottom_bar(app: &mut FluentMediaPlayer, ctx: &egui::Context, t: f32) {
                 let txt = fmt_time(f as f64 * app.duration);
                 let font = FontId::proportional(12.0);
                 let w = p.layout_no_wrap(txt.clone(), font.clone(), Color32::WHITE).size().x + 16.0;
-                let cx = (sr.left() + sr.width() * f).clamp(sr.left() + w / 2.0, sr.right() - w / 2.0);
+                let cx = (k0 + kw * f).clamp(sr.left() + w / 2.0, sr.right() - w / 2.0);
                 let r = Rect::from_center_size(pos2(cx, seek_y - 28.0), vec2(w, 22.0));
                 p.rect_filled(r, 4.0, Color32::from_rgba_unmultiplied(32, 32, 32, (235.0 * t) as u8));
                 p.text(r.center(), Align2::CENTER_CENTER, txt, font, white);
