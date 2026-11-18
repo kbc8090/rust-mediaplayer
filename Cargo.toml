@@ -3,6 +3,10 @@ name = "rust-mediaplayer"
 version = "0.1.0"
 edition = "2021"
 
+[[bin]]
+name = "RustMediaPlayer"
+path = "src/main.rs"
+
 [dependencies]
 # Activates eframe with the native OpenGL/Glow window management hooks
 eframe = { version = "0.27", features = ["glow"] }

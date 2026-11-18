@@ -12,6 +12,11 @@ fn main() {
         // If the resource compiler isn't available, just build without it.
         let mut res = winresource::WindowsResource::new();
         res.set_icon("assets/icon.ico");
+        // What Task Manager and the file's Properties dialog show
+        res.set("FileDescription", "Rust Media Player");
+        res.set("ProductName", "Rust Media Player");
+        res.set("InternalName", "RustMediaPlayer");
+        res.set("OriginalFilename", "RustMediaPlayer.exe");
         if let Err(e) = res.compile() {
             println!("cargo:warning=could not embed the app icon: {e}");
         }
