@@ -17,13 +17,15 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// The player state as last seen by the worker
 #[derive(Clone, Default)]
 pub struct Snapshot {
     /// False until the first refresh has happened
     pub valid: bool,
+    /// When `time_pos` was read (the UI moves the seek bar on smoothly from there)
+    pub taken: Option<Instant>,
     pub time_pos: f64,
     pub duration: f64,
     pub volume: f64,
@@ -159,6 +161,7 @@ fn run(mpv: Arc<Mutex<Mpv>>, rx: mpsc::Receiver<Job>, state: Arc<Mutex<Snapshot>
 
         let mut s = Snapshot {
             valid: true,
+            taken: Some(Instant::now()),
             time_pos: m.get_property::<f64>("time-pos").unwrap_or(0.0),
             duration: m.get_property::<f64>("duration").unwrap_or(0.0),
             volume: m.get_property::<f64>("volume").unwrap_or(0.0),

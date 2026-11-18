@@ -130,16 +130,17 @@ impl Thumbs {
         }
     }
 
-    /// Draw the latest thumbnail into `rect`
-    pub fn paint(&self, painter: &egui::Painter, rect: egui::Rect) {
+    /// Draw the latest thumbnail into `rect`, with corners rounded by `radius` points
+    pub fn paint(&self, painter: &egui::Painter, rect: egui::Rect, radius: f32) {
         painter.add(egui::PaintCallback {
             rect,
-            callback: Arc::new(egui_glow::CallbackFn::new(|info, painter| {
+            callback: Arc::new(egui_glow::CallbackFn::new(move |info, painter| {
                 let vp = info.viewport_in_pixels();
+                let r_px = (radius * info.pixels_per_point).round() as i32;
                 let gl = painter.gl();
                 GL.with(|g| {
                     if let Some(g) = g.borrow_mut().as_mut() {
-                        unsafe { draw(gl, g, vp.left_px, vp.from_bottom_px, vp.width_px, vp.height_px) };
+                        unsafe { draw(gl, g, vp.left_px, vp.from_bottom_px, vp.width_px, vp.height_px, r_px) };
                     }
                 });
             })),
@@ -147,7 +148,7 @@ impl Thumbs {
     }
 }
 
-unsafe fn draw(gl: &glow::Context, g: &mut Gl, x: i32, y: i32, w: i32, h: i32) {
+unsafe fn draw(gl: &glow::Context, g: &mut Gl, x: i32, y: i32, w: i32, h: i32, radius: i32) {
     if w <= 0 || h <= 0 {
         return;
     }
@@ -179,10 +180,22 @@ unsafe fn draw(gl: &glow::Context, g: &mut Gl, x: i32, y: i32, w: i32, h: i32) {
     if fresh || new_frame {
         let _ = g.rc.render::<*mut c_void>(t.fbo.0.get() as i32, w, h, true);
     }
-    // Copy the texture into the window
+    // Copy the texture into the window. A copy can only be rectangular, so the
+    // rounded corners are made by copying the top and bottom few rows a little
+    // narrower (the border egui draws around it smooths the edge).
     gl.bind_framebuffer(glow::READ_FRAMEBUFFER, Some(t.fbo));
     gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, None);
-    gl.blit_framebuffer(0, 0, w, h, x, y, x + w, y + h, glow::COLOR_BUFFER_BIT, glow::NEAREST);
+    let copy = |y0: i32, y1: i32, inset: i32| {
+        gl.blit_framebuffer(inset, y0, w - inset, y1, x + inset, y + y0, x + w - inset, y + y1, glow::COLOR_BUFFER_BIT, glow::NEAREST);
+    };
+    let r = radius.clamp(0, h / 2);
+    for row in 0..r {
+        let d = r as f32 - row as f32 - 0.5;
+        let inset = (r as f32 - (r as f32 * r as f32 - d * d).max(0.0).sqrt()).round() as i32;
+        copy(row, row + 1, inset); // bottom rows
+        copy(h - row - 1, h - row, inset); // top rows
+    }
+    copy(r, h - r, 0);
     gl.bind_framebuffer(glow::FRAMEBUFFER, None);
 }
 

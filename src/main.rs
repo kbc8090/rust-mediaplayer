@@ -213,9 +213,9 @@ const VOL_W: f32 = 90.0;
 const WIN_BTN_W: f32 = 46.0;
 const WIN_BTN_H: f32 = 34.0;
 const MORE_POPUP: &str = "more_popup";
-/// Menu button (top left): centre, level with the window buttons
+/// Menu button (top left): centre. Its highlight sits as far from the top as from the left.
 const MENU_X: f32 = 23.0;
-const MENU_Y: f32 = 17.0;
+const MENU_Y: f32 = 23.0;
 
 /// The pop-up in the top right after seeking with the keys (accumulated amount)
 /// or the mouse (seek bar dragged from this time)
@@ -319,6 +319,8 @@ struct FluentMediaPlayer {
     /// The top-left menu is open, and where its button is
     main_menu: bool,
     menu_anchor: Rect,
+    /// Previous frame, for moving the time display on smoothly
+    last_tick: std::time::Instant,
 }
 
 /// Buttons fire when the mouse button is released anywhere over them, like Windows'
@@ -485,6 +487,7 @@ impl FluentMediaPlayer {
             snap_eof: false,
             main_menu: false,
             menu_anchor: Rect::NOTHING,
+            last_tick: std::time::Instant::now(),
         }
     }
 
@@ -757,14 +760,33 @@ impl eframe::App for FluentMediaPlayer {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         // ── Player state from the mpv thread (never waits for mpv) ────────────
         let snap = self.link.snapshot();
+        let now = std::time::Instant::now();
+        let dt = now.duration_since(self.last_tick).as_secs_f64().min(0.25);
+        self.last_tick = now;
         if snap.valid {
             self.duration = snap.duration;
-            if std::time::Instant::now() >= self.hold_until {
-                self.time_pos = snap.time_pos;
+            if now >= self.hold_until {
+                // The mpv thread reads the time only ~10x a second. While playing,
+                // move on by the elapsed time every frame and ease toward mpv's value,
+                // so the seek bar glides instead of jumping in 100 ms steps.
+                let playing = !snap.paused && !snap.eof;
+                let age = snap.taken.map_or(0.0, |t| now.saturating_duration_since(t).as_secs_f64());
+                let target = if playing { snap.time_pos + age * self.speed } else { snap.time_pos };
+                if playing && (target - self.time_pos).abs() < 0.5 {
+                    self.time_pos += dt * self.speed;
+                    self.time_pos += (target - self.time_pos) * 0.15;
+                } else {
+                    self.time_pos = target;
+                }
+                if self.duration > 0.0 {
+                    self.time_pos = self.time_pos.clamp(0.0, self.duration);
+                }
                 self.volume = snap.volume;
                 self.is_playing = !snap.paused;
                 self.muted = snap.muted;
                 self.eof = snap.eof;
+            } else if self.is_playing {
+                self.time_pos += dt * self.speed;
             }
             self.mpv_info = snap.info;
             self.chapters = snap.chapters;
@@ -1522,7 +1544,7 @@ fn draw_top_bar(app: &mut FluentMediaPlayer, ctx: &egui::Context, t: f32) {
                 }
             }
 
-            // Left: menu button, then the file name, both level with the window buttons
+            // Left: menu button, then the file name level with it
             let mc = pos2(MENU_X, MENU_Y);
             let menu = hit_at(ui, mc, "menu", "Menu", t, false);
             app.menu_anchor = menu.rect;
@@ -1563,17 +1585,22 @@ fn draw_top_bar(app: &mut FluentMediaPlayer, ctx: &egui::Context, t: f32) {
                         _ => "Close",
                     };
                     hover_tooltip(ctx, &resp, r, label, false);
-                    if resp.hovered() {
-                        // Windows' own hover colours (the close red differs on 10 and 11)
+                    // Like Windows: lighter while held down (darker for close), and no
+                    // highlight while held with the pointer moved off the button
+                    let held = resp.is_pointer_button_down_on();
+                    let inside = ctx.input(|i| i.pointer.latest_pos()).map_or(false, |pp| r.contains(pp));
+                    let pressed = held && inside;
+                    if pressed || (resp.hovered() && !held) {
+                        // Windows' own colours (the close red differs on 10 and 11)
                         let fill = if k == 2 {
-                            if app.caption_font == CaptionFont::Mdl2 {
+                            let red = if app.caption_font == CaptionFont::Mdl2 {
                                 Color32::from_rgb(232, 17, 35)
                             } else {
                                 Color32::from_rgb(196, 43, 28)
-                            }
-                            .gamma_multiply(t)
+                            };
+                            red.gamma_multiply(if pressed { 0.72 } else { 1.0 } * t)
                         } else {
-                            Color32::from_white_alpha((22.0 * t) as u8)
+                            Color32::from_white_alpha((if pressed { 38.0 } else { 22.0 } * t) as u8)
                         };
                         p.rect_filled(r, 0.0, fill);
                     }
@@ -1715,29 +1742,13 @@ fn draw_bottom_bar(app: &mut FluentMediaPlayer, ctx: &egui::Context, t: f32) {
                 else { None };
             if let (Some(f), true) = (preview, app.duration > 0.0) {
                 let secs = f as f64 * app.duration;
-                // "12:34", plus the chapter's name when the file has chapters
-                let font = FontId::proportional(12.0);
-                let mut job = egui::text::LayoutJob::default();
-                job.append(&fmt_time(secs), 0.0, egui::TextFormat::simple(font.clone(), white));
-                if let Some((_, title)) = app.chapters.iter().rev().find(|(start, _)| *start <= secs + 0.01) {
-                    job.append(
-                        &format!("  ·  {title}"),
-                        0.0,
-                        egui::TextFormat::simple(font, Color32::from_rgb(200, 200, 200).gamma_multiply(t)),
-                    );
-                }
-                job.wrap = egui::text::TextWrapping {
-                    max_width: 320.0,
-                    max_rows: 1,
-                    break_anywhere: true,
-                    overflow_character: Some('…'),
-                };
-                let galley = p.layout_job(job);
-                let w = galley.size().x + 16.0;
+                let txt = fmt_time(secs);
+                let font = FontId::proportional(13.0);
+                let w = p.layout_no_wrap(txt.clone(), font.clone(), Color32::WHITE).size().x + 16.0;
                 let cx = (k0 + kw * f).clamp(sr.left() + w / 2.0, sr.right() - w / 2.0);
-                let r = Rect::from_center_size(pos2(cx, seek_y - 28.0), vec2(w, 22.0));
+                let r = Rect::from_center_size(pos2(cx, seek_y - 28.0), vec2(w, 23.0));
                 p.rect_filled(r, 4.0, Color32::from_rgba_unmultiplied(32, 32, 32, (235.0 * t) as u8));
-                p.galley(r.center() - galley.size() / 2.0, galley, white);
+                p.text(r.center(), Align2::CENTER_CENTER, txt, font, white);
 
                 // Thumbnail of that moment, above the time
                 app.thumbs.request(secs);
@@ -1752,9 +1763,8 @@ fn draw_bottom_bar(app: &mut FluentMediaPlayer, ctx: &egui::Context, t: f32) {
                     for (e, a) in [(1.0, 60.0), (2.5, 30.0), (4.0, 14.0)] {
                         tp.rect_filled(tr.expand(e), 4.0 + e, Color32::from_black_alpha((a * t) as u8));
                     }
-                    tp.rect_filled(tr, 0.0, Color32::BLACK);
-                    app.thumbs.paint(&tp, tr);
-                    tp.rect_stroke(tr.expand(0.5), 1.0, Stroke::new(1.0_f32, { let a = (70.0 * t) as u8; Color32::from_rgba_premultiplied(a, a, a, a) }));
+                    app.thumbs.paint(&tp, tr, 2.0);
+                    tp.rect_stroke(tr.expand(0.5), 2.5, Stroke::new(1.0_f32, { let a = (70.0 * t) as u8; Color32::from_rgba_premultiplied(a, a, a, a) }));
                 }
             }
 
@@ -2192,13 +2202,13 @@ fn draw_main_menu(app: &mut FluentMediaPlayer, ctx: &egui::Context) {
     if !app.main_menu {
         return;
     }
-    const W: f32 = 252.0;
-    const ITEM_H: f32 = 34.0;
-    const PAD: f32 = 4.0;
-    const SEP_H: f32 = 9.0;
+    const W: f32 = 228.0;
+    const ITEM_H: f32 = 28.0;
+    const PAD: f32 = 3.0;
+    const SEP_H: f32 = 7.0;
     let box_left = MENU_X - BTN_BOX / 2.0;
     let rect = Rect::from_min_size(
-        pos2(box_left, MENU_Y + BTN_BOX / 2.0 + 6.0),
+        pos2(box_left, MENU_Y + BTN_BOX / 2.0 + 4.0),
         vec2(W, PAD * 2.0 + ITEM_H * 2.0 + SEP_H),
     );
 
@@ -2238,7 +2248,7 @@ fn draw_main_menu(app: &mut FluentMediaPlayer, ctx: &egui::Context) {
                 }
                 resp
             };
-            let text_x = rect.left() + PAD + 36.0;
+            let text_x = rect.left() + PAD + 28.0;
 
             // Open file…
             let top = rect.top() + PAD;
@@ -2246,7 +2256,7 @@ fn draw_main_menu(app: &mut FluentMediaPlayer, ctx: &egui::Context) {
             let cy = top + ITEM_H / 2.0;
             p.text(pos2(text_x, cy), Align2::LEFT_CENTER, "Open file\u{2026}", font.clone(), text);
             p.text(
-                pos2(rect.right() - PAD - 12.0, cy),
+                pos2(rect.right() - PAD - 10.0, cy),
                 Align2::RIGHT_CENTER,
                 "Ctrl+O",
                 FontId::proportional(12.5),
@@ -2269,7 +2279,7 @@ fn draw_main_menu(app: &mut FluentMediaPlayer, ctx: &egui::Context) {
             let auto = item(ui, top, "autoplay");
             let cy = top + ITEM_H / 2.0;
             if app.autoplay {
-                poly(&p, pos2(rect.left() + PAD + 18.0, cy), &[(-4.5, 0.0), (-1.5, 3.2), (4.5, -3.5)], text, 1.5);
+                poly(&p, pos2(rect.left() + PAD + 14.0, cy), &[(-4.5, 0.0), (-1.5, 3.2), (4.5, -3.5)], text, 1.5);
             }
             p.text(pos2(text_x, cy), Align2::LEFT_CENTER, "Auto-play next file in folder", font, text);
             if auto.activated() {
