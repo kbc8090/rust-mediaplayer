@@ -18,33 +18,78 @@ jobs:
         with:
           targets: x86_64-pc-windows-msvc
 
-      - name: Fetch and Link Pinned libmpv Core Libraries
+      # Always use the newest full libmpv build. Primary source: the weekly
+      # "mpv-dev-x86_64" builds on SourceForge (mpv-player-windows project).
+      # Fallback: the latest GitHub release of shinchiro/mpv-winbuild-cmake.
+      - name: Download Newest libmpv
         shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          $devUrl = "https://github.com/media-kit/libmpv-win32-video-build/releases/download/2023-09-24/mpv-dev-x86_64-20230924-git-652a1dd.7z"
-          
-          Invoke-WebRequest -Uri $devUrl -OutFile "$env:RUNNER_TEMP\mpv_dev.7z"
-          
-          # Extract with 7-Zip
-          & "C:\Program Files\7-Zip\7z.exe" x "$env:RUNNER_TEMP\mpv_dev.7z" -o"C:\mpv_dev"
-          
-          # Dynamically locate the library file inside subfolders and flatten it to the root as mpv.lib
+          $archive = "$env:RUNNER_TEMP\mpv_dev.7z"
+          $name = $null
+
+          # A real .7z starts with the bytes 37 7A BC AF 27 1C
+          function Test-7z([string]$path) {
+            if (-not (Test-Path $path)) { return $false }
+            $fs = [System.IO.File]::OpenRead($path)
+            try { $buf = New-Object byte[] 6; $null = $fs.Read($buf, 0, 6) } finally { $fs.Dispose() }
+            return (($buf -join ',') -eq '55,122,188,175,39,28')
+          }
+
+          try {
+            $listing = (Invoke-WebRequest -UseBasicParsing -Uri 'https://sourceforge.net/projects/mpv-player-windows/files/libmpv/').Content
+            # Plain x86_64 build only (not -v3, which needs an AVX2 CPU). The date is
+            # in the name, so the newest sorts last.
+            $found = [regex]::Matches($listing, 'mpv-dev-x86_64-\d{8}-git-[0-9a-f]+\.7z') |
+                     ForEach-Object { $_.Value } | Sort-Object -Unique -Descending
+            if ($found) {
+              $candidate = @($found)[0]
+              Write-Host "Newest on SourceForge: $candidate"
+              curl.exe -fsSL --retry 3 --retry-delay 5 -o $archive "https://sourceforge.net/projects/mpv-player-windows/files/libmpv/$candidate/download"
+              if ($LASTEXITCODE -eq 0 -and (Test-7z $archive)) { $name = $candidate }
+              else { Write-Warning "SourceForge download failed or was not a .7z file" }
+            } else {
+              Write-Warning "No mpv-dev-x86_64 build found in the SourceForge listing"
+            }
+          } catch {
+            Write-Warning "SourceForge lookup failed: $_"
+          }
+
+          if (-not $name) {
+            Write-Host "Falling back to the latest GitHub release of shinchiro/mpv-winbuild-cmake"
+            gh release download --repo shinchiro/mpv-winbuild-cmake --pattern 'mpv-dev-x86_64-2*.7z' --output $archive --clobber
+            if ($LASTEXITCODE -ne 0 -or -not (Test-7z $archive)) {
+              Write-Error "Could not download libmpv from SourceForge or GitHub"
+              exit 1
+            }
+            $name = (gh release view --repo shinchiro/mpv-winbuild-cmake --json assets --jq '.assets[].name' |
+                     Where-Object { $_ -like 'mpv-dev-x86_64-2*.7z' } | Select-Object -First 1)
+          }
+
+          Write-Host "Using libmpv build: $name"
+          # Recorded next to the .exe so you can always tell which libmpv a build has
+          Set-Content -Path "$env:RUNNER_TEMP\libmpv-version.txt" -Value $name -Encoding ascii
+
+          & "C:\Program Files\7-Zip\7z.exe" x $archive -o"C:\mpv_dev" -y
+          if ($LASTEXITCODE -ne 0) { Write-Error "Extracting libmpv failed"; exit 1 }
+
+          # Locate the import library and flatten it to the root as mpv.lib
           $libFile = Get-ChildItem -Path "C:\mpv_dev" -Filter "*mpv*.lib" -Recurse | Select-Object -First 1
           if ($null -eq $libFile) {
               $libFile = Get-ChildItem -Path "C:\mpv_dev" -Filter "*mpv*.dll.a" -Recurse | Select-Object -First 1
           }
-          
           if ($libFile) {
               Copy-Item $libFile.FullName -Destination "C:\mpv_dev\mpv.lib" -Force
-              Write-Host "Successfully staged compiler link library to C:\mpv_dev\mpv.lib"
+              Write-Host "Staged link library from $($libFile.Name) as C:\mpv_dev\mpv.lib"
           } else {
-              Write-Error "Could not find any mpv static library file inside the downloaded archive."
+              Write-Error "Could not find an mpv import library inside the downloaded archive."
               exit 1
           }
-          
-          # Inject paths into the MSVC Compiler Linker environment
+
+          # Inject paths into the MSVC linker environment
           echo "LIB=C:\mpv_dev" >> $env:GITHUB_ENV
-          echo "PATH=C:\mpv_dev;$env:PATH" >> $env:GITHUB_PATH
+          echo "C:\mpv_dev" >> $env:GITHUB_PATH
 
       - name: Cache Build Cache
         uses: actions/cache@v5
@@ -65,20 +110,23 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force -Path "target\bundle\"
           Copy-Item "target\x86_64-pc-windows-msvc\release\*.exe" "target\bundle\"
-          
-          # Dynamically locate the dynamic .dll library file and copy it to the distribution folder
-          $dllFile = Get-ChildItem -Path "C:\mpv_dev" -Filter "*mpv*.dll" -Recurse | Select-Object -First 1
+          Copy-Item "$env:RUNNER_TEMP\libmpv-version.txt" "target\bundle\"
+
+          # The libmpv runtime DLL goes next to the .exe
+          $dllFile = Get-ChildItem -Path "C:\mpv_dev" -Recurse -File |
+                     Where-Object { $_.Name -like '*mpv*' -and $_.Extension -eq '.dll' } |
+                     Select-Object -First 1
           if ($dllFile) {
               Copy-Item $dllFile.FullName -Destination "target\bundle\" -Force
               Write-Host "Bundled dynamic runtime library: $($dllFile.Name)"
           } else {
-              Write-Error "Could not find any mpv dynamic link runtime library (.dll) to package."
+              Write-Error "Could not find the mpv runtime library (.dll) to package."
               exit 1
           }
 
       - name: Upload Complete Media Player Package
         uses: actions/upload-artifact@v6
         with:
-          name: fluent-mediaplayer-windows
+          name: RustMediaPlayer-windows
           path: target/bundle/*
           retention-days: 15
