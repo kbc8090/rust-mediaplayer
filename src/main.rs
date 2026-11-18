@@ -311,6 +311,11 @@ impl FluentMediaPlayer {
             // Don't decode straight into GPU-mapped buffers (another known source of
             // garbled frames on some drivers).
             let _ = init.set_property("vd-lavc-dr", "no");
+            // One decoding thread while hardware decoding. mpv 0.36 did this itself;
+            // newer mpv runs the hardware decoder multithreaded, which produced
+            // garbled blocks with copy-back decoding on AMD. (Software decoding gets
+            // automatic threads again, see toggle_hw_decode.)
+            let _ = init.set_property("vd-lavc-threads", 1_i64);
             // Subtitles start off; the captions button turns them on
             let _ = init.set_property("sid", "no");
             let _ = init.set_property("volume-max", VOL_MAX);
@@ -438,6 +443,8 @@ impl FluentMediaPlayer {
     fn toggle_hw_decode(&mut self) {
         self.hw_decode = !self.hw_decode;
         if let Ok(mpv) = self.mpv.lock() {
+            // Threads must be set before the decoder is re-opened by the hwdec change
+            let _ = mpv.set_property("vd-lavc-threads", if self.hw_decode { 1_i64 } else { 0_i64 });
             let _ = mpv.set_property("hwdec", if self.hw_decode { "auto-copy" } else { "no" });
         }
         self.show_info = true;
@@ -446,7 +453,9 @@ impl FluentMediaPlayer {
     /// Settings used during a live resize (see the resize block in `update`),
     /// returning the previous values to restore later
     fn set_fast_scaling(&self) -> Vec<(String, String)> {
-        const FAST: [(&str, &str); 1] = [("dither-depth", "no")];
+        // Both put the window size (height / shrink ratio) into mpv's shaders, which
+        // forces a recompile for every new size while dragging.
+        const FAST: [(&str, &str); 2] = [("dither-depth", "no"), ("correct-downscaling", "no")];
         let mut saved = Vec::new();
         if let Ok(mpv) = self.mpv.lock() {
             for (k, v) in FAST {
