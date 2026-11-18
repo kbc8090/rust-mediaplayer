@@ -300,7 +300,39 @@ pub fn hook_window(hwnd: isize) -> bool {
     }
 }
 
+// ── Windows 11 corners and border ─────────────────────────────────────────────
+/// The window gets Windows 11's own rounded corners (and the thin border Windows
+/// draws with them). Our window has no standard frame, so Windows has to be asked.
+static ROUNDED: AtomicBool = AtomicBool::new(false);
+
+/// Ask for rounded corners. Returns false on Windows 10, which has no such thing.
+pub fn round_corners(hwnd: isize) -> bool {
+    let ok = set_corners(hwnd, true);
+    ROUNDED.store(ok, Ordering::Relaxed);
+    ok
+}
+
+/// DWMWA_WINDOW_CORNER_PREFERENCE: DWMWCP_ROUND (2) / DWMWCP_DONOTROUND (1)
+fn set_corners(hwnd: isize, round: bool) -> bool {
+    let pref: u32 = if round { 2 } else { 1 };
+    unsafe { DwmSetWindowAttribute(hwnd, 33, &pref as *const u32 as *const c_void, 4) == 0 }
+}
+
+/// Windows 11 border colour as 0x00BBGGRR, or BORDER_DEFAULT (Windows decides: grey,
+/// or the accent colour when "Show accent colour on title bars and window borders"
+/// is on) or BORDER_NONE
+pub const BORDER_DEFAULT: u32 = 0xFFFF_FFFF;
+pub const BORDER_NONE: u32 = 0xFFFF_FFFE;
+
+pub fn set_border_color(hwnd: isize, color: u32) {
+    // DWMWA_BORDER_COLOR
+    unsafe { DwmSetWindowAttribute(hwnd, 34, &color as *const u32 as *const c_void, 4) };
+}
+
 unsafe fn enter_fullscreen_now(hwnd: isize) {
+    if ROUNDED.load(Ordering::Relaxed) {
+        set_corners(hwnd, false); // rounded corners on a full screen look wrong
+    }
     // A maximized window can't be sized past its maximized size: un-maximize first.
     let was_max = IsZoomed(hwnd) != 0;
     if was_max {
@@ -334,6 +366,9 @@ unsafe fn enter_fullscreen_now(hwnd: isize) {
 }
 
 unsafe fn exit_fullscreen_now(hwnd: isize) {
+    if ROUNDED.load(Ordering::Relaxed) {
+        set_corners(hwnd, true);
+    }
     let saved = FS_RESTORE.lock().ok().and_then(|mut r| r.take());
     if let Some([l, t, r, b]) = saved {
         SetWindowPos(hwnd, 0, l, t, r - l, b - t, 0x0200);

@@ -117,8 +117,9 @@ struct Settings {
     muted: bool,
     repeat: bool,
     on_top: bool,
-    /// Hardware decoding (H). Off by default, like mpv itself.
-    hwdec: bool,
+    /// Hardware decoding mode, an index into HW_MODES (H). 0 = off (software), the
+    /// default like mpv itself.
+    hwdec: usize,
     /// Play the next video in the folder when one ends (menu). Off by default.
     autoplay: bool,
     /// Order of previous / next in a folder (menu)
@@ -131,8 +132,6 @@ struct Settings {
     multi: bool,
     /// Even out loud and quiet parts (menu). Off by default.
     normalize: bool,
-    /// 1 px accent-colour line around the window (menu). Off by default.
-    border: bool,
 }
 
 /// Order of the files that previous / next step through, like Explorer's "Sort by"
@@ -172,10 +171,9 @@ fn save_settings(st: &Settings) {
     let _ = std::fs::write(
         path,
         format!(
-            "{} {} {} {} {} {} {} {} {} {} {} {}",
-            st.volume, st.muted as u8, st.repeat as u8, st.on_top as u8, st.hwdec as u8, st.autoplay as u8,
-            st.sort_by.code(), st.sort_desc as u8, st.snap as u8, st.multi as u8, st.normalize as u8,
-            st.border as u8
+            "{} {} {} {} {} {} {} {} {} {} {}",
+            st.volume, st.muted as u8, st.repeat as u8, st.on_top as u8, st.hwdec, st.autoplay as u8,
+            st.sort_by.code(), st.sort_desc as u8, st.snap as u8, st.multi as u8, st.normalize as u8
         ),
     );
 }
@@ -186,14 +184,16 @@ fn load_settings() -> Settings {
     let text = settings_path().and_then(|p| std::fs::read_to_string(p).ok()).unwrap_or_default();
     let mut it = text.split_whitespace();
     let volume = it.next().and_then(|t| t.parse::<f64>().ok());
-    let mut flag = || it.next().and_then(|t| t.parse::<u8>().ok()) == Some(1);
-    let (muted, repeat, on_top, hwdec, autoplay) = (flag(), flag(), flag(), flag(), flag());
+    let mut num = || it.next().and_then(|t| t.parse::<usize>().ok());
+    let (muted, repeat, on_top) = (num() == Some(1), num() == Some(1), num() == Some(1));
+    // (older settings files saved 1 for "on", which was copy-back decoding: mode 1)
+    let hwdec = num().unwrap_or(0).min(HW_MODES.len() - 1);
+    let autoplay = num() == Some(1);
     let sort_by = SortBy::from_code(it.next().and_then(|t| t.parse::<u8>().ok()).unwrap_or(0));
     let sort_desc = it.next().and_then(|t| t.parse::<u8>().ok()) == Some(1);
     let snap = it.next().and_then(|t| t.parse::<u8>().ok()) != Some(0);
     let multi = it.next().and_then(|t| t.parse::<u8>().ok()) == Some(1);
     let normalize = it.next().and_then(|t| t.parse::<u8>().ok()) == Some(1);
-    let border = it.next().and_then(|t| t.parse::<u8>().ok()) == Some(1);
     Settings {
         volume: volume.map_or(80.0, |v| v.clamp(0.0, VOL_MAX)).round() as i32,
         muted,
@@ -206,7 +206,6 @@ fn load_settings() -> Settings {
         snap,
         multi,
         normalize,
-        border,
     }
 }
 
@@ -284,6 +283,18 @@ enum SeekOsd {
 /// ~1 s ahead and smoothly raises quiet passages / lowers loud ones, so dialogue and
 /// explosions (or songs from different albums) come out at a more even level.
 const NORMALIZER: &str = "lavfi=[dynaudnorm=f=150:g=15]";
+/// Decoding methods H cycles through: mpv's hwdec value, and its name on screen.
+/// "Copy" methods decode on the GPU and copy each frame back before drawing (most
+/// compatible); "direct" ones hand frames straight to OpenGL (fastest, but need
+/// driver support; when that's missing mpv quietly decodes in software, which the
+/// info overlay's "Decoder:" line shows).
+const HW_MODES: [(&str, &str); 5] = [
+    ("no", "Software (CPU)"),
+    ("d3d11va-copy", "D3D11 (copy)"),
+    ("dxva2-copy", "DXVA2 (copy)"),
+    ("d3d11va", "D3D11 (direct)"),
+    ("dxva2", "DXVA2 (direct)"),
+];
 /// Highest volume (percent). mpv allows up to 130 by default.
 const VOL_MAX: f64 = 130.0;
 
@@ -336,8 +347,8 @@ struct FluentMediaPlayer {
     /// Technical info overlay (toggle with I)
     show_info: bool,
     info_lines: Vec<String>,
-    /// Hardware decoding on/off (toggle with H)
-    hw_decode: bool,
+    /// Hardware decoding mode, index into HW_MODES (cycle with H)
+    hw_decode: usize,
     /// File given on the command line (drop on the .exe / "Open with"), played once ready
     startup_file: Option<String>,
     /// The window was maximized when last closed: re-apply it at startup
@@ -401,8 +412,12 @@ struct FluentMediaPlayer {
     multi: bool,
     /// Volume normalizer on
     normalize: bool,
-    /// Accent-colour window border
-    border: bool,
+    /// Windows' "Show accent colour on title bars and window borders" setting
+    accent_borders: bool,
+    /// Windows 11: Windows draws our rounded corners and border; the colour last
+    /// sent to it
+    win11_frame: bool,
+    border_sent: Option<u32>,
 }
 
 /// Buttons fire when the mouse button is released anywhere over them, like Windows'
@@ -465,9 +480,9 @@ impl FluentMediaPlayer {
             }
             let _ = init.set_property("video-timing-offset", 0.0_f64);
             // Decoding: software by default (mpv's own default, and the newer mpv's
-            // hardware decoder garbled frames on this setup). H switches to hardware
-            // decoding with copy-back ("auto-copy"); the choice is remembered.
-            let _ = init.set_property("hwdec", if st.hwdec { "auto-copy" } else { "no" });
+            // hardware decoder garbled frames on one AMD setup). H cycles through the
+            // hardware decoding methods; the choice is remembered.
+            let _ = init.set_property("hwdec", HW_MODES[st.hwdec].0);
             // Don't decode straight into GPU-mapped buffers (another known source of
             // garbled frames on some drivers).
             let _ = init.set_property("vd-lavc-dr", "no");
@@ -475,7 +490,7 @@ impl FluentMediaPlayer {
             // newer mpv runs the hardware decoder multithreaded, which produced
             // garbled blocks with copy-back decoding on AMD. (Software decoding gets
             // automatic threads again, see toggle_hw_decode.)
-            let _ = init.set_property("vd-lavc-threads", if st.hwdec { "1" } else { "0" });
+            let _ = init.set_property("vd-lavc-threads", if st.hwdec > 0 { "1" } else { "0" });
             // Subtitles start off; the captions button turns them on
             let _ = init.set_property("sid", "no");
             let _ = init.set_property("volume-max", VOL_MAX);
@@ -586,7 +601,9 @@ impl FluentMediaPlayer {
             snap: st.snap,
             multi: st.multi,
             normalize: st.normalize,
-            border: st.border,
+            accent_borders: accent_borders_on(),
+            win11_frame: false,
+            border_sent: None,
         }
     }
 
@@ -731,12 +748,13 @@ impl FluentMediaPlayer {
         self.touch();
     }
 
-    /// Switch hardware decoding on/off (handy if a video shows glitches)
+    /// Next hardware decoding method (H). Different GPUs / drivers glitch with
+    /// different methods; the info overlay opens to show whether it took.
     fn toggle_hw_decode(&mut self) {
-        self.hw_decode = !self.hw_decode;
+        self.hw_decode = (self.hw_decode + 1) % HW_MODES.len();
         // Threads must be set before the decoder is re-opened by the hwdec change
-        self.link.set("vd-lavc-threads", if self.hw_decode { "1" } else { "0" });
-        self.link.set("hwdec", if self.hw_decode { "auto-copy" } else { "no" });
+        self.link.set("vd-lavc-threads", if self.hw_decode > 0 { "1" } else { "0" });
+        self.link.set("hwdec", HW_MODES[self.hw_decode].0);
         self.show_info = true;
     }
 
@@ -766,7 +784,6 @@ impl FluentMediaPlayer {
             snap: self.snap,
             multi: self.multi,
             normalize: self.normalize,
-            border: self.border,
         }
     }
 
@@ -806,8 +823,8 @@ impl FluentMediaPlayer {
     fn refresh_info(&mut self) {
         let mut lines = self.mpv_info.clone();
         lines.push(format!(
-            "Hardware decoding: {}  (H to switch)",
-            if self.hw_decode { "on" } else { "off" }
+            "Decoding method: {}  (H for the next one)",
+            HW_MODES[self.hw_decode].1
         ));
         let render_ms = RENDER_MS.with(|r| r.get());
         lines.push(format!(
@@ -1008,6 +1025,7 @@ impl eframe::App for FluentMediaPlayer {
             self.taskbar_tried = true;
             taskbar::hook_window(self.hwnd);
             self.taskbar = taskbar::Taskbar::new(self.hwnd);
+            self.win11_frame = taskbar::round_corners(self.hwnd);
         }
         if taskbar::take_fullscreen_failed() {
             ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(true));
@@ -1065,6 +1083,7 @@ impl eframe::App for FluentMediaPlayer {
         if self.accent_checked.elapsed() > std::time::Duration::from_secs(2) {
             self.accent = system_accent();
             self.border_color = border_accent();
+            self.accent_borders = accent_borders_on();
             self.accent_checked = std::time::Instant::now();
         }
         if self.show_info {
@@ -1406,10 +1425,28 @@ impl eframe::App for FluentMediaPlayer {
             }
         }
 
-        // Accent-colour border around the window (not when maximized / fullscreen,
-        // like Windows' own borders); grey while another window is active
-        if self.border && !self.is_fullscreen && !(self.hwnd != 0 && unsafe { IsZoomed(self.hwnd) != 0 }) {
-            let focused = ctx.input(|i| i.viewport().focused.unwrap_or(true));
+        // Window border, following Windows' "Show accent colour on title bars and
+        // window borders" setting.
+        let focused = ctx.input(|i| i.viewport().focused.unwrap_or(true));
+        if self.win11_frame {
+            // Windows 11 draws it (with the rounded corners): accent colour while
+            // active if that setting is on, otherwise Windows' usual grey; none in
+            // fullscreen
+            let want = if self.is_fullscreen {
+                taskbar::BORDER_NONE
+            } else if self.accent_borders && focused {
+                let c = self.border_color;
+                c.r() as u32 | (c.g() as u32) << 8 | (c.b() as u32) << 16
+            } else {
+                taskbar::BORDER_DEFAULT
+            };
+            if self.border_sent != Some(want) {
+                taskbar::set_border_color(self.hwnd, want);
+                self.border_sent = Some(want);
+            }
+        } else if self.accent_borders && !self.is_fullscreen && !(self.hwnd != 0 && unsafe { IsZoomed(self.hwnd) != 0 }) {
+            // Windows 10: our own 1 px line (Windows doesn't draw one for a window
+            // without a standard frame); grey while another window is active
             let col = if focused { self.border_color } else { Color32::from_rgb(70, 70, 72) };
             let px = 1.0 / ctx.pixels_per_point(); // exactly one screen pixel
             ctx.layer_painter(egui::LayerId::new(egui::Order::Tooltip, egui::Id::new("window_border")))
@@ -2411,6 +2448,12 @@ fn system_accent() -> Color32 {
     }
 }
 
+/// Windows' "Show accent colour on title bars and window borders" (Settings →
+/// Personalisation → Colours)
+fn accent_borders_on() -> bool {
+    reg_dword(r"Software\Microsoft\Windows\DWM", "ColorPrevalence") == Some(1)
+}
+
 /// The window border colour: Windows' title-bar accent (what Explorer's title bar
 /// shows), lifted slightly the way Windows draws its own 1 px borders. Much calmer
 /// than the boosted accent the controls use.
@@ -2559,7 +2602,7 @@ const SHORTCUTS: &[(&[&str], &str)] = &[
     (&["R"], "Rotate 90\u{b0}"),
     (&["Ctrl+O"], "Open file"),
     (&["I"], "Video info"),
-    (&["H"], "Hardware decoding on / off"),
+    (&["H"], "Next decoding method"),
     (&["Media keys"], "Play / pause, next, previous"),
 ];
 
@@ -2706,7 +2749,6 @@ fn draw_main_menu(app: &mut FluentMediaPlayer, ctx: &egui::Context) {
         MenuRow::Item { key: "normalize", label: "Normalize volume", hint: None, mark: Mark::Check(app.normalize) },
         MenuRow::Item { key: "snap", label: "Snap to screen edges", hint: None, mark: Mark::Check(app.snap) },
         MenuRow::Item { key: "multi", label: "Allow multiple windows", hint: None, mark: Mark::Check(app.multi) },
-        MenuRow::Item { key: "border", label: "Accent color border", hint: None, mark: Mark::Check(app.border) },
         MenuRow::Sep,
         MenuRow::Header("Previous / next order"),
     ];
@@ -2818,7 +2860,6 @@ fn draw_main_menu(app: &mut FluentMediaPlayer, ctx: &egui::Context) {
         Some("autoplay") => app.autoplay = !app.autoplay,
         Some("normalize") => app.toggle_normalize(),
         Some("multi") => app.multi = !app.multi,
-        Some("border") => app.border = !app.border,
         Some("snap") => {
             app.snap = !app.snap;
             taskbar::set_snap(app.snap);
