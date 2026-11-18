@@ -2,8 +2,11 @@
 
 use eframe::egui::{self, pos2, vec2, Align2, Color32, FontFamily, FontId, Pos2, Rect, Sense, Stroke};
 use libmpv2::{Mpv, render::{RenderContext, OpenGLInitParams, RenderParam, RenderParamApiType}};
+mod mpv_link;
 mod splash;
 mod taskbar;
+
+use mpv_link::{yn, MpvLink};
 
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use std::sync::{Arc, Mutex};
@@ -210,7 +213,17 @@ const MORE_POPUP: &str = "more_popup";
 const VOL_MAX: f64 = 130.0;
 
 struct FluentMediaPlayer {
+    /// Only used (briefly, at startup) to create the render context; everything
+    /// else goes through `link`, which talks to mpv on its own thread
     mpv: Arc<Mutex<Mpv>>,
+    link: MpvLink,
+    /// After a user action, keep our own values for a moment instead of the
+    /// (slightly older) snapshot, so buttons and the seek bar don't flicker back
+    hold_until: std::time::Instant,
+    /// mpv sits on the last frame of a finished video
+    eof: bool,
+    /// Decoder / video lines from the mpv thread for the info overlay
+    mpv_info: Vec<String>,
     render_ctx_initialized: bool,
     current_file: String,
     is_playing: bool,
@@ -261,7 +274,8 @@ struct FluentMediaPlayer {
     last_size: egui::Vec2,
     resize_until: Option<std::time::Instant>,
     /// mpv settings saved while the live-resize ones are in use
-    fast_scale_saved: Option<Vec<(String, String)>>,
+    /// The live-resize settings are switched on
+    resize_mode: bool,
     /// Live-resize statistics: frames, summed / worst frame interval, worst mpv render (ms)
     last_frame: std::time::Instant,
     rs_stats: (u32, f32, f32, f32),
@@ -344,6 +358,9 @@ impl FluentMediaPlayer {
         // per-frame vsync reports that this embedding doesn't provide.
         // Repaints: mpv signals us through a channel when a new frame is ready.
 
+        let mpv = Arc::new(Mutex::new(mpv));
+        let link = MpvLink::start(mpv.clone());
+
         // Channel: mpv render thread → egui repaint
         let (tx, rx) = std::sync::mpsc::sync_channel::<()>(1);
         let ctx_clone = cc.egui_ctx.clone();
@@ -355,7 +372,11 @@ impl FluentMediaPlayer {
         });
 
         Self {
-            mpv: Arc::new(Mutex::new(mpv)),
+            mpv: mpv.clone(),
+            link,
+            hold_until: std::time::Instant::now(),
+            eof: false,
+            mpv_info: Vec::new(),
             render_ctx_initialized: false,
             current_file: String::new(),
             is_playing: false,
@@ -390,7 +411,7 @@ impl FluentMediaPlayer {
             caption_font,
             last_size: egui::Vec2::ZERO,
             resize_until: None,
-            fast_scale_saved: None,
+            resize_mode: false,
             last_frame: std::time::Instant::now(),
             rs_stats: (0, 0.0, 0.0, 0.0),
             hwnd: 0,
@@ -410,80 +431,54 @@ impl FluentMediaPlayer {
         self.has_file = true;
         self.folder_files = scan_folder(Path::new(path));
         self.folder_index = self.folder_files.iter().position(|p| p == Path::new(path));
-        if let Ok(mpv) = self.mpv.lock() {
-            // Back to "subtitles off" for every new file, even if they were
-            // switched on for the previous one
-            let _ = mpv.set_property("sid", "no");
-            let _ = mpv.command("loadfile", &[path]);
-            let _ = mpv.set_property("pause", false);
-        }
+        // Back to "subtitles off" for every new file, even if they were switched on
+        // for the previous one
+        self.link.set("sid", "no");
+        self.link.command("loadfile", &[path]);
+        self.link.set("pause", "no");
         self.is_playing = true;
+        self.time_pos = 0.0;
+        self.eof = false;
+        self.touch();
     }
 
     fn toggle_play_pause(&mut self) {
         // Finished playing (mpv sits on the last frame): Play / Space starts it over
-        let ended = self.has_file
-            && self
-                .mpv
-                .lock()
-                .ok()
-                .and_then(|m| m.get_property::<bool>("eof-reached").ok())
-                .unwrap_or(false);
-        if ended {
-            if let Ok(mpv) = self.mpv.lock() {
-                let _ = mpv.command("seek", &["0", "absolute"]);
-                let _ = mpv.set_property("pause", false);
-            }
+        if self.has_file && self.eof {
+            self.link.command("seek", &["0", "absolute"]);
+            self.link.set("pause", "no");
             self.time_pos = 0.0;
             self.is_playing = true;
+            self.eof = false;
+            self.touch();
             return;
         }
 
         self.is_playing = !self.is_playing;
-        if let Ok(mpv) = self.mpv.lock() {
-            let _ = mpv.set_property("pause", !self.is_playing);
-        }
+        self.link.set("pause", yn(!self.is_playing));
+        self.touch();
     }
 
     /// Switch hardware decoding on/off (handy if a video shows glitches)
     fn toggle_hw_decode(&mut self) {
         self.hw_decode = !self.hw_decode;
-        if let Ok(mpv) = self.mpv.lock() {
-            // Threads must be set before the decoder is re-opened by the hwdec change
-            let _ = mpv.set_property("vd-lavc-threads", if self.hw_decode { "1" } else { "0" });
-            let _ = mpv.set_property("hwdec", if self.hw_decode { "auto-copy" } else { "no" });
-        }
+        // Threads must be set before the decoder is re-opened by the hwdec change
+        self.link.set("vd-lavc-threads", if self.hw_decode { "1" } else { "0" });
+        self.link.set("hwdec", if self.hw_decode { "auto-copy" } else { "no" });
         self.show_info = true;
     }
 
-    /// Settings used during a live resize (see the resize block in `update`),
-    /// returning the previous values to restore later
-    fn set_fast_scaling(&self) -> Vec<(String, String)> {
-        // Both put the window size (height / shrink ratio) into mpv's shaders, which
-        // forces a recompile for every new size while dragging.
-        const FAST: [(&str, &str); 2] = [("dither-depth", "no"), ("correct-downscaling", "no")];
-        let mut saved = Vec::new();
-        if let Ok(mpv) = self.mpv.lock() {
-            for (k, v) in FAST {
-                if let Ok(old) = mpv.get_property::<String>(k) {
-                    if mpv.set_property(k, v).is_ok() {
-                        saved.push((k.to_owned(), old));
-                    }
-                }
-            }
+    /// Live-resize settings on/off (applied by the mpv thread, see mpv_link.rs)
+    fn set_resize_mode(&mut self, on: bool) {
+        if self.resize_mode != on {
+            self.resize_mode = on;
+            self.link.resize_mode(on);
         }
-        saved
     }
 
-    /// Put back the settings saved by `set_fast_scaling`
-    fn restore_scaling(&mut self) {
-        if let Some(saved) = self.fast_scale_saved.take() {
-            if let Ok(mpv) = self.mpv.lock() {
-                for (k, v) in &saved {
-                    let _ = mpv.set_property(k, v.as_str());
-                }
-            }
-        }
+    /// Keep our own (just changed) values for a moment, see `hold_until`
+    fn touch(&mut self) {
+        self.hold_until = std::time::Instant::now() + std::time::Duration::from_millis(400);
     }
 
     fn current_settings(&self) -> Settings {
@@ -509,16 +504,15 @@ impl FluentMediaPlayer {
     }
 
     fn seek_to(&mut self, secs: f64) {
-        if let Ok(mpv) = self.mpv.lock() {
-            let _ = mpv.set_property("time-pos", secs);
-        }
+        self.link.set("time-pos", secs);
+        self.time_pos = secs;
+        self.touch();
     }
 
     fn set_volume(&mut self, vol: f64) {
         self.volume = vol.clamp(0.0, VOL_MAX);
-        if let Ok(mpv) = self.mpv.lock() {
-            let _ = mpv.set_property("volume", self.volume);
-        }
+        self.link.set("volume", self.volume);
+        self.touch();
     }
 
     /// Change the volume by `delta` percent and show the volume pop-up
@@ -530,33 +524,15 @@ impl FluentMediaPlayer {
 
     /// Gather decoder / video details for the info overlay
     fn refresh_info(&mut self) {
-        let mut lines = Vec::new();
-        if let Ok(mpv) = self.mpv.lock() {
-            let hw = mpv.get_property::<String>("hwdec-current").unwrap_or_default();
-            lines.push(match hw.as_str() {
-                "" => "Decoder: starting…".to_owned(),
-                "no" => "Decoder: software (CPU)".to_owned(),
-                other => format!("Decoder: hardware ({other})"),
-            });
-            let fmt = mpv.get_property::<String>("video-format").unwrap_or_default();
-            let w = mpv.get_property::<i64>("width").unwrap_or(0);
-            let h = mpv.get_property::<i64>("height").unwrap_or(0);
-            let fps = mpv.get_property::<f64>("estimated-vf-fps").unwrap_or(0.0);
-            lines.push(format!("Video: {fmt} {w}x{h} @ {fps:.1} fps"));
-            let dropped = mpv.get_property::<i64>("frame-drop-count").unwrap_or(0);
-            let dec_dropped = mpv.get_property::<i64>("decoder-frame-drop-count").unwrap_or(0);
-            lines.push(format!("Dropped frames: {dropped} (decoder: {dec_dropped})"));
-            lines.push(format!(
-                "Hardware decoding: {}  (H to switch)",
-                if self.hw_decode { "on" } else { "off" }
-            ));
-            let ahead = mpv.get_property::<f64>("demuxer-cache-duration").unwrap_or(0.0);
-            lines.push(format!("Buffered ahead: {ahead:.1} s"));
-        }
+        let mut lines = self.mpv_info.clone();
+        lines.push(format!(
+            "Hardware decoding: {}  (H to switch)",
+            if self.hw_decode { "on" } else { "off" }
+        ));
         let render_ms = RENDER_MS.with(|r| r.get());
         lines.push(format!(
             "Render: {render_ms:.1} ms per frame{}",
-            if self.fast_scale_saved.is_some() { " (dithering paused while resizing)" } else { "" }
+            if self.resize_mode { " (resize settings active)" } else { "" }
         ));
         let (n, sum, worst, worst_render) = self.rs_stats;
         if n > 0 {
@@ -573,29 +549,22 @@ impl FluentMediaPlayer {
 
     fn set_mute(&mut self, mute: bool) {
         self.muted = mute;
-        if let Ok(mpv) = self.mpv.lock() {
-            let _ = mpv.set_property("mute", mute);
-        }
+        self.link.set("mute", yn(mute));
+        self.touch();
     }
 
     fn toggle_repeat(&mut self) {
         self.repeat = !self.repeat;
-        if let Ok(mpv) = self.mpv.lock() {
-            let _ = mpv.set_property("loop-file", if self.repeat { "inf" } else { "no" });
-        }
+        self.link.set("loop-file", if self.repeat { "inf" } else { "no" });
     }
 
     fn cycle_captions(&mut self) {
-        if let Ok(mpv) = self.mpv.lock() {
-            let _ = mpv.command("cycle", &["sub"]);
-        }
+        self.link.command("cycle", &["sub"]);
     }
 
     fn set_speed(&mut self, speed: f64) {
         self.speed = speed;
-        if let Ok(mpv) = self.mpv.lock() {
-            let _ = mpv.set_property("speed", speed);
-        }
+        self.link.set("speed", speed);
     }
 
     fn has_prev(&self) -> bool {
@@ -684,14 +653,20 @@ impl FluentMediaPlayer {
 
 impl eframe::App for FluentMediaPlayer {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
-        // ── Poll mpv properties (cheap IPC calls) ─────────────────────────────
-        if let Ok(mpv) = self.mpv.lock() {
-            if let Ok(t) = mpv.get_property::<f64>("time-pos") { self.time_pos = t; }
-            if let Ok(d) = mpv.get_property::<f64>("duration") { self.duration = d; }
-            if let Ok(v) = mpv.get_property::<f64>("volume")   { self.volume   = v; }
-            if let Ok(p) = mpv.get_property::<bool>("pause")   { self.is_playing = !p; }
-            if let Ok(m) = mpv.get_property::<bool>("mute")    { self.muted = m; }
+        // ── Player state from the mpv thread (never waits for mpv) ────────────
+        let snap = self.link.snapshot();
+        if snap.valid {
+            self.duration = snap.duration;
+            if std::time::Instant::now() >= self.hold_until {
+                self.time_pos = snap.time_pos;
+                self.volume = snap.volume;
+                self.is_playing = !snap.paused;
+                self.muted = snap.muted;
+                self.eof = snap.eof;
+            }
+            self.mpv_info = snap.info;
         }
+        self.link.want_info(self.show_info);
 
         // ── Native window handle → taskbar progress + thumbnail buttons ───────
         if self.hwnd == 0 {
@@ -875,16 +850,14 @@ impl eframe::App for FluentMediaPlayer {
             self.last_size = size;
             if !first && self.has_file && self.fs_settle.is_none() {
                 self.resize_until = Some(std::time::Instant::now() + std::time::Duration::from_millis(300));
-                if self.fast_scale_saved.is_none() {
-                    self.fast_scale_saved = Some(self.set_fast_scaling());
-                }
+                self.set_resize_mode(true);
             }
         }
 
         if let Some(until) = self.resize_until {
             if std::time::Instant::now() >= until {
                 self.resize_until = None;
-                self.restore_scaling();
+                self.set_resize_mode(false);
             } else {
                 ctx.request_repaint_after(std::time::Duration::from_millis(60));
             }
@@ -1016,6 +989,9 @@ impl eframe::App for FluentMediaPlayer {
                             let started = std::time::Instant::now();
                             TLS_RENDER_CTX.with(|c| {
                                 if let Some(rc) = c.borrow_mut().as_mut() {
+                                    // Acknowledge mpv's update first (its docs recommend calling
+                                    // this after every update callback)
+                                    let _ = rc.update();
                                     let _ = rc.render::<*mut std::os::raw::c_void>(
                                         0, vp.width_px, vp.height_px, true,
                                     );
