@@ -13,6 +13,9 @@ egui_glow = "0.27"
 # Critical: You must tell libmpv2 to expose its internal OpenGL Init bindings
 libmpv2 = { version = "6.0.0", features = ["render"] }
 
+# Gives access to the native window handle (HWND) from eframe's Frame
+raw-window-handle = "0.6"
+
 [target.'cfg(windows)'.build-dependencies]
 # Embeds assets/icon.ico into the .exe
 winresource = "0.1"
