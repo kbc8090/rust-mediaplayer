@@ -190,12 +190,12 @@ pub fn draw(p: &egui::Painter, rect: Rect, accent: Color32) {
     let ty = (rect.top() + h * 0.80).min(rect.bottom() - 134.0).max(rect.top() + h * 0.55);
     let c = pos2(cx, ty);
     let title = FontId::proportional(20.0);
-    p.text(c + vec2(1.0, 1.0), Align2::CENTER_CENTER, "Drop a video file to play", title.clone(), Color32::from_black_alpha(160));
-    p.text(c, Align2::CENTER_CENTER, "Drop a video file to play", title, Color32::from_rgb(235, 238, 245));
+    p.text(c + vec2(1.0, 1.0), Align2::CENTER_CENTER, "Drop a video or music file to play", title.clone(), Color32::from_black_alpha(160));
+    p.text(c, Align2::CENTER_CENTER, "Drop a video or music file to play", title, Color32::from_rgb(235, 238, 245));
     p.text(
         c + vec2(0.0, 26.0),
         Align2::CENTER_CENTER,
-        "MP4 · MKV · AVI · MOV · WMV · WebM · and more",
+        "MP4 · MKV · AVI · MOV · MP3 · FLAC · GIF · and more",
         FontId::proportional(12.5),
         Color32::from_rgb(170, 176, 190),
     );

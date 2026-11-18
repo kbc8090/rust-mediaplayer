@@ -430,12 +430,19 @@ pub fn open_file_dialog(owner: isize, initial_dir: Option<String>) {
 
 unsafe fn run_open_dialog(owner: isize, initial_dir: Option<String>) -> Option<String> {
     CoInitializeEx(std::ptr::null_mut(), 0x2 /* COINIT_APARTMENTTHREADED */);
-    let filter: Vec<u16> = "Video files\0*.mp4;*.mkv;*.avi;*.mov;*.wmv;*.flv;*.webm;*.m4v;*.ts;*.m2ts;*.mpg;*.mpeg;*.3gp;*.ogv\0All files\0*.*\0\0"
+    let filter: Vec<u16> = concat!(
+        "Media files\0",
+        "*.mp4;*.mkv;*.avi;*.mov;*.wmv;*.flv;*.webm;*.m4v;*.ts;*.m2ts;*.mts;*.mpg;*.mpeg;*.3gp;*.ogv;",
+        "*.mp3;*.flac;*.wav;*.m4a;*.aac;*.ogg;*.oga;*.opus;*.wma;*.alac;*.aiff;*.aif;*.ape;*.wv;*.mka;*.gif\0",
+        "Video\0*.mp4;*.mkv;*.avi;*.mov;*.wmv;*.flv;*.webm;*.m4v;*.ts;*.m2ts;*.mts;*.mpg;*.mpeg;*.3gp;*.ogv\0",
+        "Music\0*.mp3;*.flac;*.wav;*.m4a;*.aac;*.ogg;*.oga;*.opus;*.wma;*.alac;*.aiff;*.aif;*.ape;*.wv;*.mka\0",
+        "All files\0*.*\0\0"
+    )
         .encode_utf16()
         .collect();
     let mut file = vec![0u16; 4096];
     let dir = initial_dir.map(|d| wide(&d));
-    let title = wide("Open video");
+    let title = wide("Open");
     let mut ofn: OpenFileNameW = std::mem::zeroed();
     ofn.struct_size = std::mem::size_of::<OpenFileNameW>() as u32;
     ofn.owner = owner;
