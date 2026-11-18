@@ -39,6 +39,7 @@ unsafe extern "system" {
     fn GetCurrentProcess() -> isize;
     fn TerminateProcess(process: isize, exit_code: u32) -> i32;
     fn K32GetProcessMemoryInfo(process: isize, counters: *mut MemCounters, size: u32) -> i32;
+    fn MultiByteToWideChar(code_page: u32, flags: u32, src: *const u8, src_len: i32, dst: *mut u16, dst_len: i32) -> i32;
 }
 
 #[link(name = "user32")]
@@ -261,6 +262,9 @@ struct FluentMediaPlayer {
     /// Video files in the current file's folder, in Explorer-style order
     folder_files: Vec<PathBuf>,
     folder_index: Option<usize>,
+    /// The .m3u being played, if any: then `folder_files` holds its entries
+    /// instead of the folder's files, and it always plays on to the next entry
+    playlist: Option<PathBuf>,
     /// Accumulated mouse-wheel scroll (points) not yet converted into volume steps
     scroll_accum: f32,
     /// Windows accent colour (re-read every couple of seconds so changes follow live)
@@ -396,6 +400,8 @@ impl FluentMediaPlayer {
             // Subtitles start off; the captions button turns them on
             let _ = init.set_property("sid", "no");
             let _ = init.set_property("volume-max", VOL_MAX);
+            // Pictures stay on screen until you move on (mpv's default is 1 second)
+            let _ = init.set_property("image-display-duration", "inf");
             // Memory: mpv's defaults keep up to 150 MiB of read-ahead plus 50 MiB of
             // already-played packets. For local files a few seconds is plenty.
             let _ = init.set_property("cache", "no");
@@ -452,6 +458,7 @@ impl FluentMediaPlayer {
             repaint_tx: tx,
             folder_files: Vec::new(),
             folder_index: None,
+            playlist: None,
             scroll_accum: 0.0,
             accent: system_accent(),
             accent_checked: std::time::Instant::now(),
@@ -491,11 +498,29 @@ impl FluentMediaPlayer {
         }
     }
 
+    /// Open a file the user picked (drop, Open dialog, command line). For a playlist,
+    /// previous / next go through its entries; otherwise through the files of the
+    /// same kind (videos / music / pictures) in the file's folder.
     fn open_file(&mut self, path: &str) {
+        if is_playlist_file(path) {
+            let entries = read_playlist(Path::new(path));
+            let Some(first) = entries.first().map(|p| p.to_string_lossy().into_owned()) else { return };
+            self.playlist = Some(PathBuf::from(path));
+            self.folder_files = entries;
+            self.folder_index = Some(0);
+            self.load_entry(&first);
+        } else {
+            self.playlist = None;
+            self.folder_files = scan_folder(Path::new(path));
+            self.folder_index = self.folder_files.iter().position(|p| p == Path::new(path));
+            self.load_entry(path);
+        }
+    }
+
+    /// Start playing `path` (keeps the current previous / next list)
+    fn load_entry(&mut self, path: &str) {
         self.current_file = path.to_owned();
         self.has_file = true;
-        self.folder_files = scan_folder(Path::new(path));
-        self.folder_index = self.folder_files.iter().position(|p| p == Path::new(path));
         // Back to "subtitles off" for every new file, even if they were switched on
         // for the previous one
         self.link.set("sid", "no");
@@ -677,7 +702,8 @@ impl FluentMediaPlayer {
         let target = i as isize + delta;
         if target < 0 || target as usize >= self.folder_files.len() { return; }
         let path = self.folder_files[target as usize].to_string_lossy().into_owned();
-        self.open_file(&path);
+        self.folder_index = Some(target as usize);
+        self.load_entry(&path);
     }
 
     fn skip(&mut self, secs: f64) {
@@ -797,7 +823,9 @@ impl eframe::App for FluentMediaPlayer {
             self.mpv_info = snap.info;
             self.chapters = snap.chapters;
             // A video just ended: go on to the next one in the folder if wanted
-            if snap.eof && !self.snap_eof && self.has_file && self.autoplay && !self.repeat && self.has_next() {
+            // (a playlist always plays on)
+            let play_on = self.autoplay || self.playlist.is_some();
+            if snap.eof && !self.snap_eof && self.has_file && play_on && !self.repeat && self.has_next() {
                 self.play_adjacent(1);
             }
             self.snap_eof = snap.eof;
@@ -1072,7 +1100,7 @@ impl eframe::App for FluentMediaPlayer {
 
         // ── Actions ───────────────────────────────────────────────────────────
         for s in &inp.dropped {
-            if is_media_file(s) { self.open_file(s); }
+            if is_media_file(s) || is_playlist_file(s) { self.open_file(s); }
         }
         if inp.space { self.toggle_play_pause(); }
         if inp.right { self.step(10.0); }
@@ -1950,13 +1978,19 @@ fn row_layout(left: f32, right: f32, time_w: f32) -> RowLayout {
 
 // ── Folder navigation ─────────────────────────────────────────────────────────
 /// Video files in the same folder as `path`, in Explorer-like (natural) order
+/// (only files of the same kind: a video steps through videos, a picture through
+/// pictures, a song through music)
 fn scan_folder(path: &Path) -> Vec<PathBuf> {
     let Some(dir) = path.parent() else { return vec![path.to_owned()] };
+    let kind = media_kind(&path.to_string_lossy());
     let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
         .map(|rd| {
             rd.filter_map(|e| e.ok())
                 .map(|e| e.path())
-                .filter(|p| p.is_file() && is_media_file(&p.to_string_lossy()))
+                .filter(|p| {
+                    let k = media_kind(&p.to_string_lossy());
+                    p.is_file() && k.is_some() && (kind.is_none() || k == kind)
+                })
                 .collect()
         })
         .unwrap_or_default();
@@ -2344,16 +2378,102 @@ fn fmt_time(secs: f64) -> String {
     if h > 0 { format!("{h}:{m:02}:{s:02}") } else { format!("{m}:{s:02}") }
 }
 
-/// Video, music and animated-image files mpv plays (used for drag-and-drop and
-/// for the folder's previous / next list)
-const MEDIA_EXTS: &[&str] = &[
-    // video
+// ── File types ────────────────────────────────────────────────────────────────
+/// Files mpv plays, by kind (drag-and-drop, the Open dialog, previous / next)
+const VIDEO_EXTS: &[&str] = &[
     "mp4", "mkv", "avi", "mov", "wmv", "flv", "webm", "m4v", "ts", "m2ts", "mts", "mpg", "mpeg", "3gp", "ogv",
-    // music
-    "mp3", "flac", "wav", "m4a", "aac", "ogg", "oga", "opus", "wma", "alac", "aiff", "aif", "ape", "wv", "mka",
-    // animated images
-    "gif",
 ];
+const MUSIC_EXTS: &[&str] = &[
+    "mp3", "flac", "wav", "m4a", "aac", "ogg", "oga", "opus", "wma", "alac", "aiff", "aif", "ape", "wv", "mka",
+];
+const IMAGE_EXTS: &[&str] = &[
+    "jpg", "jpeg", "png", "gif", "webp", "avif", "bmp", "tif", "tiff", "jxl",
+];
+const PLAYLIST_EXTS: &[&str] = &["m3u", "m3u8"];
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum MediaKind {
+    Video,
+    Music,
+    Image,
+}
+
+fn media_kind(path: &str) -> Option<MediaKind> {
+    if has_ext(path, VIDEO_EXTS) {
+        Some(MediaKind::Video)
+    } else if has_ext(path, MUSIC_EXTS) {
+        Some(MediaKind::Music)
+    } else if has_ext(path, IMAGE_EXTS) {
+        Some(MediaKind::Image)
+    } else {
+        None
+    }
+}
+
+fn is_playlist_file(path: &str) -> bool {
+    has_ext(path, PLAYLIST_EXTS)
+}
+
+/// The entries of an .m3u / .m3u8 playlist that exist (or are web addresses),
+/// in order. Relative paths are relative to the playlist's folder.
+fn read_playlist(path: &Path) -> Vec<PathBuf> {
+    let Ok(bytes) = std::fs::read(path) else { return Vec::new() };
+    let base = path.parent().map(Path::to_path_buf).unwrap_or_default();
+    playlist_text(&bytes)
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .filter_map(|line| {
+            if line.contains("://") && !line.starts_with("file://") {
+                return Some(PathBuf::from(line)); // web address: mpv streams it
+            }
+            let line = match line.strip_prefix("file:///").or_else(|| line.strip_prefix("file://")) {
+                Some(rest) => percent_decode(rest),
+                None => line.to_owned(),
+            };
+            let p = PathBuf::from(line.replace('/', "\\"));
+            let p = if p.is_absolute() { p } else { base.join(p) };
+            (p.is_file() && !is_playlist_file(&p.to_string_lossy())).then_some(p)
+        })
+        .collect()
+}
+
+/// .m3u8 (and modern .m3u) files are UTF-8; older .m3u files use the Windows
+/// language's code page
+fn playlist_text(bytes: &[u8]) -> String {
+    let bytes = bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(bytes);
+    if let Ok(s) = std::str::from_utf8(bytes) {
+        return s.to_owned();
+    }
+    unsafe {
+        let n = MultiByteToWideChar(0 /* CP_ACP */, 0, bytes.as_ptr(), bytes.len() as i32, std::ptr::null_mut(), 0);
+        if n > 0 {
+            let mut wide = vec![0u16; n as usize];
+            MultiByteToWideChar(0, 0, bytes.as_ptr(), bytes.len() as i32, wide.as_mut_ptr(), n);
+            return String::from_utf16_lossy(&wide);
+        }
+    }
+    String::from_utf8_lossy(bytes).into_owned()
+}
+
+/// "My%20Song.mp3" → "My Song.mp3" (for file:// entries)
+fn percent_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            if let Ok(v) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
+                out.push(v);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
 
 fn has_ext(path: &str, exts: &[&str]) -> bool {
     Path::new(path)
@@ -2363,7 +2483,7 @@ fn has_ext(path: &str, exts: &[&str]) -> bool {
 }
 
 fn is_media_file(path: &str) -> bool {
-    has_ext(path, MEDIA_EXTS)
+    media_kind(path).is_some()
 }
 
 fn main() -> eframe::Result<()> {
