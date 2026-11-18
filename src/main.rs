@@ -35,32 +35,11 @@ unsafe extern "system" {
     fn TerminateProcess(process: isize, exit_code: u32) -> i32;
 }
 
-#[repr(C)]
-#[derive(Clone, Copy, Default)]
-struct RectI {
-    left: i32,
-    top: i32,
-    right: i32,
-    bottom: i32,
-}
-
-#[repr(C)]
-struct MonitorInfo {
-    size: u32,
-    monitor: RectI,
-    work: RectI,
-    flags: u32,
-}
-
 #[link(name = "user32")]
 unsafe extern "system" {
     fn GetSystemMetrics(index: i32) -> i32;
     fn IsZoomed(hwnd: isize) -> i32;
     fn ShowWindow(hwnd: isize, cmd: i32) -> i32;
-    fn GetWindowRect(hwnd: isize, rect: *mut RectI) -> i32;
-    fn MonitorFromWindow(hwnd: isize, flags: u32) -> isize;
-    fn GetMonitorInfoW(monitor: isize, info: *mut MonitorInfo) -> i32;
-    fn SetWindowPos(hwnd: isize, insert_after: isize, x: i32, y: i32, cx: i32, cy: i32, flags: u32) -> i32;
 }
 
 thread_local! {
@@ -206,10 +185,12 @@ struct FluentMediaPlayer {
     info_lines: Vec<String>,
     /// Hardware decoding on/off (toggle with H)
     hw_decode: bool,
-    /// Window rectangle (screen pixels) to go back to when leaving fullscreen
-    fs_restore: Option<RectI>,
-    /// The window was maximized when fullscreen was entered (so it can be re-maximized)
-    fs_was_max: bool,
+    /// File given on the command line (drop on the .exe / "Open with"), played once ready
+    startup_file: Option<String>,
+    /// The window was maximized when last closed: re-apply it at startup
+    start_max: bool,
+    start_max_done: bool,
+    start_time: std::time::Instant,
     /// Fullscreen transition under way: overlays are held steady (no fade) until it settles
     fs_settle: Option<std::time::Instant>,
     /// In fullscreen the overlays only appear once the mouse has left the screen edges
@@ -233,6 +214,13 @@ impl FluentMediaPlayer {
         install_fonts(&cc.egui_ctx);
         let saved = load_window_state().unwrap_or(WinState::DEFAULT);
         let (volume, muted) = load_settings();
+        // A file passed on the command line: drag a video onto the .exe, double-click an
+        // associated file, or "Open with". (Explorer passes the path as the first argument.)
+        let startup_file = std::env::args_os()
+            .skip(1)
+            .map(PathBuf::from)
+            .find(|p| p.is_file())
+            .map(|p| p.to_string_lossy().into_owned());
 
         // video-timing-offset = 0 stops mpv from blocking the UI thread inside
         // render() while it waits for each frame's display time (the default 50 ms
@@ -294,8 +282,10 @@ impl FluentMediaPlayer {
             show_info: false,
             info_lines: Vec::new(),
             hw_decode: true,
-            fs_restore: None,
-            fs_was_max: false,
+            startup_file,
+            start_max: saved.maximized,
+            start_max_done: false,
+            start_time: std::time::Instant::now(),
             fs_settle: None,
             fs_armed: true,
             hwnd: 0,
@@ -480,64 +470,26 @@ impl FluentMediaPlayer {
         self.fs_settle = Some(std::time::Instant::now());
         self.fs_armed = false;
         self.show_controls = false;
-
-        let hwnd = self.hwnd;
-        if hwnd != 0 {
-            unsafe {
-                // A maximized window can't be sized past its maximized size, so
-                // un-maximize it first (and remember to maximize it again afterwards).
-                let was_max = IsZoomed(hwnd) != 0;
-                if was_max {
-                    ShowWindow(hwnd, 9); // SW_RESTORE
-                }
-                let mut window = RectI::default();
-                let mut info = MonitorInfo {
-                    size: std::mem::size_of::<MonitorInfo>() as u32,
-                    monitor: RectI::default(),
-                    work: RectI::default(),
-                    flags: 0,
-                };
-                let monitor = MonitorFromWindow(hwnd, 2); // MONITOR_DEFAULTTONEAREST
-                if monitor != 0 && GetWindowRect(hwnd, &mut window) != 0 && GetMonitorInfoW(monitor, &mut info) != 0 {
-                    self.fs_restore = Some(window);
-                    self.fs_was_max = was_max;
-                    self.is_fullscreen = true;
-                    let m = info.monitor;
-                    SetWindowPos(hwnd, 0, m.left, m.top, m.right - m.left, m.bottom - m.top, 0x0200); // SWP_NOOWNERZORDER
-                    ctx.request_repaint();
-                    return;
-                }
-                if was_max {
-                    ShowWindow(hwnd, 3); // SW_MAXIMIZE — couldn't go fullscreen, put it back
-                }
-            }
-        }
-        // Fallback: let egui/winit do the normal fullscreen switch
-        self.fs_restore = None;
         self.is_fullscreen = true;
-        ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(true));
+        if self.hwnd != 0 {
+            // Posted, so the resize happens between two frames (see taskbar.rs)
+            taskbar::post_fullscreen(self.hwnd, true);
+            ctx.request_repaint();
+        } else {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(true));
+        }
     }
 
     fn exit_fullscreen(&mut self, ctx: &egui::Context) {
         self.fs_settle = Some(std::time::Instant::now());
         self.show_controls = true;
         self.is_fullscreen = false;
-
-        let hwnd = self.hwnd;
-        if hwnd != 0 {
-            if let Some(r) = self.fs_restore.take() {
-                unsafe {
-                    SetWindowPos(hwnd, 0, r.left, r.top, r.right - r.left, r.bottom - r.top, 0x0200);
-                    if self.fs_was_max {
-                        ShowWindow(hwnd, 3); // SW_MAXIMIZE
-                    }
-                }
-                self.fs_was_max = false;
-                ctx.request_repaint();
-                return;
-            }
+        if self.hwnd != 0 {
+            taskbar::post_fullscreen(self.hwnd, false);
+            ctx.request_repaint();
+        } else {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
         }
-        ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
     }
 
     fn toggle_maximize(&mut self, ctx: &egui::Context) {
@@ -584,7 +536,21 @@ impl eframe::App for FluentMediaPlayer {
         }
         if self.hwnd != 0 && !self.taskbar_tried {
             self.taskbar_tried = true;
+            taskbar::hook_window(self.hwnd);
             self.taskbar = taskbar::Taskbar::new(self.hwnd);
+        }
+        if taskbar::take_fullscreen_failed() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(true));
+        }
+
+        // Re-apply "maximized" from last time if the window didn't start that way
+        if self.start_max && !self.start_max_done && self.hwnd != 0 && self.start_time.elapsed().as_secs_f32() > 0.5 {
+            self.start_max_done = true;
+            unsafe {
+                if IsZoomed(self.hwnd) == 0 {
+                    ShowWindow(self.hwnd, 3); // SW_MAXIMIZE
+                }
+            }
         }
         if let Some(id) = taskbar::take_click() {
             match id {
@@ -621,6 +587,16 @@ impl eframe::App for FluentMediaPlayer {
                 let v = i.viewport();
                 (v.outer_rect, v.inner_rect, v.maximized.unwrap_or(false), v.minimized.unwrap_or(false))
             });
+            // egui's own "maximized" flag is unreliable for a frameless window, so ask
+            // Windows. For the first moments after starting maximized, trust the saved
+            // state: the window may not have been maximized yet.
+            let maximized = if self.start_max && self.start_time.elapsed().as_secs_f32() < 3.0 {
+                true
+            } else if self.hwnd != 0 {
+                unsafe { IsZoomed(self.hwnd) != 0 }
+            } else {
+                maximized
+            };
             if let (Some(o), Some(i), false) = (outer, inner, minimized) {
                 // (a minimised window reports a position around -32000)
                 if o.min.x > -10000.0 && o.min.y > -10000.0 {
@@ -692,6 +668,12 @@ impl eframe::App for FluentMediaPlayer {
                 rc.set_update_callback(move || { let _ = tx.try_send(()); });
                 TLS_RENDER_CTX.with(|c| *c.borrow_mut() = Some(rc));
                 self.render_ctx_initialized = true;
+            }
+        }
+
+        if self.render_ctx_initialized {
+            if let Some(path) = self.startup_file.take() {
+                self.open_file(&path);
             }
         }
 
@@ -965,12 +947,18 @@ fn poly(p: &egui::Painter, c: Pos2, pts: &[(f32, f32)], col: Color32, w: f32) {
     p.add(egui::Shape::line(v, Stroke::new(w, col)));
 }
 
-fn closed_poly(p: &egui::Painter, c: Pos2, pts: &[(f32, f32)], col: Color32, w: f32) {
-    let v: Vec<Pos2> = pts.iter().map(|&(x, y)| pos2(c.x + x, c.y + y)).collect();
+/// Same as `poly` / `closed_poly`, with the offsets scaled by the icon scale `K`
+fn kpoly(p: &egui::Painter, c: Pos2, pts: &[(f32, f32)], col: Color32, w: f32) {
+    let v: Vec<Pos2> = pts.iter().map(|&(x, y)| pos2(c.x + x * K, c.y + y * K)).collect();
+    p.add(egui::Shape::line(v, Stroke::new(w, col)));
+}
+
+fn kclosed(p: &egui::Painter, c: Pos2, pts: &[(f32, f32)], col: Color32, w: f32) {
+    let v: Vec<Pos2> = pts.iter().map(|&(x, y)| pos2(c.x + x * K, c.y + y * K)).collect();
     p.add(egui::Shape::closed_line(v, Stroke::new(w, col)));
 }
 
-/// 36×36 hit area with a soft round hover highlight. Draw the icon afterwards.
+/// 36×36 click target with a faint 30×30 rounded hover highlight (8 px radius). Draw the icon afterwards.
 fn hit(ui: &mut egui::Ui, centre: Pos2, id: &str, tip: &str, t: f32) -> egui::Response {
     let r = ui.interact(
         Rect::from_center_size(centre, vec2(36.0, 36.0)),
@@ -980,41 +968,47 @@ fn hit(ui: &mut egui::Ui, centre: Pos2, id: &str, tip: &str, t: f32) -> egui::Re
     if r.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
         ui.painter().rect_filled(
-            Rect::from_center_size(centre, vec2(36.0, 36.0)),
+            Rect::from_center_size(centre, vec2(30.0, 30.0)),
             8.0,
-            Color32::from_white_alpha((24.0 * t) as u8),
+            Color32::from_white_alpha((13.0 * t) as u8),
         );
     }
     r.on_hover_text(tip)
 }
 
 // ── Icons (drawn with shapes so they never depend on font coverage) ───────────
-const SW: f32 = 1.4;
+const SW: f32 = 1.35;
+/// Overall scale of the control-row icons
+const K: f32 = 0.92;
 
 fn icon_pause(p: &egui::Painter, c: Pos2, col: Color32) {
-    p.rect_filled(Rect::from_center_size(pos2(c.x - 3.5, c.y), vec2(2.6, 13.0)), 0.5, col);
-    p.rect_filled(Rect::from_center_size(pos2(c.x + 3.5, c.y), vec2(2.6, 13.0)), 0.5, col);
+    p.rect_filled(Rect::from_center_size(pos2(c.x - 3.5 * K, c.y), vec2(2.6 * K, 13.0 * K)), 0.5, col);
+    p.rect_filled(Rect::from_center_size(pos2(c.x + 3.5 * K, c.y), vec2(2.6 * K, 13.0 * K)), 0.5, col);
 }
 fn icon_play(p: &egui::Painter, c: Pos2, col: Color32) {
     p.add(egui::Shape::convex_polygon(
-        vec![pos2(c.x - 4.5, c.y - 7.5), pos2(c.x - 4.5, c.y + 7.5), pos2(c.x + 7.5, c.y)],
+        vec![
+            pos2(c.x - 4.5 * K, c.y - 7.5 * K),
+            pos2(c.x - 4.5 * K, c.y + 7.5 * K),
+            pos2(c.x + 7.5 * K, c.y),
+        ],
         col, Stroke::NONE,
     ));
 }
 fn icon_prev(p: &egui::Painter, c: Pos2, col: Color32) {
-    p.line_segment([pos2(c.x - 6.5, c.y - 6.0), pos2(c.x - 6.5, c.y + 6.0)], Stroke::new(SW, col));
-    closed_poly(p, c, &[(6.5, -6.0), (6.5, 6.0), (-3.0, 0.0)], col, SW);
+    p.line_segment([pos2(c.x - 6.5 * K, c.y - 6.0 * K), pos2(c.x - 6.5 * K, c.y + 6.0 * K)], Stroke::new(SW, col));
+    kclosed(p, c, &[(6.5, -6.0), (6.5, 6.0), (-3.0, 0.0)], col, SW);
 }
 fn icon_next(p: &egui::Painter, c: Pos2, col: Color32) {
-    p.line_segment([pos2(c.x + 6.5, c.y - 6.0), pos2(c.x + 6.5, c.y + 6.0)], Stroke::new(SW, col));
-    closed_poly(p, c, &[(-6.5, -6.0), (-6.5, 6.0), (3.0, 0.0)], col, SW);
+    p.line_segment([pos2(c.x + 6.5 * K, c.y - 6.0 * K), pos2(c.x + 6.5 * K, c.y + 6.0 * K)], Stroke::new(SW, col));
+    kclosed(p, c, &[(-6.5, -6.0), (-6.5, 6.0), (3.0, 0.0)], col, SW);
 }
 fn icon_volume(p: &egui::Painter, c: Pos2, col: Color32, level: f64, muted: bool) {
-    let c = pos2(c.x - 3.0, c.y);
-    closed_poly(p, c, &[(-6.0, -3.0), (-3.0, -3.0), (1.5, -7.0), (1.5, 7.0), (-3.0, 3.0), (-6.0, 3.0)], col, SW);
+    let c = pos2(c.x - 3.0 * K, c.y);
+    kclosed(p, c, &[(-6.0, -3.0), (-3.0, -3.0), (1.5, -7.0), (1.5, 7.0), (-3.0, 3.0), (-6.0, 3.0)], col, SW);
     if muted || level <= 0.0 {
-        poly(p, c, &[(5.0, -3.5), (10.5, 3.5)], col, SW);
-        poly(p, c, &[(5.0, 3.5), (10.5, -3.5)], col, SW);
+        kpoly(p, c, &[(5.0, -3.5), (10.5, 3.5)], col, SW);
+        kpoly(p, c, &[(5.0, 3.5), (10.5, -3.5)], col, SW);
     } else {
         let arc = |r: f32| -> Vec<(f32, f32)> {
             (-4..=4).map(|k| {
@@ -1022,34 +1016,34 @@ fn icon_volume(p: &egui::Painter, c: Pos2, col: Color32, level: f64, muted: bool
                 (1.5 + r * a.cos(), r * a.sin())
             }).collect()
         };
-        poly(p, c, &arc(5.0), col, SW);
-        if level >= 40.0 { poly(p, c, &arc(9.0), col, SW); }
+        kpoly(p, c, &arc(5.0), col, SW);
+        if level >= 40.0 { kpoly(p, c, &arc(9.0), col, SW); }
     }
 }
 fn icon_repeat(p: &egui::Painter, c: Pos2, col: Color32) {
-    poly(p, c, &[(-8.0, 2.0), (-8.0, -2.0), (-5.0, -5.0), (6.0, -5.0)], col, SW);
-    poly(p, c, &[(3.5, -7.5), (6.0, -5.0), (3.5, -2.5)], col, SW);
-    poly(p, c, &[(8.0, -2.0), (8.0, 2.0), (5.0, 5.0), (-6.0, 5.0)], col, SW);
-    poly(p, c, &[(-3.5, 2.5), (-6.0, 5.0), (-3.5, 7.5)], col, SW);
+    kpoly(p, c, &[(-8.0, 2.0), (-8.0, -2.0), (-5.0, -5.0), (6.0, -5.0)], col, SW);
+    kpoly(p, c, &[(3.5, -7.5), (6.0, -5.0), (3.5, -2.5)], col, SW);
+    kpoly(p, c, &[(8.0, -2.0), (8.0, 2.0), (5.0, 5.0), (-6.0, 5.0)], col, SW);
+    kpoly(p, c, &[(-3.5, 2.5), (-6.0, 5.0), (-3.5, 7.5)], col, SW);
 }
 fn icon_captions(p: &egui::Painter, c: Pos2, col: Color32) {
-    p.rect_stroke(Rect::from_center_size(c, vec2(18.0, 13.0)), 2.0, Stroke::new(SW, col));
-    poly(p, c, &[(-5.0, -1.0), (-1.5, -1.0)], col, SW);
-    poly(p, c, &[(1.5, -1.0), (5.0, -1.0)], col, SW);
-    poly(p, c, &[(-5.0, 2.5), (2.0, 2.5)], col, SW);
+    p.rect_stroke(Rect::from_center_size(c, vec2(18.0 * K, 13.0 * K)), 2.0, Stroke::new(SW, col));
+    kpoly(p, c, &[(-5.0, -1.0), (-1.5, -1.0)], col, SW);
+    kpoly(p, c, &[(1.5, -1.0), (5.0, -1.0)], col, SW);
+    kpoly(p, c, &[(-5.0, 2.5), (2.0, 2.5)], col, SW);
 }
 fn icon_compact(p: &egui::Painter, c: Pos2, col: Color32) {
-    p.rect_stroke(Rect::from_center_size(c, vec2(17.0, 13.0)), 1.5, Stroke::new(SW, col));
-    p.rect_filled(Rect::from_min_size(pos2(c.x + 0.5, c.y - 0.5), vec2(6.0, 4.5)), 0.5, col);
+    p.rect_stroke(Rect::from_center_size(c, vec2(17.0 * K, 13.0 * K)), 1.5, Stroke::new(SW, col));
+    p.rect_filled(Rect::from_min_size(pos2(c.x + 0.5 * K, c.y - 0.5 * K), vec2(6.0 * K, 4.5 * K)), 0.5, col);
 }
 fn icon_fullscreen(p: &egui::Painter, c: Pos2, col: Color32) {
-    poly(p, c, &[(-6.5, 6.5), (6.5, -6.5)], col, SW);
-    poly(p, c, &[(6.5, -1.5), (6.5, -6.5), (1.5, -6.5)], col, SW);
-    poly(p, c, &[(-6.5, 1.5), (-6.5, 6.5), (-1.5, 6.5)], col, SW);
+    kpoly(p, c, &[(-6.5, 6.5), (6.5, -6.5)], col, SW);
+    kpoly(p, c, &[(6.5, -1.5), (6.5, -6.5), (1.5, -6.5)], col, SW);
+    kpoly(p, c, &[(-6.5, 1.5), (-6.5, 6.5), (-1.5, 6.5)], col, SW);
 }
 fn icon_more(p: &egui::Painter, c: Pos2, col: Color32) {
-    for dx in [-6.0, 0.0, 6.0] {
-        p.circle_filled(pos2(c.x + dx, c.y), 1.5, col);
+    for dx in [-6.0_f32, 0.0, 6.0] {
+        p.circle_filled(pos2(c.x + dx * K, c.y), 1.4, col);
     }
 }
 
@@ -1070,7 +1064,7 @@ fn draw_top_bar(app: &mut FluentMediaPlayer, ctx: &egui::Context, t: f32) {
     let bar = Rect::from_min_size(screen.min, vec2(screen.width(), TOP_H));
     let maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
     let fullscreen = app.is_fullscreen;
-    let title = if app.has_file { app.file_name() } else { "Media Player".to_owned() };
+    let title = if app.has_file { app.file_name() } else { "Rust Media Player".to_owned() };
     let white = Color32::WHITE.gamma_multiply(t);
 
     egui::Area::new(egui::Id::new("top_bar"))
@@ -1591,7 +1585,7 @@ fn is_video_file(path: &str) -> bool {
 
 fn main() -> eframe::Result<()> {
     let mut viewport = egui::ViewportBuilder::default()
-        .with_title("Media Player")
+        .with_title("Rust Media Player")
         .with_inner_size([960.0, 540.0])
         .with_min_inner_size([480.0, 300.0])
         // We draw our own title bar and window buttons
@@ -1616,7 +1610,7 @@ fn main() -> eframe::Result<()> {
         ..Default::default()
     };
     eframe::run_native(
-        "Media Player",
+        "Rust Media Player",
         options,
         Box::new(|cc| Box::new(FluentMediaPlayer::new(cc))),
     )

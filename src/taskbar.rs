@@ -5,6 +5,11 @@
 //!  * transport buttons (previous file, back 10 s, play/pause, forward 10 s,
 //!    next file) in the preview that pops up when you hover the taskbar icon
 //!
+//! It also hosts the window-procedure hook, which additionally
+//!
+//!  * performs the fullscreen switch *between* frames (see `post_fullscreen`)
+//!  * stops Windows erasing the window background on resize (a flash source)
+//!
 //! Everything here fails quietly: if Windows refuses a call, the player simply
 //! runs without that part of the integration.
 //!
@@ -13,6 +18,7 @@
 
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 // Thumbnail button ids (also the values returned by `take_click`)
@@ -68,6 +74,23 @@ struct IconInfo {
     color: isize,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct RectI {
+    left: i32,
+    top: i32,
+    right: i32,
+    bottom: i32,
+}
+
+#[repr(C)]
+struct MonitorInfo {
+    size: u32,
+    monitor: RectI,
+    work: RectI,
+    flags: u32,
+}
+
 type SubclassProc = unsafe extern "system" fn(isize, u32, usize, isize, usize, usize) -> isize;
 
 #[link(name = "ole32")]
@@ -95,6 +118,18 @@ unsafe extern "system" {
     fn IsIconic(hwnd: isize) -> i32;
     fn RedrawWindow(hwnd: isize, update_rect: *const c_void, update_region: isize, flags: u32) -> i32;
     fn CreateIconIndirect(info: *const IconInfo) -> isize;
+    fn PostMessageW(hwnd: isize, msg: u32, wparam: usize, lparam: isize) -> i32;
+    fn IsZoomed(hwnd: isize) -> i32;
+    fn ShowWindow(hwnd: isize, cmd: i32) -> i32;
+    fn GetWindowRect(hwnd: isize, rect: *mut RectI) -> i32;
+    fn MonitorFromWindow(hwnd: isize, flags: u32) -> isize;
+    fn GetMonitorInfoW(monitor: isize, info: *mut MonitorInfo) -> i32;
+    fn SetWindowPos(hwnd: isize, insert_after: isize, x: i32, y: i32, cx: i32, cy: i32, flags: u32) -> i32;
+}
+
+#[link(name = "dwmapi")]
+unsafe extern "system" {
+    fn DwmSetWindowAttribute(hwnd: isize, attribute: u32, value: *const c_void, size: u32) -> i32;
 }
 
 #[link(name = "gdi32")]
@@ -103,6 +138,9 @@ unsafe extern "system" {
     fn DeleteObject(object: isize) -> i32;
 }
 
+const WM_ERASEBKGND: u32 = 0x0014;
+/// Private message: switch fullscreen on (wparam 1) or off (wparam 2)
+const WM_APP_FULLSCREEN: u32 = 0x8001;
 const WM_COMMAND: u32 = 0x0111;
 const WM_TIMER: u32 = 0x0113;
 const THBN_CLICKED: u32 = 0x1800;
@@ -141,6 +179,84 @@ static CLICKED: AtomicU32 = AtomicU32::new(0);
 /// Id of the "TaskbarButtonCreated" window message (sent again if Explorer restarts)
 static BUTTON_MSG: AtomicU32 = AtomicU32::new(0);
 static BUTTONS_LOST: AtomicBool = AtomicBool::new(false);
+
+/// Window rectangle to go back to when leaving fullscreen: left, top, right, bottom
+static FS_RESTORE: Mutex<Option<[i32; 4]>> = Mutex::new(None);
+/// The window was maximized when fullscreen was entered
+static FS_WAS_MAX: AtomicBool = AtomicBool::new(false);
+/// Entering fullscreen could not be done natively (caller falls back to egui's way)
+static FS_FAILED: AtomicBool = AtomicBool::new(false);
+
+/// True once if the last fullscreen request could not be carried out
+pub fn take_fullscreen_failed() -> bool {
+    FS_FAILED.swap(false, Ordering::Relaxed)
+}
+
+/// Ask the window procedure to switch fullscreen on/off. The switch is *posted*, so it
+/// runs between two frames instead of in the middle of one: the old frame is never
+/// stretched into the resized window, which is what looked like flicker.
+pub fn post_fullscreen(hwnd: isize, enter: bool) {
+    unsafe {
+        PostMessageW(hwnd, WM_APP_FULLSCREEN, if enter { 1 } else { 2 }, 0);
+    }
+}
+
+/// Install the window-procedure hook (taskbar clicks, fullscreen, erase-background)
+/// and switch off Windows' own window animations.
+pub fn hook_window(hwnd: isize) -> bool {
+    unsafe {
+        let ok = SetWindowSubclass(hwnd, Some(subclass_proc), SUBCLASS_ID, 0) != 0;
+        if ok {
+            // While the window is minimised the UI loop sleeps; this timer wakes it
+            // twice a second so the taskbar progress keeps moving.
+            SetTimer(hwnd, TIMER_ID, 500, std::ptr::null());
+        }
+        // DWMWA_TRANSITIONS_FORCEDISABLED: no open/close/min/max animations, which
+        // make fullscreen switches look jumpy.
+        let on: i32 = 1;
+        DwmSetWindowAttribute(hwnd, 3, &on as *const i32 as *const c_void, 4);
+        ok
+    }
+}
+
+unsafe fn enter_fullscreen_now(hwnd: isize) {
+    // A maximized window can't be sized past its maximized size: un-maximize first.
+    let was_max = IsZoomed(hwnd) != 0;
+    if was_max {
+        ShowWindow(hwnd, 9); // SW_RESTORE
+    }
+    let mut window = RectI::default();
+    let mut info = MonitorInfo {
+        size: std::mem::size_of::<MonitorInfo>() as u32,
+        monitor: RectI::default(),
+        work: RectI::default(),
+        flags: 0,
+    };
+    let monitor = MonitorFromWindow(hwnd, 2); // MONITOR_DEFAULTTONEAREST
+    if monitor != 0 && GetWindowRect(hwnd, &mut window) != 0 && GetMonitorInfoW(monitor, &mut info) != 0 {
+        if let Ok(mut r) = FS_RESTORE.lock() {
+            *r = Some([window.left, window.top, window.right, window.bottom]);
+        }
+        FS_WAS_MAX.store(was_max, Ordering::Relaxed);
+        let m = info.monitor;
+        SetWindowPos(hwnd, 0, m.left, m.top, m.right - m.left, m.bottom - m.top, 0x0200); // SWP_NOOWNERZORDER
+    } else {
+        if was_max {
+            ShowWindow(hwnd, 3); // SW_MAXIMIZE — couldn't go fullscreen, put it back
+        }
+        FS_FAILED.store(true, Ordering::Relaxed);
+    }
+}
+
+unsafe fn exit_fullscreen_now(hwnd: isize) {
+    let saved = FS_RESTORE.lock().ok().and_then(|mut r| r.take());
+    if let Some([l, t, r, b]) = saved {
+        SetWindowPos(hwnd, 0, l, t, r - l, b - t, 0x0200);
+        if FS_WAS_MAX.swap(false, Ordering::Relaxed) {
+            ShowWindow(hwnd, 3); // SW_MAXIMIZE
+        }
+    }
+}
 
 /// The thumbnail button that was clicked since the last call, if any
 pub fn take_click() -> Option<u32> {
@@ -193,12 +309,6 @@ impl Taskbar {
             }
 
             BUTTON_MSG.store(RegisterWindowMessageW(wide("TaskbarButtonCreated").as_ptr()), Ordering::Relaxed);
-            if SetWindowSubclass(hwnd, Some(subclass_proc), SUBCLASS_ID, 0) == 0 {
-                return None;
-            }
-            // While the window is minimised the UI loop sleeps; this timer wakes it
-            // twice a second so the taskbar progress keeps moving.
-            SetTimer(hwnd, TIMER_ID, 500, std::ptr::null());
 
             let icons = [
                 make_icon(Glyph::Prev)?,
@@ -316,7 +426,17 @@ unsafe extern "system" fn subclass_proc(
     _subclass_id: usize,
     _ref_data: usize,
 ) -> isize {
-    if msg == WM_COMMAND {
+    if msg == WM_ERASEBKGND {
+        // The whole client area is painted by OpenGL; erasing it first only flashes.
+        return 1;
+    } else if msg == WM_APP_FULLSCREEN {
+        if wparam == 1 {
+            enter_fullscreen_now(hwnd);
+        } else {
+            exit_fullscreen_now(hwnd);
+        }
+        return 0;
+    } else if msg == WM_COMMAND {
         let code = ((wparam >> 16) & 0xFFFF) as u32;
         let id = (wparam & 0xFFFF) as u32;
         if code == THBN_CLICKED && (PREV..=NEXT).contains(&id) {
