@@ -115,7 +115,7 @@ fn load_settings() -> (f64, bool) {
     let volume = it.next().and_then(|t| t.parse::<f64>().ok());
     let muted = it.next().and_then(|t| t.parse::<u8>().ok()) == Some(1);
     match volume {
-        Some(v) => (v.clamp(0.0, 100.0), muted),
+        Some(v) => (v.clamp(0.0, VOL_MAX), muted),
         None => (80.0, false),
     }
 }
@@ -174,6 +174,8 @@ const ROW_FROM_BOTTOM: f32 = 27.0;    // button row centre line
 const WIN_BTN_W: f32 = 46.0;
 const WIN_BTN_H: f32 = 34.0;
 const MORE_POPUP: &str = "more_popup";
+/// Highest volume (percent). mpv allows up to 130 by default.
+const VOL_MAX: f64 = 130.0;
 
 struct FluentMediaPlayer {
     mpv: Arc<Mutex<Mpv>>,
@@ -252,7 +254,11 @@ impl FluentMediaPlayer {
         // render() while it waits for each frame's display time (the default 50 ms
         // wait made window moves/resizes follow the video's frame rate).
         let mpv = Mpv::with_initializer(|init| {
-            init.set_property("video-timing-offset", 0.0_f64)?;
+            // Draw video ONLY through our render context, never in a window of mpv's
+            // own. Older libmpv builds happened to pick this automatically; newer
+            // ones default to their own video output (a separate "mpv" window).
+            let _ = init.set_property("vo", "libmpv");
+            let _ = init.set_property("video-timing-offset", 0.0_f64);
             // Hardware decoding with copy-back: the GPU decodes, frames are copied to
             // system memory and uploaded as normal textures. The direct GPU-sharing
             // modes ("auto") can show corrupted frames with OpenGL on some drivers.
@@ -260,6 +266,9 @@ impl FluentMediaPlayer {
             // Don't decode straight into GPU-mapped buffers (another known source of
             // garbled frames on some drivers).
             let _ = init.set_property("vd-lavc-dr", "no");
+            // Subtitles start off; the captions button turns them on
+            let _ = init.set_property("sid", "no");
+            let _ = init.set_property("volume-max", VOL_MAX);
             // Memory: mpv's defaults keep up to 150 MiB of read-ahead plus 50 MiB of
             // already-played packets. For local files a few seconds is plenty.
             let _ = init.set_property("cache", "no");
@@ -337,6 +346,9 @@ impl FluentMediaPlayer {
         self.folder_files = scan_folder(Path::new(path));
         self.folder_index = self.folder_files.iter().position(|p| p == Path::new(path));
         if let Ok(mpv) = self.mpv.lock() {
+            // Back to "subtitles off" for every new file, even if they were
+            // switched on for the previous one
+            let _ = mpv.set_property("sid", "no");
             let _ = mpv.command("loadfile", &[path]);
             let _ = mpv.set_property("pause", false);
         }
@@ -396,7 +408,7 @@ impl FluentMediaPlayer {
     }
 
     fn set_volume(&mut self, vol: f64) {
-        self.volume = vol.clamp(0.0, 100.0);
+        self.volume = vol.clamp(0.0, VOL_MAX);
         if let Ok(mpv) = self.mpv.lock() {
             let _ = mpv.set_property("volume", self.volume);
         }
@@ -1089,6 +1101,15 @@ fn draw_top_bar(app: &mut FluentMediaPlayer, ctx: &egui::Context, t: f32) {
             let p = ui.painter().clone();
             gradient(&p, bar, black(150, t), Color32::TRANSPARENT);
 
+            // Fullscreen: the bar covers the top edge of the screen, so it must
+            // handle the double-click itself (the video underneath can't see it)
+            if fullscreen {
+                let bg = ui.interact(bar, ui.id().with("fs_bg"), Sense::click());
+                if bg.double_clicked() {
+                    app.toggle_fullscreen(ctx);
+                }
+            }
+
             // Drag region: move the window, double-click to maximise
             if !fullscreen {
                 let drag = ui.interact(
@@ -1175,6 +1196,21 @@ fn draw_bottom_bar(app: &mut FluentMediaPlayer, ctx: &egui::Context, t: f32) {
             let p = ui.painter().clone();
             gradient(&p, bar, Color32::TRANSPARENT, black(175, t));
 
+            // Empty parts of the bar behave like the video underneath: double-click
+            // toggles fullscreen (so the bottom edge of the screen works too), drag
+            // moves the window. Registered first, so the seek bar and buttons added
+            // after it take precedence.
+            let bg = ui.interact(bar, ui.id().with("bar_bg"), Sense::click_and_drag());
+            if bg.double_clicked() {
+                app.toggle_fullscreen(ctx);
+            }
+            let pressed_on_edge = ctx
+                .input(|i| i.pointer.press_origin())
+                .map_or(false, |o| hit_edge(o, screen).is_some());
+            if bg.drag_started() && !app.is_fullscreen && !pressed_on_edge {
+                ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+            }
+
             // ── Seek bar ──────────────────────────────────────────────────────
             let seek_y = screen.bottom() - SEEK_FROM_BOTTOM;
             let sr = Rect::from_min_max(
@@ -1250,7 +1286,7 @@ fn draw_bottom_bar(app: &mut FluentMediaPlayer, ctx: &egui::Context, t: f32) {
             p.text(
                 pos2(left + 139.0, row_y), Align2::LEFT_CENTER,
                 format!("{} / {}", fmt_time(app.time_pos), fmt_time(app.duration)),
-                FontId::proportional(13.0), white,
+                FontId::proportional(14.5), white,
             );
 
             // Volume icon (click = mute) + slider
@@ -1267,16 +1303,24 @@ fn draw_bottom_bar(app: &mut FluentMediaPlayer, ctx: &egui::Context, t: f32) {
             let vresp = ui.interact(vr, ui.id().with("vol"), Sense::click_and_drag());
             if vresp.is_pointer_button_down_on() || vresp.dragged() {
                 if let Some(pos) = vresp.interact_pointer_pos() {
-                    let v = ((pos.x - vl) / vw).clamp(0.0, 1.0) as f64 * 100.0;
-                    app.set_volume(v);
+                    let mut v = ((pos.x - vl) / vw).clamp(0.0, 1.0) as f64 * VOL_MAX;
+                    // Gentle snap to 100 % so it's easy to land exactly on it
+                    if (v - 100.0).abs() < 2.5 { v = 100.0; }
+                    app.set_volume(v.round());
                     if app.muted { app.set_mute(false); }
                 }
             }
-            let vf = (app.volume / 100.0).clamp(0.0, 1.0) as f32;
+            let vf = (app.volume / VOL_MAX).clamp(0.0, 1.0) as f32;
             let vhot = vresp.hovered() || vresp.dragged();
             p.rect_filled(
                 Rect::from_min_max(pos2(vl, row_y - 1.0), pos2(vl + vw, row_y + 1.0)),
                 1.0, VOL_TRACK.gamma_multiply(t),
+            );
+            // Small tick marking 100 % (everything right of it is boost)
+            let x100 = vl + vw * (100.0 / VOL_MAX) as f32;
+            p.line_segment(
+                [pos2(x100, row_y - 4.0), pos2(x100, row_y + 4.0)],
+                Stroke::new(1.0_f32, VOL_TRACK.gamma_multiply(t * 0.8)),
             );
             p.rect_filled(
                 Rect::from_min_max(pos2(vl, row_y - 1.5), pos2(vl + vw * vf, row_y + 1.5)),
@@ -1548,7 +1592,7 @@ fn draw_volume_osd(ctx: &egui::Context, volume: f64, muted: bool, accent: Color3
         pos2(rect.right() - 14.0, rect.bottom() - 6.0),
     );
     p.rect_filled(bar, 1.5, VOL_TRACK.gamma_multiply(alpha * 0.6));
-    let frac = if muted { 0.0 } else { (volume / 100.0).clamp(0.0, 1.0) as f32 };
+    let frac = if muted { 0.0 } else { (volume / VOL_MAX).clamp(0.0, 1.0) as f32 };
     p.rect_filled(
         Rect::from_min_max(bar.min, pos2(bar.left() + bar.width() * frac, bar.max.y)),
         1.5,
