@@ -1960,8 +1960,8 @@ fn draw_bottom_bar(app: &mut FluentMediaPlayer, ctx: &egui::Context, t: f32) {
                     for (e, a) in [(1.0, 60.0), (2.5, 30.0), (4.0, 14.0)] {
                         tp.rect_filled(tr.expand(e), 4.0 + e, Color32::from_black_alpha((a * t) as u8));
                     }
-                    app.thumbs.paint(&tp, tr, 4.0);
-                    tp.rect_stroke(tr.expand(0.5), 4.5, Stroke::new(1.0_f32, { let a = (70.0 * t) as u8; Color32::from_rgba_premultiplied(a, a, a, a) }));
+                    app.thumbs.paint(&tp, tr, 2.0);
+                    tp.rect_stroke(tr.expand(0.5), 2.5, Stroke::new(1.0_f32, { let a = (70.0 * t) as u8; Color32::from_rgba_premultiplied(a, a, a, a) }));
                 }
             }
 

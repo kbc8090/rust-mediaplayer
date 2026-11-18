@@ -87,6 +87,13 @@ struct RectI {
 }
 
 #[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct Point {
+    x: i32,
+    y: i32,
+}
+
+#[repr(C)]
 struct MonitorInfo {
     size: u32,
     monitor: RectI,
@@ -175,6 +182,8 @@ unsafe extern "system" {
     fn SetForegroundWindow(hwnd: isize) -> i32;
     fn MonitorFromRect(rect: *const RectI, flags: u32) -> isize;
     fn GetDpiForWindow(hwnd: isize) -> u32;
+    fn GetCursorPos(point: *mut Point) -> i32;
+    fn SendMessageW(hwnd: isize, msg: u32, wparam: usize, lparam: isize) -> isize;
 }
 
 #[link(name = "kernel32")]
@@ -209,6 +218,9 @@ const WM_KEYDOWN: u32 = 0x0100;
 const WM_APPCOMMAND: u32 = 0x0319;
 const WM_MOVING: u32 = 0x0216;
 const WM_SIZING: u32 = 0x0214;
+const WM_ENTERSIZEMOVE: u32 = 0x0231;
+const WM_EXITSIZEMOVE: u32 = 0x0232;
+const WM_GETMINMAXINFO: u32 = 0x0024;
 /// Marks our WM_COPYDATA messages ("RMP1")
 const COPYDATA_MAGIC: usize = 0x524D_5031;
 const WM_TIMER: u32 = 0x0113;
@@ -382,61 +394,140 @@ pub fn forward_to_running_instance(file: Option<&str>) -> bool {
 static SNAP: AtomicBool = AtomicBool::new(true);
 
 /// Moving / resizing the window pulls its edges onto the screen's edges when they
-/// come within 8 px (menu setting)
+/// come within 6 px (menu setting)
 pub fn set_snap(on: bool) {
     SNAP.store(on, Ordering::Relaxed);
 }
 
-/// Adjust the proposed window rectangle of a move (`sizing` = None) or a resize
-/// (`sizing` = which edge is being dragged, WMSZ_*)
-unsafe fn snap_rect(hwnd: isize, r: &mut RectI, sizing: Option<usize>) {
-    let mut mi: MonitorInfo = std::mem::zeroed();
-    mi.size = std::mem::size_of::<MonitorInfo>() as u32;
-    if GetMonitorInfoW(MonitorFromRect(r, 2 /* MONITOR_DEFAULTTONEAREST */), &mut mi) == 0 {
+/// Where a move / resize started. Windows moves the window by each small mouse step
+/// from wherever it was put last, so after a snap, slow mouse steps were each
+/// snapped back and only a fast flick could break free. Instead, the window's
+/// intended place is worked out from the total mouse movement since the start.
+struct DragStart {
+    cursor: Point,
+    rect: RectI,
+    /// Smallest window size (resizing must not go below it)
+    min: Point,
+    /// Snapped to an edge: left/right axis, top/bottom axis (moving), or each of
+    /// the four sides (resizing)
+    snapped: [bool; 4],
+}
+
+thread_local! {
+    static DRAG: std::cell::RefCell<Option<DragStart>> = const { std::cell::RefCell::new(None) };
+}
+
+unsafe fn drag_begin(hwnd: isize) {
+    let mut cursor = Point::default();
+    let mut rect = RectI::default();
+    if GetCursorPos(&mut cursor) == 0 || GetWindowRect(hwnd, &mut rect) == 0 {
         return;
     }
-    // The screen area without the taskbar
-    let w = mi.work;
-    // Any invisible border around the window shouldn't count: snap what you see
-    let (mut il, mut it, mut ir, mut ib) = (0, 0, 0, 0);
-    let (mut win, mut vis) = (RectI::default(), RectI::default());
-    if GetWindowRect(hwnd, &mut win) != 0
-        && DwmGetWindowAttribute(hwnd, 9 /* DWMWA_EXTENDED_FRAME_BOUNDS */, &mut vis as *mut RectI as *mut c_void, 16) == 0
-    {
-        (il, it, ir, ib) = (vis.left - win.left, vis.top - win.top, win.right - vis.right, win.bottom - vis.bottom);
-        if il.abs() > 32 || it.abs() > 32 || ir.abs() > 32 || ib.abs() > 32 {
-            (il, it, ir, ib) = (0, 0, 0, 0);
+    // Ask the window (winit) for its minimum size, as Windows itself does
+    let mut mmi = [Point::default(); 5];
+    SendMessageW(hwnd, WM_GETMINMAXINFO, 0, mmi.as_mut_ptr() as isize);
+    let min = mmi[3];
+    DRAG.with(|d| *d.borrow_mut() = Some(DragStart { cursor, rect, min, snapped: [false; 4] }));
+}
+
+/// Replace the proposed rectangle of a move (`sizing` = None) or a resize (`sizing`
+/// = the edge being dragged, WMSZ_*) with one following the mouse exactly, with
+/// its edges snapped to the screen's edges when they're close
+unsafe fn snap_rect(hwnd: isize, r: &mut RectI, sizing: Option<usize>) {
+    DRAG.with(|d| {
+        let mut d = d.borrow_mut();
+        let Some(st) = d.as_mut() else { return };
+        let mut cur = Point::default();
+        if GetCursorPos(&mut cur) == 0 {
+            return;
         }
-    }
-    let (l, t, rt, b) = (r.left + il, r.top + it, r.right - ir, r.bottom - ib);
-    // 8 px at 100 % display scaling, more on high-DPI screens
-    let reach = (8 * GetDpiForWindow(hwnd).max(96) as i32 + 48) / 96;
-    let pull = |edge: i32, target: i32| ((edge - target).abs() <= reach).then_some(target - edge);
-    match sizing {
-        None => {
-            let dx = pull(l, w.left).or_else(|| pull(rt, w.right)).unwrap_or(0);
-            let dy = pull(t, w.top).or_else(|| pull(b, w.bottom)).unwrap_or(0);
-            r.left += dx;
-            r.right += dx;
-            r.top += dy;
-            r.bottom += dy;
+        // Dragging a maximized window un-maximizes it mid-drag (new size, put under
+        // the mouse by Windows): measure from there instead
+        if sizing.is_none() && (r.right - r.left, r.bottom - r.top) != (st.rect.right - st.rect.left, st.rect.bottom - st.rect.top) {
+            st.rect = *r;
+            st.cursor = cur;
+            st.snapped = [false; 4];
         }
-        // WMSZ_LEFT 1, RIGHT 2, TOP 3, TOPLEFT 4, TOPRIGHT 5, BOTTOM 6, BOTTOMLEFT 7, BOTTOMRIGHT 8
-        Some(edge) => {
-            if matches!(edge, 1 | 4 | 7) {
-                r.left += pull(l, w.left).unwrap_or(0);
+        let (dx, dy) = (cur.x - st.cursor.x, cur.y - st.cursor.y);
+
+        // Where the mouse alone would put the window
+        let mut want = st.rect;
+        match sizing {
+            None => {
+                want.left += dx;
+                want.right += dx;
+                want.top += dy;
+                want.bottom += dy;
             }
-            if matches!(edge, 2 | 5 | 8) {
-                r.right += pull(rt, w.right).unwrap_or(0);
-            }
-            if matches!(edge, 3 | 4 | 5) {
-                r.top += pull(t, w.top).unwrap_or(0);
-            }
-            if matches!(edge, 6 | 7 | 8) {
-                r.bottom += pull(b, w.bottom).unwrap_or(0);
+            Some(edge) => {
+                // WMSZ_LEFT 1, RIGHT 2, TOP 3, TOPLEFT 4, TOPRIGHT 5, BOTTOM 6, BOTTOMLEFT 7, BOTTOMRIGHT 8
+                if matches!(edge, 1 | 4 | 7) { want.left += dx; }
+                if matches!(edge, 2 | 5 | 8) { want.right += dx; }
+                if matches!(edge, 3 | 4 | 5) { want.top += dy; }
+                if matches!(edge, 6 | 7 | 8) { want.bottom += dy; }
             }
         }
-    }
+
+        if SNAP.load(Ordering::Relaxed) {
+            let mut mi: MonitorInfo = std::mem::zeroed();
+            mi.size = std::mem::size_of::<MonitorInfo>() as u32;
+            if GetMonitorInfoW(MonitorFromRect(&want, 2 /* MONITOR_DEFAULTTONEAREST */), &mut mi) != 0 {
+                // The screen area without the taskbar
+                let w = mi.work;
+                // Any invisible border around the window shouldn't count: snap what you see
+                let (mut il, mut it, mut ir, mut ib) = (0, 0, 0, 0);
+                let (mut win, mut vis) = (RectI::default(), RectI::default());
+                if GetWindowRect(hwnd, &mut win) != 0
+                    && DwmGetWindowAttribute(hwnd, 9 /* DWMWA_EXTENDED_FRAME_BOUNDS */, &mut vis as *mut RectI as *mut c_void, 16) == 0
+                {
+                    (il, it, ir, ib) = (vis.left - win.left, vis.top - win.top, win.right - vis.right, win.bottom - vis.bottom);
+                    if il.abs() > 32 || it.abs() > 32 || ir.abs() > 32 || ib.abs() > 32 {
+                        (il, it, ir, ib) = (0, 0, 0, 0);
+                    }
+                }
+                // Snaps within 6 px, lets go after 10 px (at 100 % display scaling)
+                let dpi = GetDpiForWindow(hwnd).max(96) as i32;
+                let (enter, leave) = ((6 * dpi + 48) / 96, (10 * dpi + 48) / 96);
+                let pull = |edge: i32, target: i32, snapped: &mut bool| {
+                    let reach = if *snapped { leave } else { enter };
+                    let d = target - edge;
+                    *snapped = d.abs() <= reach;
+                    if *snapped { d } else { 0 }
+                };
+                let (l, t, rt, b) = (want.left + il, want.top + it, want.right - ir, want.bottom - ib);
+                match sizing {
+                    None => {
+                        // Per axis: whichever of the two screen edges is nearer
+                        let x_to = if (l - w.left).abs() <= (rt - w.right).abs() { (l, w.left) } else { (rt, w.right) };
+                        let y_to = if (t - w.top).abs() <= (b - w.bottom).abs() { (t, w.top) } else { (b, w.bottom) };
+                        let ddx = pull(x_to.0, x_to.1, &mut st.snapped[0]);
+                        let ddy = pull(y_to.0, y_to.1, &mut st.snapped[1]);
+                        want.left += ddx;
+                        want.right += ddx;
+                        want.top += ddy;
+                        want.bottom += ddy;
+                    }
+                    Some(edge) => {
+                        if matches!(edge, 1 | 4 | 7) { want.left += pull(l, w.left, &mut st.snapped[0]); }
+                        if matches!(edge, 2 | 5 | 8) { want.right += pull(rt, w.right, &mut st.snapped[1]); }
+                        if matches!(edge, 3 | 4 | 5) { want.top += pull(t, w.top, &mut st.snapped[2]); }
+                        if matches!(edge, 6 | 7 | 8) { want.bottom += pull(b, w.bottom, &mut st.snapped[3]); }
+                    }
+                }
+            }
+        }
+
+        // Never resize below the minimum size (move the dragged edge back instead)
+        if let Some(edge) = sizing {
+            if want.right - want.left < st.min.x {
+                if matches!(edge, 1 | 4 | 7) { want.left = want.right - st.min.x; } else { want.right = want.left + st.min.x; }
+            }
+            if want.bottom - want.top < st.min.y {
+                if matches!(edge, 3 | 4 | 5) { want.top = want.bottom - st.min.y; } else { want.bottom = want.top + st.min.y; }
+            }
+        }
+        *r = want;
+    });
 }
 
 // ── Media keys ────────────────────────────────────────────────────────────────
@@ -698,7 +789,11 @@ unsafe extern "system" fn subclass_proc(
     _subclass_id: usize,
     _ref_data: usize,
 ) -> isize {
-    if (msg == WM_MOVING || msg == WM_SIZING) && lparam != 0 && SNAP.load(Ordering::Relaxed) {
+    if msg == WM_ENTERSIZEMOVE {
+        drag_begin(hwnd);
+    } else if msg == WM_EXITSIZEMOVE {
+        DRAG.with(|d| *d.borrow_mut() = None);
+    } else if (msg == WM_MOVING || msg == WM_SIZING) && lparam != 0 {
         // (then carries on to the normal handling with the adjusted rectangle)
         snap_rect(hwnd, &mut *(lparam as *mut RectI), (msg == WM_SIZING).then_some(wparam));
     }
