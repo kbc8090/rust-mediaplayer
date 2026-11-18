@@ -1,0 +1,227 @@
+//! Seek-bar thumbnails.
+//!
+//! A second mpv, never shown and never playing, opens the same file as the player.
+//! While the pointer is over the seek bar it jumps to the time under the pointer
+//! (to the nearest keyframe, which is quick), draws that frame small into an
+//! off-screen texture, and the texture is copied into the window above the seek bar.
+//!
+//! The thumbnail mpv is started the first time a file is opened, and like the main
+//! one it is only ever talked to through its own background thread (mpv_link.rs).
+
+use crate::mpv_link::MpvLink;
+use eframe::egui;
+use egui_glow::glow::{self, HasContext};
+use libmpv2::render::{mpv_render_update, OpenGLInitParams, RenderContext, RenderParam, RenderParamApiType};
+use libmpv2::Mpv;
+use std::cell::RefCell;
+use std::ffi::c_void;
+use std::sync::{Arc, Mutex};
+
+/// The thumbnail's height in points; the width follows the video's shape
+pub const THUMB_H: f32 = 90.0;
+
+/// GL objects; they live on the window's (drawing) thread
+struct Gl {
+    rc: RenderContext<'static>,
+    target: Option<Target>,
+}
+
+/// Off-screen texture the thumbnail is drawn into
+struct Target {
+    fbo: glow::NativeFramebuffer,
+    tex: glow::NativeTexture,
+    w: i32,
+    h: i32,
+}
+
+thread_local! {
+    static GL: RefCell<Option<Gl>> = const { RefCell::new(None) };
+}
+
+pub struct Thumbs {
+    /// Started on first use (`load`); None until then, or if it couldn't start
+    mpv: Option<(Arc<Mutex<Mpv>>, MpvLink)>,
+    gl_ready: bool,
+    gl_failed: bool,
+    /// File waiting to be opened once the drawing side exists (mpv must have its
+    /// render context before a video starts, or it turns the video off)
+    pending: Option<String>,
+    /// The time last asked for
+    requested: Option<f64>,
+}
+
+impl Thumbs {
+    pub fn new() -> Self {
+        Self { mpv: None, gl_ready: false, gl_failed: false, pending: None, requested: None }
+    }
+
+    /// Open `path` in the thumbnail player
+    pub fn load(&mut self, path: &str) {
+        self.pending = Some(path.to_owned());
+        self.requested = None;
+        self.flush();
+    }
+
+    fn flush(&mut self) {
+        if !self.gl_ready {
+            return;
+        }
+        if let (Some(path), Some((_, link))) = (self.pending.take(), &self.mpv) {
+            link.command("loadfile", &[&path]);
+        }
+    }
+
+    /// Start the thumbnail player and its drawing side once there is a file for it.
+    /// Call from `update`, where the window's GL context is current.
+    pub fn init_gl(&mut self, ctx: &egui::Context, get_proc_address: fn(&*mut c_void, &str) -> *mut c_void) {
+        if self.gl_ready || self.gl_failed || self.pending.is_none() {
+            return;
+        }
+        if self.mpv.is_none() {
+            match start_mpv() {
+                Some(m) => {
+                    let m = Arc::new(Mutex::new(m));
+                    let link = MpvLink::start(m.clone());
+                    self.mpv = Some((m, link));
+                }
+                None => {
+                    self.gl_failed = true;
+                    return;
+                }
+            }
+        }
+        let Some((mpv, _)) = &self.mpv else { return };
+        let params = vec![
+            RenderParam::ApiType(RenderParamApiType::OpenGl),
+            RenderParam::InitParams(OpenGLInitParams { get_proc_address, ctx: std::ptr::null_mut::<c_void>() }),
+        ];
+        // The Mpv lives (in its Arc) until the process ends, like the main player's
+        let mpv_ref = unsafe { std::mem::transmute::<&Mpv, &'static Mpv>(&*mpv.lock().unwrap()) };
+        match mpv_ref.create_render_context(params) {
+            Ok(mut rc) => {
+                // A new thumbnail frame is ready: draw again
+                let ctx = ctx.clone();
+                rc.set_update_callback(move || ctx.request_repaint());
+                GL.with(|g| *g.borrow_mut() = Some(Gl { rc, target: None }));
+                self.gl_ready = true;
+                self.flush();
+            }
+            Err(_) => self.gl_failed = true,
+        }
+    }
+
+    /// Width / height of the current video, once the thumbnail player has it
+    /// (None for audio-only files, or while still opening)
+    pub fn aspect(&self) -> Option<f32> {
+        if !self.gl_ready {
+            return None;
+        }
+        let s = self.mpv.as_ref()?.1.snapshot();
+        (s.dwidth > 0 && s.dheight > 0).then(|| s.dwidth as f32 / s.dheight as f32)
+    }
+
+    /// Ask for the frame at `secs`. Cheap to call every frame: mpv itself merges
+    /// seeks that arrive faster than it can carry them out.
+    pub fn request(&mut self, secs: f64) {
+        let Some((_, link)) = &self.mpv else { return };
+        if self.requested.map_or(true, |r| (r - secs).abs() > 0.2) {
+            self.requested = Some(secs);
+            link.command("seek", &[&format!("{secs:.2}"), "absolute+keyframes"]);
+        }
+    }
+
+    /// Draw the latest thumbnail into `rect`
+    pub fn paint(&self, painter: &egui::Painter, rect: egui::Rect) {
+        painter.add(egui::PaintCallback {
+            rect,
+            callback: Arc::new(egui_glow::CallbackFn::new(|info, painter| {
+                let vp = info.viewport_in_pixels();
+                let gl = painter.gl();
+                GL.with(|g| {
+                    if let Some(g) = g.borrow_mut().as_mut() {
+                        unsafe { draw(gl, g, vp.left_px, vp.from_bottom_px, vp.width_px, vp.height_px) };
+                    }
+                });
+            })),
+        });
+    }
+}
+
+unsafe fn draw(gl: &glow::Context, g: &mut Gl, x: i32, y: i32, w: i32, h: i32) {
+    if w <= 0 || h <= 0 {
+        return;
+    }
+    // (Re)create the off-screen texture at exactly the on-screen pixel size
+    let mut fresh = false;
+    if g.target.as_ref().map_or(true, |t| t.w != w || t.h != h) {
+        if let Some(old) = g.target.take() {
+            gl.delete_framebuffer(old.fbo);
+            gl.delete_texture(old.tex);
+        }
+        let (Ok(tex), Ok(fbo)) = (gl.create_texture(), gl.create_framebuffer()) else { return };
+        gl.bind_texture(glow::TEXTURE_2D, Some(tex));
+        gl.tex_image_2d(glow::TEXTURE_2D, 0, glow::RGBA8 as i32, w, h, 0, glow::RGBA, glow::UNSIGNED_BYTE, None);
+        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::LINEAR as i32);
+        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, glow::LINEAR as i32);
+        gl.bind_texture(glow::TEXTURE_2D, None);
+        gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
+        gl.framebuffer_texture_2d(glow::FRAMEBUFFER, glow::COLOR_ATTACHMENT0, glow::TEXTURE_2D, Some(tex), 0);
+        gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+        g.target = Some(Target { fbo, tex, w, h });
+        fresh = true;
+    }
+    let Some(t) = g.target.as_ref() else { return };
+
+    // egui clips with the scissor test; it mustn't cut into mpv's drawing in the
+    // texture (egui switches it back on after this callback)
+    gl.disable(glow::SCISSOR_TEST);
+    let new_frame = g.rc.update().map_or(true, |f| f & mpv_render_update::Frame != 0);
+    if fresh || new_frame {
+        let _ = g.rc.render::<*mut c_void>(t.fbo.0.get() as i32, w, h, true);
+    }
+    // Copy the texture into the window
+    gl.bind_framebuffer(glow::READ_FRAMEBUFFER, Some(t.fbo));
+    gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, None);
+    gl.blit_framebuffer(0, 0, w, h, x, y, x + w, y + h, glow::COLOR_BUFFER_BIT, glow::NEAREST);
+    gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+}
+
+fn start_mpv() -> Option<Mpv> {
+    Mpv::with_initializer(|init| {
+        for (k, v) in [
+            ("vo", "libmpv"),
+            // Picture only, never playing
+            ("aid", "no"),
+            ("sid", "no"),
+            ("pause", "yes"),
+            ("keep-open", "yes"),
+            ("audio-display", "no"),
+            // Fast over pretty: nearest-keyframe seeks, quick decoding, cheap scaling
+            ("hr-seek", "no"),
+            ("hwdec", "no"),
+            ("vd-lavc-threads", "2"),
+            ("vd-lavc-fast", "yes"),
+            ("vd-lavc-skiploopfilter", "all"),
+            ("scale", "bilinear"),
+            ("dscale", "bilinear"),
+            ("cscale", "bilinear"),
+            ("dither-depth", "no"),
+            ("correct-downscaling", "no"),
+            ("linear-downscaling", "no"),
+            ("sigmoid-upscaling", "no"),
+            ("deband", "no"),
+            ("video-timing-offset", "0"),
+            // Little memory: it only ever needs the packets around one keyframe
+            ("cache", "no"),
+            ("demuxer-max-bytes", "4MiB"),
+            ("demuxer-max-back-bytes", "1MiB"),
+            ("osc", "no"),
+            ("load-scripts", "no"),
+            ("ytdl", "no"),
+        ] {
+            let _ = init.set_property(k, v);
+        }
+        Ok(())
+    })
+    .ok()
+}

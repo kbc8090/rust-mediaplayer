@@ -7,6 +7,9 @@
 //!
 //! It also hosts the window-procedure hook, which additionally
 //!
+//!  * receives files from a second launch of the player (single window)
+//!  * catches the keyboard's media keys
+//!
 //!  * performs the fullscreen switch *between* frames (see `post_fullscreen`)
 //!  * stops Windows erasing the window background on resize (a flash source)
 //!
@@ -17,7 +20,7 @@
 //! in main.rs) so no extra dependency is needed.
 
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -91,6 +94,40 @@ struct MonitorInfo {
     flags: u32,
 }
 
+#[repr(C)]
+struct CopyDataStruct {
+    data: usize,
+    len: u32,
+    ptr: *const c_void,
+}
+
+#[repr(C)]
+struct OpenFileNameW {
+    struct_size: u32,
+    owner: isize,
+    instance: isize,
+    filter: *const u16,
+    custom_filter: *mut u16,
+    max_custom_filter: u32,
+    filter_index: u32,
+    file: *mut u16,
+    max_file: u32,
+    file_title: *mut u16,
+    max_file_title: u32,
+    initial_dir: *const u16,
+    title: *const u16,
+    flags: u32,
+    file_offset: u16,
+    file_extension: u16,
+    default_ext: *const u16,
+    cust_data: isize,
+    hook: *const c_void,
+    template_name: *const u16,
+    reserved_ptr: *mut c_void,
+    reserved: u32,
+    flags_ex: u32,
+}
+
 type SubclassProc = unsafe extern "system" fn(isize, u32, usize, isize, usize, usize) -> isize;
 
 #[link(name = "ole32")]
@@ -125,6 +162,28 @@ unsafe extern "system" {
     fn MonitorFromWindow(hwnd: isize, flags: u32) -> isize;
     fn GetMonitorInfoW(monitor: isize, info: *mut MonitorInfo) -> i32;
     fn SetWindowPos(hwnd: isize, insert_after: isize, x: i32, y: i32, cx: i32, cy: i32, flags: u32) -> i32;
+    fn FindWindowW(class: *const u16, title: *const u16) -> isize;
+    fn SendMessageTimeoutW(
+        hwnd: isize,
+        msg: u32,
+        wparam: usize,
+        lparam: isize,
+        flags: u32,
+        timeout_ms: u32,
+        result: *mut usize,
+    ) -> isize;
+    fn SetForegroundWindow(hwnd: isize) -> i32;
+}
+
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn CreateMutexW(attributes: *const c_void, initial_owner: i32, name: *const u16) -> isize;
+    fn GetLastError() -> u32;
+}
+
+#[link(name = "comdlg32")]
+unsafe extern "system" {
+    fn GetOpenFileNameW(ofn: *mut OpenFileNameW) -> i32;
 }
 
 #[link(name = "dwmapi")]
@@ -142,6 +201,11 @@ const WM_ERASEBKGND: u32 = 0x0014;
 /// Private message: switch fullscreen on (wparam 1) or off (wparam 2)
 const WM_APP_FULLSCREEN: u32 = 0x8001;
 const WM_COMMAND: u32 = 0x0111;
+const WM_COPYDATA: u32 = 0x004A;
+const WM_KEYDOWN: u32 = 0x0100;
+const WM_APPCOMMAND: u32 = 0x0319;
+/// Marks our WM_COPYDATA messages ("RMP1")
+const COPYDATA_MAGIC: usize = 0x524D_5031;
 const WM_TIMER: u32 = 0x0113;
 const THBN_CLICKED: u32 = 0x1800;
 const RDW_INTERNALPAINT: u32 = 0x0002;
@@ -260,6 +324,134 @@ unsafe fn exit_fullscreen_now(hwnd: isize) {
             ShowWindow(hwnd, 3); // SW_MAXIMIZE
         }
     }
+}
+
+// ── Single window ─────────────────────────────────────────────────────────────
+/// A file handed over by a second launch of the player ("" = just come to front)
+static FORWARDED: Mutex<Option<String>> = Mutex::new(None);
+
+pub fn take_forwarded() -> Option<String> {
+    FORWARDED.lock().ok().and_then(|mut f| f.take())
+}
+
+/// Called at startup, before any window exists. If the player is already running,
+/// hand it `file` (it opens it in place of what's playing), bring it to the front and
+/// return true: this process should then just exit.
+pub fn forward_to_running_instance(file: Option<&str>) -> bool {
+    unsafe {
+        // The mutex lives as long as this process; a second process finds it taken
+        let mutex = CreateMutexW(std::ptr::null(), 0, wide("Local\\RustMediaPlayer.SingleWindow").as_ptr());
+        if mutex == 0 || GetLastError() != 183 /* ERROR_ALREADY_EXISTS */ {
+            return false;
+        }
+        // The other player may still be starting up: give its window a moment
+        let title = wide("Rust Media Player");
+        let mut hwnd = 0;
+        for _ in 0..30 {
+            hwnd = FindWindowW(std::ptr::null(), title.as_ptr());
+            if hwnd != 0 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        if hwnd == 0 {
+            return false; // couldn't find it: just run as a second player
+        }
+        let payload: Vec<u16> = file.unwrap_or("").encode_utf16().collect();
+        let cds = CopyDataStruct {
+            data: COPYDATA_MAGIC,
+            len: (payload.len() * 2) as u32,
+            ptr: payload.as_ptr() as *const c_void,
+        };
+        let mut result = 0usize;
+        SendMessageTimeoutW(hwnd, WM_COPYDATA, 0, &cds as *const _ as isize, 0x2 /* SMTO_ABORTIFHUNG */, 3000, &mut result);
+        if IsIconic(hwnd) != 0 {
+            ShowWindow(hwnd, 9); // SW_RESTORE
+        }
+        SetForegroundWindow(hwnd);
+        true
+    }
+}
+
+// ── Media keys ────────────────────────────────────────────────────────────────
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum MediaKey {
+    PlayPause,
+    Play,
+    Pause,
+    Stop,
+    Next,
+    Previous,
+}
+
+static MEDIA_KEY: AtomicU32 = AtomicU32::new(0);
+
+pub fn take_media_key() -> Option<MediaKey> {
+    Some(match MEDIA_KEY.swap(0, Ordering::Relaxed) {
+        1 => MediaKey::PlayPause,
+        2 => MediaKey::Play,
+        3 => MediaKey::Pause,
+        4 => MediaKey::Stop,
+        5 => MediaKey::Next,
+        6 => MediaKey::Previous,
+        _ => return None,
+    })
+}
+
+// ── Open file dialog ──────────────────────────────────────────────────────────
+static DIALOG_OPEN: AtomicBool = AtomicBool::new(false);
+static PICKED: Mutex<Option<String>> = Mutex::new(None);
+static DIALOG_OWNER: AtomicIsize = AtomicIsize::new(0);
+
+/// The file picked in the open dialog, once it has closed
+pub fn take_picked_file() -> Option<String> {
+    PICKED.lock().ok().and_then(|mut p| p.take())
+}
+
+/// Show Windows' "Open" dialog without blocking the player: it runs on its own
+/// thread (the video keeps playing and drawing), and the choice is collected
+/// with `take_picked_file`.
+pub fn open_file_dialog(owner: isize, initial_dir: Option<String>) {
+    if DIALOG_OPEN.swap(true, Ordering::Relaxed) {
+        return; // already showing
+    }
+    DIALOG_OWNER.store(owner, Ordering::Relaxed);
+    std::thread::spawn(move || {
+        let picked = unsafe { run_open_dialog(owner, initial_dir) };
+        if let Some(p) = picked {
+            if let Ok(mut slot) = PICKED.lock() {
+                *slot = Some(p);
+            }
+        }
+        DIALOG_OPEN.store(false, Ordering::Relaxed);
+        wake(DIALOG_OWNER.load(Ordering::Relaxed));
+    });
+}
+
+unsafe fn run_open_dialog(owner: isize, initial_dir: Option<String>) -> Option<String> {
+    CoInitializeEx(std::ptr::null_mut(), 0x2 /* COINIT_APARTMENTTHREADED */);
+    let filter: Vec<u16> = "Video files\0*.mp4;*.mkv;*.avi;*.mov;*.wmv;*.flv;*.webm;*.m4v;*.ts;*.m2ts;*.mpg;*.mpeg;*.3gp;*.ogv\0All files\0*.*\0\0"
+        .encode_utf16()
+        .collect();
+    let mut file = vec![0u16; 4096];
+    let dir = initial_dir.map(|d| wide(&d));
+    let title = wide("Open video");
+    let mut ofn: OpenFileNameW = std::mem::zeroed();
+    ofn.struct_size = std::mem::size_of::<OpenFileNameW>() as u32;
+    ofn.owner = owner;
+    ofn.filter = filter.as_ptr();
+    ofn.filter_index = 1;
+    ofn.file = file.as_mut_ptr();
+    ofn.max_file = file.len() as u32;
+    ofn.initial_dir = dir.as_ref().map_or(std::ptr::null(), |d| d.as_ptr());
+    ofn.title = title.as_ptr();
+    // OFN_EXPLORER | OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_HIDEREADONLY | OFN_ENABLESIZING
+    ofn.flags = 0x0008_0000 | 0x0000_1000 | 0x0000_0800 | 0x0000_0004 | 0x0080_0000;
+    if GetOpenFileNameW(&mut ofn) == 0 {
+        return None; // cancelled
+    }
+    let len = file.iter().position(|&c| c == 0).unwrap_or(file.len());
+    Some(String::from_utf16_lossy(&file[..len]))
 }
 
 /// The thumbnail button that was clicked since the last call, if any
@@ -430,6 +622,49 @@ unsafe extern "system" fn subclass_proc(
     _subclass_id: usize,
     _ref_data: usize,
 ) -> isize {
+    if msg == WM_COPYDATA && lparam != 0 {
+        let cds = &*(lparam as *const CopyDataStruct);
+        if cds.data == COPYDATA_MAGIC {
+            let n = cds.len as usize / 2;
+            let path = if n > 0 && !cds.ptr.is_null() {
+                String::from_utf16_lossy(std::slice::from_raw_parts(cds.ptr as *const u16, n))
+            } else {
+                String::new()
+            };
+            if let Ok(mut slot) = FORWARDED.lock() {
+                *slot = Some(path);
+            }
+            wake(hwnd);
+            return 1;
+        }
+    } else if msg == WM_KEYDOWN && (0xB0..=0xB3).contains(&wparam) {
+        // VK_MEDIA_NEXT_TRACK / PREV_TRACK / STOP / PLAY_PAUSE
+        let key = match wparam {
+            0xB0 => 5,
+            0xB1 => 6,
+            0xB2 => 4,
+            _ => 1,
+        };
+        MEDIA_KEY.store(key, Ordering::Relaxed);
+        wake(hwnd);
+        return 0;
+    } else if msg == WM_APPCOMMAND {
+        let cmd = ((lparam as usize >> 16) & 0x0FFF) as u32;
+        let key = match cmd {
+            14 => 1, // APPCOMMAND_MEDIA_PLAY_PAUSE
+            46 => 2, // APPCOMMAND_MEDIA_PLAY
+            47 => 3, // APPCOMMAND_MEDIA_PAUSE
+            13 => 4, // APPCOMMAND_MEDIA_STOP
+            11 => 5, // APPCOMMAND_MEDIA_NEXTTRACK
+            12 => 6, // APPCOMMAND_MEDIA_PREVIOUSTRACK
+            _ => 0,
+        };
+        if key != 0 {
+            MEDIA_KEY.store(key, Ordering::Relaxed);
+            wake(hwnd);
+            return 1;
+        }
+    }
     if msg == WM_ERASEBKGND {
         // The whole client area is painted by OpenGL; erasing it first only flashes.
         return 1;

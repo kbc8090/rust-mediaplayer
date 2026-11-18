@@ -5,6 +5,7 @@ use libmpv2::{Mpv, render::{RenderContext, OpenGLInitParams, RenderParam, Render
 mod mpv_link;
 mod splash;
 mod taskbar;
+mod thumbs;
 
 use mpv_link::{yn, MpvLink};
 
@@ -117,6 +118,8 @@ struct Settings {
     on_top: bool,
     /// Hardware decoding (H). Off by default, like mpv itself.
     hwdec: bool,
+    /// Play the next video in the folder when one ends (menu). Off by default.
+    autoplay: bool,
 }
 
 fn save_settings(st: &Settings) {
@@ -127,8 +130,8 @@ fn save_settings(st: &Settings) {
     let _ = std::fs::write(
         path,
         format!(
-            "{} {} {} {} {}",
-            st.volume, st.muted as u8, st.repeat as u8, st.on_top as u8, st.hwdec as u8
+            "{} {} {} {} {} {}",
+            st.volume, st.muted as u8, st.repeat as u8, st.on_top as u8, st.hwdec as u8, st.autoplay as u8
         ),
     );
 }
@@ -140,13 +143,14 @@ fn load_settings() -> Settings {
     let mut it = text.split_whitespace();
     let volume = it.next().and_then(|t| t.parse::<f64>().ok());
     let mut flag = || it.next().and_then(|t| t.parse::<u8>().ok()) == Some(1);
-    let (muted, repeat, on_top, hwdec) = (flag(), flag(), flag(), flag());
+    let (muted, repeat, on_top, hwdec, autoplay) = (flag(), flag(), flag(), flag(), flag());
     Settings {
         volume: volume.map_or(80.0, |v| v.clamp(0.0, VOL_MAX)).round() as i32,
         muted,
         repeat,
         on_top,
         hwdec,
+        autoplay,
     }
 }
 
@@ -209,6 +213,17 @@ const VOL_W: f32 = 90.0;
 const WIN_BTN_W: f32 = 46.0;
 const WIN_BTN_H: f32 = 34.0;
 const MORE_POPUP: &str = "more_popup";
+/// Menu button (top left): centre, level with the window buttons
+const MENU_X: f32 = 23.0;
+const MENU_Y: f32 = 17.0;
+
+/// The pop-up in the top right after seeking with the keys (accumulated amount)
+/// or the mouse (seek bar dragged from this time)
+#[derive(Clone, Copy)]
+enum SeekOsd {
+    Step(f64),
+    Drag(f64),
+}
 /// Highest volume (percent). mpv allows up to 130 by default.
 const VOL_MAX: f64 = 130.0;
 
@@ -291,6 +306,46 @@ struct FluentMediaPlayer {
     win_state: WinState,
     win_saved: WinState,
     win_changed: std::time::Instant,
+    /// Seek pop-up (top right), and when it was last refreshed
+    seek_osd: Option<(std::time::Instant, SeekOsd)>,
+    /// Chapters of the current file (start time, title)
+    chapters: Arc<Vec<(f64, String)>>,
+    /// Seek-bar thumbnails (a second, hidden mpv)
+    thumbs: thumbs::Thumbs,
+    /// Play the next file in the folder when one ends
+    autoplay: bool,
+    /// mpv's end-of-file flag last frame (to notice the moment a video ends)
+    snap_eof: bool,
+    /// The top-left menu is open, and where its button is
+    main_menu: bool,
+    menu_anchor: Rect,
+}
+
+/// Buttons fire when the mouse button is released anywhere over them, like Windows'
+/// own buttons. (egui's "click" also needs the pointer to have stayed nearly still.)
+trait Activated {
+    fn activated(&self) -> bool;
+}
+
+impl Activated for egui::Response {
+    fn activated(&self) -> bool {
+        self.clicked()
+            || (self.drag_stopped()
+                && self.ctx.input(|i| i.pointer.latest_pos()).map_or(false, |p| self.rect.contains(p)))
+    }
+}
+
+/// OpenGL function lookup for mpv's render contexts
+fn gl_proc_address(_ctx: &*mut std::ffi::c_void, name: &str) -> *mut std::ffi::c_void {
+    unsafe {
+        let c_name = std::ffi::CString::new(name).unwrap();
+        let addr = wglGetProcAddress(c_name.as_ptr());
+        if !addr.is_null() && (addr as usize) > 3 && (addr as usize) != usize::MAX {
+            return addr;
+        }
+        let h_mod = GetModuleHandleA(b"opengl32.dll\0".as_ptr() as *const _);
+        GetProcAddress(h_mod, c_name.as_ptr())
+    }
 }
 
 impl FluentMediaPlayer {
@@ -423,6 +478,13 @@ impl FluentMediaPlayer {
             win_state: saved,
             win_saved: saved,
             win_changed: std::time::Instant::now(),
+            seek_osd: None,
+            chapters: Arc::new(Vec::new()),
+            thumbs: thumbs::Thumbs::new(),
+            autoplay: st.autoplay,
+            snap_eof: false,
+            main_menu: false,
+            menu_anchor: Rect::NOTHING,
         }
     }
 
@@ -439,7 +501,30 @@ impl FluentMediaPlayer {
         self.is_playing = true;
         self.time_pos = 0.0;
         self.eof = false;
+        self.chapters = Arc::new(Vec::new());
+        self.thumbs.load(path);
         self.touch();
+    }
+
+    /// Open a file handed to us from outside (open dialog, a second launch)
+    fn open_external(&mut self, path: String) {
+        if !Path::new(&path).is_file() {
+            return;
+        }
+        if self.render_ctx_initialized {
+            self.open_file(&path);
+        } else {
+            self.startup_file = Some(path);
+        }
+    }
+
+    /// Windows' "Open" dialog, starting in the current video's folder
+    fn show_open_dialog(&mut self) {
+        let dir = Path::new(&self.current_file)
+            .parent()
+            .map(|d| d.to_string_lossy().into_owned())
+            .filter(|d| !d.is_empty());
+        taskbar::open_file_dialog(self.hwnd, dir);
     }
 
     fn toggle_play_pause(&mut self) {
@@ -488,6 +573,7 @@ impl FluentMediaPlayer {
             repeat: self.repeat,
             on_top: self.on_top,
             hwdec: self.hw_decode,
+            autoplay: self.autoplay,
         }
     }
 
@@ -520,6 +606,7 @@ impl FluentMediaPlayer {
         self.set_volume(self.volume + delta);
         if delta > 0.0 && self.muted { self.set_mute(false); }
         self.volume_osd = Some(std::time::Instant::now());
+        self.seek_osd = None;
     }
 
     /// Gather decoder / video details for the info overlay
@@ -587,6 +674,21 @@ impl FluentMediaPlayer {
     fn skip(&mut self, secs: f64) {
         let new_pos = (self.time_pos + secs).clamp(0.0, self.duration);
         self.seek_to(new_pos);
+    }
+
+    /// Skip with the keys / taskbar buttons, and show "+10 s" (adding up quick repeats
+    /// in the same direction)
+    fn step(&mut self, secs: f64) {
+        if !self.has_file {
+            return;
+        }
+        self.skip(secs);
+        let total = match self.seek_osd {
+            Some((t0, SeekOsd::Step(prev))) if t0.elapsed().as_secs_f32() < 1.2 && prev.signum() == secs.signum() => prev + secs,
+            _ => secs,
+        };
+        self.seek_osd = Some((std::time::Instant::now(), SeekOsd::Step(total)));
+        self.volume_osd = None;
     }
 
     fn toggle_fullscreen(&mut self, ctx: &egui::Context) {
@@ -665,6 +767,12 @@ impl eframe::App for FluentMediaPlayer {
                 self.eof = snap.eof;
             }
             self.mpv_info = snap.info;
+            self.chapters = snap.chapters;
+            // A video just ended: go on to the next one in the folder if wanted
+            if snap.eof && !self.snap_eof && self.has_file && self.autoplay && !self.repeat && self.has_next() {
+                self.play_adjacent(1);
+            }
+            self.snap_eof = snap.eof;
         }
         self.link.want_info(self.show_info);
 
@@ -697,12 +805,31 @@ impl eframe::App for FluentMediaPlayer {
         if let Some(id) = taskbar::take_click() {
             match id {
                 taskbar::PREV => self.play_adjacent(-1),
-                taskbar::BACK => self.skip(-10.0),
+                taskbar::BACK => self.step(-10.0),
                 taskbar::PLAY => self.toggle_play_pause(),
-                taskbar::FWD => self.skip(10.0),
+                taskbar::FWD => self.step(10.0),
                 taskbar::NEXT => self.play_adjacent(1),
                 _ => {}
             }
+        }
+        // Keyboard media keys
+        if let Some(key) = taskbar::take_media_key() {
+            use taskbar::MediaKey;
+            match key {
+                MediaKey::PlayPause if self.has_file => self.toggle_play_pause(),
+                MediaKey::Play if self.has_file && !self.is_playing => self.toggle_play_pause(),
+                MediaKey::Pause | MediaKey::Stop if self.is_playing => self.toggle_play_pause(),
+                MediaKey::Next => self.play_adjacent(1),
+                MediaKey::Previous => self.play_adjacent(-1),
+                _ => {}
+            }
+        }
+        // A file from the open dialog, or from a second launch of the player
+        if let Some(path) = taskbar::take_picked_file() {
+            self.open_external(path);
+        }
+        if let Some(path) = taskbar::take_forwarded() {
+            self.open_external(path);
         }
         let status = taskbar::Status {
             has_file: self.has_file,
@@ -786,15 +913,7 @@ impl eframe::App for FluentMediaPlayer {
         // ── Initialize mpv OpenGL render context once GL is ready ─────────────
         if !self.render_ctx_initialized && frame.gl().is_some() {
             let init_params = OpenGLInitParams {
-                get_proc_address: |_: &*mut std::os::raw::c_void, name| unsafe {
-                    let c_name = std::ffi::CString::new(name).unwrap();
-                    let addr = wglGetProcAddress(c_name.as_ptr());
-                    if !addr.is_null() && (addr as usize) > 3 && (addr as usize) != usize::MAX {
-                        return addr;
-                    }
-                    let h_mod = GetModuleHandleA(b"opengl32.dll\0".as_ptr() as *const _);
-                    GetProcAddress(h_mod, c_name.as_ptr())
-                },
+                get_proc_address: gl_proc_address,
                 ctx: std::ptr::null_mut::<std::os::raw::c_void>(),
             };
             let params = vec![
@@ -816,6 +935,9 @@ impl eframe::App for FluentMediaPlayer {
         if self.render_ctx_initialized {
             if let Some(path) = self.startup_file.take() {
                 self.open_file(&path);
+            }
+            if frame.gl().is_some() {
+                self.thumbs.init_gl(ctx, gl_proc_address);
             }
         }
 
@@ -881,6 +1003,7 @@ impl eframe::App for FluentMediaPlayer {
             info:  i.key_pressed(egui::Key::I),
             hw:    i.key_pressed(egui::Key::H),
             esc:   i.key_pressed(egui::Key::Escape),
+            open:  i.modifiers.ctrl && i.key_pressed(egui::Key::O),
             scroll_y: i.raw_scroll_delta.y,
             pressed: i.pointer.primary_pressed(),
             moved: i.pointer.delta().length_sq() > 0.5,
@@ -895,7 +1018,7 @@ impl eframe::App for FluentMediaPlayer {
         }
         let near_edge = inp.pointer
             .map_or(false, |p| p.y < TOP_H || p.y > screen.bottom() - BOTTOM_H);
-        let menu_open = ctx.memory(|m| m.is_popup_open(egui::Id::new(MORE_POPUP)));
+        let menu_open = self.main_menu || ctx.memory(|m| m.is_popup_open(egui::Id::new(MORE_POPUP)));
         let idle = self.last_mouse_move.elapsed().as_secs_f32();
         let settling = self.fs_settle.map_or(false, |t0| t0.elapsed().as_secs_f32() < 0.45);
         if !settling {
@@ -924,15 +1047,16 @@ impl eframe::App for FluentMediaPlayer {
             if is_video_file(s) { self.open_file(s); }
         }
         if inp.space { self.toggle_play_pause(); }
-        if inp.right { self.skip(10.0); }
-        if inp.left  { self.skip(-10.0); }
+        if inp.right { self.step(10.0); }
+        if inp.left  { self.step(-10.0); }
         if inp.up    { self.nudge_volume(5.0); }
         if inp.down  { self.nudge_volume(-5.0); }
-        if inp.m     { let m = !self.muted; self.set_mute(m); self.volume_osd = Some(std::time::Instant::now()); }
+        if inp.m     { let m = !self.muted; self.set_mute(m); self.volume_osd = Some(std::time::Instant::now()); self.seek_osd = None; }
         if inp.n     { self.play_adjacent(1); }
         if inp.p     { self.play_adjacent(-1); }
         if inp.info  { self.show_info = !self.show_info; }
         if inp.hw    { self.toggle_hw_decode(); }
+        if inp.open  { self.main_menu = false; self.show_open_dialog(); }
 
 
         // Mouse wheel anywhere in the window = volume, 5 % per notch
@@ -945,8 +1069,12 @@ impl eframe::App for FluentMediaPlayer {
         }
 
         if inp.f     { self.toggle_fullscreen(ctx); }
-        if inp.esc && self.is_fullscreen {
-            self.exit_fullscreen(ctx);
+        if inp.esc {
+            if self.main_menu {
+                self.main_menu = false;
+            } else if self.is_fullscreen {
+                self.exit_fullscreen(ctx);
+            }
         }
 
         // ── Resize from the window edges (we have no OS frame) ────────────────
@@ -1015,6 +1143,9 @@ impl eframe::App for FluentMediaPlayer {
         if t > 0.0 {
             draw_top_bar(self, ctx, t);
             draw_bottom_bar(self, ctx, t);
+            draw_main_menu(self, ctx);
+        } else {
+            self.main_menu = false;
         }
 
         // Resize cursor wins over any other cursor set this frame
@@ -1022,15 +1153,26 @@ impl eframe::App for FluentMediaPlayer {
             ctx.set_cursor_icon(icon);
         }
 
-        // Volume pop-up (top right) for a moment after the volume changes
-        if let Some(t0) = self.volume_osd {
+        // Volume / seek pop-up (top right) for a moment after a change
+        let osd_alpha = |t0: std::time::Instant| {
             let age = t0.elapsed().as_secs_f32();
-            if age < 1.6 {
-                let alpha = if age > 1.2 { 1.0 - (age - 1.2) / 0.4 } else { 1.0 };
+            (age < 1.6).then(|| if age > 1.2 { 1.0 - (age - 1.2) / 0.4 } else { 1.0 })
+        };
+        if let Some(t0) = self.volume_osd {
+            if let Some(alpha) = osd_alpha(t0) {
                 draw_volume_osd(ctx, self.volume, self.muted, self.accent, alpha, self.is_fullscreen);
                 ctx.request_repaint_after(std::time::Duration::from_millis(30));
             } else {
                 self.volume_osd = None;
+            }
+        }
+        if let Some((t0, kind)) = self.seek_osd {
+            if let Some(alpha) = osd_alpha(t0) {
+                let target = self.drag_frac.map_or(self.time_pos, |f| f as f64 * self.duration);
+                draw_seek_osd(ctx, kind, target, self.duration, self.accent, alpha, self.is_fullscreen);
+                ctx.request_repaint_after(std::time::Duration::from_millis(30));
+            } else {
+                self.seek_osd = None;
             }
         }
 
@@ -1059,7 +1201,7 @@ impl eframe::App for FluentMediaPlayer {
 struct InputSnapshot {
     dropped: Vec<String>,
     space: bool, right: bool, left: bool, up: bool, down: bool,
-    f: bool, m: bool, n: bool, p: bool, info: bool, hw: bool, esc: bool,
+    f: bool, m: bool, n: bool, p: bool, info: bool, hw: bool, esc: bool, open: bool,
     scroll_y: f32,
     pressed: bool,
     moved: bool, active: bool,
@@ -1380,10 +1522,24 @@ fn draw_top_bar(app: &mut FluentMediaPlayer, ctx: &egui::Context, t: f32) {
                 }
             }
 
-            // Left: file name
-            let y = 28.0;
+            // Left: menu button, then the file name, both level with the window buttons
+            let mc = pos2(MENU_X, MENU_Y);
+            let menu = hit_at(ui, mc, "menu", "Menu", t, false);
+            app.menu_anchor = menu.rect;
+            if app.main_menu && !menu.hovered() {
+                // keep it highlighted while its menu is open
+                p.rect_filled(Rect::from_center_size(mc, vec2(BTN_BOX, BTN_BOX)), 8.0, Color32::from_white_alpha((8.0 * t) as u8));
+            }
+            for dy in [-4.5, 0.0, 4.5] {
+                p.line_segment([pos2(mc.x - 7.0, mc.y + dy), pos2(mc.x + 7.0, mc.y + dy)], Stroke::new(SW, white));
+            }
+            if menu.activated() {
+                app.main_menu = !app.main_menu;
+            }
+
+            let y = MENU_Y;
             let right_limit = if fullscreen { screen.right() - 20.0 } else { screen.right() - WIN_BTN_W * 3.0 - 10.0 };
-            let tx = SIDE;
+            let tx = MENU_X + BTN_BOX / 2.0 + 8.0;
             let clip = p.with_clip_rect(Rect::from_min_max(pos2(tx, 0.0), pos2(right_limit, TOP_H)));
             let font = FontId::new(14.5, FontFamily::Name("semibold".into()));
             clip.text(pos2(tx + 1.0, y + 1.0), Align2::LEFT_CENTER, &title, font.clone(), black(170, t));
@@ -1449,7 +1605,7 @@ fn draw_top_bar(app: &mut FluentMediaPlayer, ctx: &egui::Context, t: f32) {
                         }
                     }
                     }
-                    if resp.clicked() {
+                    if resp.activated() {
                         match k {
                             0 => ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true)),
                             1 => app.toggle_maximize(ctx),
@@ -1510,6 +1666,13 @@ fn draw_bottom_bar(app: &mut FluentMediaPlayer, ctx: &egui::Context, t: f32) {
             if dragging {
                 if let Some(pos) = seek.interact_pointer_pos() {
                     let f = frac_at(pos.x);
+                    // Seek pop-up: remembers where the drag started
+                    let from = match (app.drag_frac, app.seek_osd) {
+                        (Some(_), Some((_, SeekOsd::Drag(from)))) => from,
+                        _ => app.time_pos,
+                    };
+                    app.seek_osd = Some((std::time::Instant::now(), SeekOsd::Drag(from)));
+                    app.volume_osd = None;
                     app.drag_frac = Some(f);
                     if app.duration > 0.0 { app.seek_to(f as f64 * app.duration); }
                 }
@@ -1531,6 +1694,19 @@ fn draw_bottom_bar(app: &mut FluentMediaPlayer, ctx: &egui::Context, t: f32) {
                 Rect::from_min_max(pos2(sr.left(), seek_y - 1.5), pos2(fill_x, seek_y + 1.5)),
                 1.0, accent,
             );
+            // Chapter marks: small gaps in the bar
+            if app.duration > 0.0 {
+                let ppp = ctx.pixels_per_point();
+                for &(start, _) in app.chapters.iter() {
+                    if start > 0.5 && start < app.duration - 0.5 {
+                        let x = ((k0 + kw * (start / app.duration) as f32) * ppp).round() / ppp;
+                        p.rect_filled(
+                            Rect::from_center_size(pos2(x, seek_y), vec2(2.0, 3.0)),
+                            0.0, Color32::from_black_alpha((200.0 * t) as u8),
+                        );
+                    }
+                }
+            }
             draw_knob(&p, ctx.pixels_per_point(), pos2(fill_x, seek_y), hot, accent, t);
 
             // Hover / drag time preview
@@ -1538,13 +1714,48 @@ fn draw_bottom_bar(app: &mut FluentMediaPlayer, ctx: &egui::Context, t: f32) {
                 else if seek.hovered() { seek.hover_pos().map(|pp| frac_at(pp.x)) }
                 else { None };
             if let (Some(f), true) = (preview, app.duration > 0.0) {
-                let txt = fmt_time(f as f64 * app.duration);
+                let secs = f as f64 * app.duration;
+                // "12:34", plus the chapter's name when the file has chapters
                 let font = FontId::proportional(12.0);
-                let w = p.layout_no_wrap(txt.clone(), font.clone(), Color32::WHITE).size().x + 16.0;
+                let mut job = egui::text::LayoutJob::default();
+                job.append(&fmt_time(secs), 0.0, egui::TextFormat::simple(font.clone(), white));
+                if let Some((_, title)) = app.chapters.iter().rev().find(|(start, _)| *start <= secs + 0.01) {
+                    job.append(
+                        &format!("  ·  {title}"),
+                        0.0,
+                        egui::TextFormat::simple(font, Color32::from_rgb(200, 200, 200).gamma_multiply(t)),
+                    );
+                }
+                job.wrap = egui::text::TextWrapping {
+                    max_width: 320.0,
+                    max_rows: 1,
+                    break_anywhere: true,
+                    overflow_character: Some('…'),
+                };
+                let galley = p.layout_job(job);
+                let w = galley.size().x + 16.0;
                 let cx = (k0 + kw * f).clamp(sr.left() + w / 2.0, sr.right() - w / 2.0);
                 let r = Rect::from_center_size(pos2(cx, seek_y - 28.0), vec2(w, 22.0));
                 p.rect_filled(r, 4.0, Color32::from_rgba_unmultiplied(32, 32, 32, (235.0 * t) as u8));
-                p.text(r.center(), Align2::CENTER_CENTER, txt, font, white);
+                p.galley(r.center() - galley.size() / 2.0, galley, white);
+
+                // Thumbnail of that moment, above the time
+                app.thumbs.request(secs);
+                if let Some(aspect) = app.thumbs.aspect() {
+                    let tw = (thumbs::THUMB_H * aspect).clamp(64.0, 200.0);
+                    let th = (tw / aspect).clamp(40.0, 150.0);
+                    let ppp = ctx.pixels_per_point();
+                    let snap = |v: f32| (v * ppp).round() / ppp;
+                    let tx = (k0 + kw * f - tw / 2.0).clamp(screen.left() + 8.0, screen.right() - 8.0 - tw);
+                    let tr = Rect::from_min_size(pos2(snap(tx), snap(r.top() - 6.0 - th)), vec2(snap(tw), snap(th)));
+                    let tp = ctx.layer_painter(egui::LayerId::new(egui::Order::Tooltip, egui::Id::new("thumb")));
+                    for (e, a) in [(1.0, 60.0), (2.5, 30.0), (4.0, 14.0)] {
+                        tp.rect_filled(tr.expand(e), 4.0 + e, Color32::from_black_alpha((a * t) as u8));
+                    }
+                    tp.rect_filled(tr, 0.0, Color32::BLACK);
+                    app.thumbs.paint(&tp, tr);
+                    tp.rect_stroke(tr.expand(0.5), 1.0, Stroke::new(1.0_f32, { let a = (70.0 * t) as u8; Color32::from_rgba_premultiplied(a, a, a, a) }));
+                }
             }
 
             // ── Button row ────────────────────────────────────────────────────
@@ -1559,7 +1770,7 @@ fn draw_bottom_bar(app: &mut FluentMediaPlayer, ctx: &egui::Context, t: f32) {
 
             // Play / pause
             let c = pos2(lay.play, row_y);
-            if hit(ui, c, "play", if app.is_playing { "Pause (Space)" } else { "Play (Space)" }, t).clicked() {
+            if hit(ui, c, "play", if app.is_playing { "Pause (Space)" } else { "Play (Space)" }, t).activated() {
                 app.toggle_play_pause();
             }
             if app.is_playing { icon_pause(&p, c, white) } else { icon_play(&p, c, white) }
@@ -1567,11 +1778,11 @@ fn draw_bottom_bar(app: &mut FluentMediaPlayer, ctx: &egui::Context, t: f32) {
             // Previous / next file in the same folder (dimmed when there isn't one)
             let dim = white.gamma_multiply(0.4);
             let c = pos2(lay.prev, row_y);
-            if app.has_prev() && hit(ui, c, "prev", "Previous file (P)", t).clicked() { app.play_adjacent(-1); }
+            if app.has_prev() && hit(ui, c, "prev", "Previous file (P)", t).activated() { app.play_adjacent(-1); }
             icon_prev(&p, c, if app.has_prev() { white } else { dim });
 
             let c = pos2(lay.next, row_y);
-            if app.has_next() && hit(ui, c, "next", "Next file (N)", t).clicked() { app.play_adjacent(1); }
+            if app.has_next() && hit(ui, c, "next", "Next file (N)", t).activated() { app.play_adjacent(1); }
             icon_next(&p, c, if app.has_next() { white } else { dim });
 
             // Time
@@ -1580,7 +1791,7 @@ fn draw_bottom_bar(app: &mut FluentMediaPlayer, ctx: &egui::Context, t: f32) {
             // Volume icon (click = mute) + slider (the slider is left out when the
             // window is too narrow for it; the wheel and arrow keys still work)
             let c = pos2(lay.mute, row_y);
-            if hit(ui, c, "mute", if app.muted { "Unmute (M)" } else { "Mute (M)" }, t).clicked() {
+            if hit(ui, c, "mute", if app.muted { "Unmute (M)" } else { "Mute (M)" }, t).activated() {
                 let m = !app.muted;
                 app.set_mute(m);
             }
@@ -1623,19 +1834,19 @@ fn draw_bottom_bar(app: &mut FluentMediaPlayer, ctx: &egui::Context, t: f32) {
             let tint = |on: bool| if on { accent } else { white };
 
             let c = pos2(lay.repeat, row_y);
-            if hit(ui, c, "repeat", "Repeat this video", t).clicked() { app.toggle_repeat(); }
+            if hit(ui, c, "repeat", "Repeat this video", t).activated() { app.toggle_repeat(); }
             icon_repeat(&p, c, tint(app.repeat));
 
             let c = pos2(lay.captions, row_y);
-            if hit(ui, c, "captions", "Cycle subtitles", t).clicked() { app.cycle_captions(); }
+            if hit(ui, c, "captions", "Cycle subtitles", t).activated() { app.cycle_captions(); }
             icon_captions(&p, c, white);
 
             let c = pos2(lay.ontop, row_y);
-            if hit(ui, c, "ontop", "Always on top", t).clicked() { app.toggle_on_top(ctx); }
+            if hit(ui, c, "ontop", "Always on top", t).activated() { app.toggle_on_top(ctx); }
             icon_compact(&p, c, tint(app.on_top));
 
             let c = pos2(lay.fullscreen, row_y);
-            if hit(ui, c, "fs", "Full screen (F)", t).clicked() { app.toggle_fullscreen(ctx); }
+            if hit(ui, c, "fs", "Full screen (F)", t).activated() { app.toggle_fullscreen(ctx); }
             icon_fullscreen(&p, c, white);
 
             // "More" → playback speed menu
@@ -1643,7 +1854,7 @@ fn draw_bottom_bar(app: &mut FluentMediaPlayer, ctx: &egui::Context, t: f32) {
             let more = hit(ui, c, "more", "Playback speed", t);
             icon_speed(&p, c, white);
             let popup_id = egui::Id::new(MORE_POPUP);
-            if more.clicked() {
+            if more.activated() {
                 ui.memory_mut(|m| m.toggle_popup(popup_id));
             }
             egui::popup_above_or_below_widget(ui, popup_id, &more, egui::AboveOrBelow::Above, |ui| {
@@ -1902,39 +2113,170 @@ fn hsv_to_rgb(h: f32, s: f32, v: f32) -> (f32, f32, f32) {
 }
 
 // ── Pop-ups ───────────────────────────────────────────────────────────────────
-/// "🔊 55 %" pill in the top right, with a slim level bar
-fn draw_volume_osd(ctx: &egui::Context, volume: f64, muted: bool, accent: Color32, alpha: f32, fullscreen: bool) {
+/// Pill in the top right: icon, value, and a slim bar showing `frac`
+fn draw_osd(
+    ctx: &egui::Context,
+    icon: &dyn Fn(&egui::Painter, Pos2, Color32),
+    label: &str,
+    frac: f32,
+    accent: Color32,
+    alpha: f32,
+    fullscreen: bool,
+) {
     let screen = ctx.screen_rect();
+    let p = ctx.layer_painter(egui::LayerId::new(egui::Order::Tooltip, egui::Id::new("osd")));
+    let font = FontId::new(17.0, FontFamily::Name("semibold".into()));
+    let label_w = p.layout_no_wrap(label.to_owned(), font.clone(), Color32::WHITE).size().x;
     // Sit below the window buttons (they aren't shown in fullscreen)
     let top = if fullscreen { 16.0 } else { WIN_BTN_H + 12.0 };
-    let size = vec2(116.0, 42.0);
+    let size = vec2((label_w + 66.0).max(116.0).round(), 42.0);
     let rect = Rect::from_min_size(pos2(screen.right() - 16.0 - size.x, screen.top() + top), size);
-
-    let p = ctx.layer_painter(egui::LayerId::new(egui::Order::Tooltip, egui::Id::new("vol_osd")));
     p.rect_filled(rect, 8.0, Color32::from_rgba_unmultiplied(24, 24, 24, (225.0 * alpha) as u8));
 
     let white = Color32::WHITE.gamma_multiply(alpha);
-    icon_volume(&p, pos2(rect.left() + 26.0, rect.center().y - 3.0), white, volume, muted);
-    let label = if muted { "Muted".to_owned() } else { format!("{}%", volume.round() as i32) };
-    p.text(
-        pos2(rect.right() - 16.0, rect.center().y - 3.0),
-        Align2::RIGHT_CENTER,
-        label,
-        FontId::new(17.0, FontFamily::Name("semibold".into())),
-        white,
-    );
+    icon(&p, pos2(rect.left() + 26.0, rect.center().y - 3.0), white);
+    p.text(pos2(rect.right() - 16.0, rect.center().y - 3.0), Align2::RIGHT_CENTER, label, font, white);
 
     let bar = Rect::from_min_max(
         pos2(rect.left() + 14.0, rect.bottom() - 9.0),
         pos2(rect.right() - 14.0, rect.bottom() - 6.0),
     );
     p.rect_filled(bar, 1.5, VOL_TRACK.gamma_multiply(alpha * 0.6));
-    let frac = if muted { 0.0 } else { (volume / VOL_MAX).clamp(0.0, 1.0) as f32 };
     p.rect_filled(
-        Rect::from_min_max(bar.min, pos2(bar.left() + bar.width() * frac, bar.max.y)),
+        Rect::from_min_max(bar.min, pos2(bar.left() + bar.width() * frac.clamp(0.0, 1.0), bar.max.y)),
         1.5,
         accent.gamma_multiply(alpha),
     );
+}
+
+/// "🔊 55 %" with the volume level
+fn draw_volume_osd(ctx: &egui::Context, volume: f64, muted: bool, accent: Color32, alpha: f32, fullscreen: bool) {
+    let label = if muted { "Muted".to_owned() } else { format!("{}%", volume.round() as i32) };
+    let frac = if muted { 0.0 } else { (volume / VOL_MAX) as f32 };
+    draw_osd(ctx, &|p, c, col| icon_volume(p, c, col, volume, muted), &label, frac, accent, alpha, fullscreen);
+}
+
+/// "⏩ +10 s" after the arrow keys, or "⏩ 12:34" (the new time) while dragging the
+/// seek bar; the bar shows the position in the video
+fn draw_seek_osd(ctx: &egui::Context, kind: SeekOsd, target: f64, duration: f64, accent: Color32, alpha: f32, fullscreen: bool) {
+    let (forward, label) = match kind {
+        SeekOsd::Step(secs) => {
+            let sign = if secs < 0.0 { "\u{2212}" } else { "+" };
+            let a = secs.abs();
+            (secs >= 0.0, if a < 60.0 { format!("{sign}{} s", a.round()) } else { format!("{sign}{}", fmt_time(a)) })
+        }
+        SeekOsd::Drag(from) => (target >= from, fmt_time(target)),
+    };
+    let frac = if duration > 0.0 { (target / duration) as f32 } else { 0.0 };
+    draw_osd(ctx, &|p, c, col| icon_seek(p, c, col, forward), &label, frac, accent, alpha, fullscreen);
+}
+
+/// Fast-forward (two triangles), mirrored for rewind
+fn icon_seek(p: &egui::Painter, c: Pos2, col: Color32, forward: bool) {
+    let d = if forward { 1.0 } else { -1.0 };
+    for x0 in [-7.5_f32, 0.0] {
+        p.add(egui::Shape::convex_polygon(
+            vec![
+                pos2(c.x + d * x0 * K, c.y - 6.0 * K),
+                pos2(c.x + d * (x0 + 7.5) * K, c.y),
+                pos2(c.x + d * x0 * K, c.y + 6.0 * K),
+            ],
+            col,
+            Stroke::NONE,
+        ));
+    }
+}
+
+// ── Main menu (top left) ──────────────────────────────────────────────────────
+fn draw_main_menu(app: &mut FluentMediaPlayer, ctx: &egui::Context) {
+    if !app.main_menu {
+        return;
+    }
+    const W: f32 = 252.0;
+    const ITEM_H: f32 = 34.0;
+    const PAD: f32 = 4.0;
+    const SEP_H: f32 = 9.0;
+    let box_left = MENU_X - BTN_BOX / 2.0;
+    let rect = Rect::from_min_size(
+        pos2(box_left, MENU_Y + BTN_BOX / 2.0 + 6.0),
+        vec2(W, PAD * 2.0 + ITEM_H * 2.0 + SEP_H),
+    );
+
+    // Any press outside the menu (and its button, which toggles it) closes it
+    let anchor = app.menu_anchor;
+    let pressed_outside = ctx.input(|i| {
+        i.pointer.any_pressed()
+            && i.pointer.press_origin().map_or(false, |o| !rect.contains(o) && !anchor.contains(o))
+    });
+    if pressed_outside {
+        app.main_menu = false;
+        return;
+    }
+
+    let id = egui::Id::new("main_menu");
+    egui::Area::new(id)
+        .order(egui::Order::Foreground)
+        .fixed_pos(rect.min)
+        .show(ctx, |ui| {
+            // The menu's own background swallows clicks (so they don't reach the video)
+            ui.allocate_rect(rect, Sense::click_and_drag());
+            let p = ui.painter().clone();
+            let r = 8.0;
+            for (e, a) in [(1.0, 40.0), (3.0, 22.0), (6.0, 10.0)] {
+                p.rect_filled(rect.expand(e).translate(vec2(0.0, 2.0)), r + e, Color32::from_black_alpha(a as u8));
+            }
+            p.rect_filled(rect, r, Color32::from_rgb(44, 44, 44));
+            p.rect_stroke(rect.shrink(0.5), r, Stroke::new(1.0_f32, Color32::from_rgba_premultiplied(30, 30, 30, 30)));
+
+            let text = Color32::from_rgb(240, 240, 240);
+            let font = FontId::proportional(13.5);
+            let item = |ui: &mut egui::Ui, top: f32, key: &str| {
+                let ir = Rect::from_min_size(pos2(rect.left() + PAD, top), vec2(W - 2.0 * PAD, ITEM_H));
+                let resp = ui.interact(ir, ui.id().with(key), Sense::click_and_drag());
+                if resp.hovered() {
+                    p.rect_filled(ir, 4.0, Color32::from_rgba_premultiplied(14, 14, 14, 14));
+                }
+                resp
+            };
+            let text_x = rect.left() + PAD + 36.0;
+
+            // Open file…
+            let top = rect.top() + PAD;
+            let open = item(ui, top, "open");
+            let cy = top + ITEM_H / 2.0;
+            p.text(pos2(text_x, cy), Align2::LEFT_CENTER, "Open file\u{2026}", font.clone(), text);
+            p.text(
+                pos2(rect.right() - PAD - 12.0, cy),
+                Align2::RIGHT_CENTER,
+                "Ctrl+O",
+                FontId::proportional(12.5),
+                Color32::from_rgb(160, 160, 160),
+            );
+            if open.activated() {
+                app.main_menu = false;
+                app.show_open_dialog();
+            }
+
+            // separator
+            let sep_y = top + ITEM_H + SEP_H / 2.0;
+            p.line_segment(
+                [pos2(rect.left() + 1.0, sep_y), pos2(rect.right() - 1.0, sep_y)],
+                Stroke::new(1.0_f32, Color32::from_rgba_premultiplied(26, 26, 26, 26)),
+            );
+
+            // Auto-play next file (a check mark when on); the menu stays open
+            let top = top + ITEM_H + SEP_H;
+            let auto = item(ui, top, "autoplay");
+            let cy = top + ITEM_H / 2.0;
+            if app.autoplay {
+                poly(&p, pos2(rect.left() + PAD + 18.0, cy), &[(-4.5, 0.0), (-1.5, 3.2), (4.5, -3.5)], text, 1.5);
+            }
+            p.text(pos2(text_x, cy), Align2::LEFT_CENTER, "Auto-play next file in folder", font, text);
+            if auto.activated() {
+                app.autoplay = !app.autoplay;
+            }
+        });
+    ctx.move_to_top(egui::LayerId::new(egui::Order::Foreground, id));
 }
 
 /// Decoder / video details (toggle with I) — shows whether hardware decoding is active
@@ -1992,6 +2334,17 @@ fn main() -> eframe::Result<()> {
         let title = wide("Rust Media Player");
         unsafe { MessageBoxW(0, text.as_ptr(), title.as_ptr(), 0x10 /* MB_ICONERROR */); }
     }));
+
+    // Single window: if the player is already running, hand it the file (it plays
+    // it in place of the current one) and leave
+    let arg_file = std::env::args_os()
+        .skip(1)
+        .map(PathBuf::from)
+        .find(|p| p.is_file())
+        .map(|p| p.to_string_lossy().into_owned());
+    if taskbar::forward_to_running_instance(arg_file.as_deref()) {
+        return Ok(());
+    }
 
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("Rust Media Player")

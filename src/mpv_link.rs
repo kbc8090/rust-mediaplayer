@@ -30,6 +30,11 @@ pub struct Snapshot {
     pub paused: bool,
     pub muted: bool,
     pub eof: bool,
+    /// Displayed video size (0 for audio-only / nothing loaded)
+    pub dwidth: i64,
+    pub dheight: i64,
+    /// Chapters (start time in seconds, title), empty if the file has none
+    pub chapters: Arc<Vec<(f64, String)>>,
     /// Decoder / video details, only filled while the info overlay is open
     pub info: Vec<String>,
 }
@@ -94,6 +99,9 @@ const RESIZE_SETTINGS: [(&str, &str); 2] = [("dither-depth", "no"), ("correct-do
 
 fn run(mpv: Arc<Mutex<Mpv>>, rx: mpsc::Receiver<Job>, state: Arc<Mutex<Snapshot>>, want_info: Arc<AtomicBool>) {
     let mut resize_saved: Option<Vec<(String, String)>> = None;
+    // Chapters are re-read only when the file or the chapter count changes
+    let mut chapter_key: (String, i64) = (String::new(), -1);
+    let mut chapters: Arc<Vec<(f64, String)>> = Arc::new(Vec::new());
     loop {
         // Wait for work, or refresh the snapshot every 100 ms
         let mut jobs = Vec::new();
@@ -157,8 +165,30 @@ fn run(mpv: Arc<Mutex<Mpv>>, rx: mpsc::Receiver<Job>, state: Arc<Mutex<Snapshot>
             paused: m.get_property::<bool>("pause").unwrap_or(true),
             muted: m.get_property::<bool>("mute").unwrap_or(false),
             eof: m.get_property::<bool>("eof-reached").unwrap_or(false),
+            dwidth: m.get_property::<i64>("dwidth").unwrap_or(0),
+            dheight: m.get_property::<i64>("dheight").unwrap_or(0),
+            chapters: chapters.clone(),
             info: Vec::new(),
         };
+        let key = (
+            m.get_property::<String>("path").unwrap_or_default(),
+            m.get_property::<i64>("chapter-list/count").unwrap_or(0),
+        );
+        if key != chapter_key {
+            let mut list = Vec::new();
+            for i in 0..key.1 {
+                let time = m.get_property::<f64>(&format!("chapter-list/{i}/time")).unwrap_or(0.0);
+                let title = m
+                    .get_property::<String>(&format!("chapter-list/{i}/title"))
+                    .ok()
+                    .filter(|t| !t.trim().is_empty())
+                    .unwrap_or_else(|| format!("Chapter {}", i + 1));
+                list.push((time, title));
+            }
+            chapters = Arc::new(list);
+            s.chapters = chapters.clone();
+            chapter_key = key;
+        }
         if want_info.load(Ordering::Relaxed) {
             let hw = m.get_property::<String>("hwdec-current").unwrap_or_default();
             s.info.push(match hw.as_str() {
