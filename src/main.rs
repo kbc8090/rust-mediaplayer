@@ -213,9 +213,9 @@ const VOL_W: f32 = 90.0;
 const WIN_BTN_W: f32 = 46.0;
 const WIN_BTN_H: f32 = 34.0;
 const MORE_POPUP: &str = "more_popup";
-/// Menu button (top left): centre. Its highlight sits as far from the top as from the left.
-const MENU_X: f32 = 23.0;
-const MENU_Y: f32 = 23.0;
+/// Menu button (top left): centre. Its highlight sits 8 px from the left, 7 px from the top.
+const MENU_X: f32 = 8.0 + BTN_BOX / 2.0;
+const MENU_Y: f32 = 7.0 + BTN_BOX / 2.0;
 
 /// The pop-up in the top right after seeking with the keys (accumulated amount)
 /// or the mouse (seek bar dragged from this time)
@@ -499,6 +499,7 @@ impl FluentMediaPlayer {
         // Back to "subtitles off" for every new file, even if they were switched on
         // for the previous one
         self.link.set("sid", "no");
+        self.link.set("loop-file", if self.wants_loop() { "inf" } else { "no" });
         self.link.command("loadfile", &[path]);
         self.link.set("pause", "no");
         self.is_playing = true;
@@ -645,7 +646,12 @@ impl FluentMediaPlayer {
 
     fn toggle_repeat(&mut self) {
         self.repeat = !self.repeat;
-        self.link.set("loop-file", if self.repeat { "inf" } else { "no" });
+        self.link.set("loop-file", if self.wants_loop() { "inf" } else { "no" });
+    }
+
+    /// Repeat is on, or the file is a GIF (those always loop, like in a browser)
+    fn wants_loop(&self) -> bool {
+        self.repeat || has_ext(&self.current_file, &["gif"])
     }
 
     fn cycle_captions(&mut self) {
@@ -1066,7 +1072,7 @@ impl eframe::App for FluentMediaPlayer {
 
         // ── Actions ───────────────────────────────────────────────────────────
         for s in &inp.dropped {
-            if is_video_file(s) { self.open_file(s); }
+            if is_media_file(s) { self.open_file(s); }
         }
         if inp.space { self.toggle_play_pause(); }
         if inp.right { self.step(10.0); }
@@ -1230,7 +1236,7 @@ struct InputSnapshot {
     pointer: Option<Pos2>,
 }
 
-// ── Fonts: use Segoe UI if Windows has it, otherwise egui's defaults ──────────
+// ── Fonts: Golos Text (built in), then Segoe UI / egui's defaults as fallback ─
 /// Which Windows icon font supplies the minimize / maximize / close glyphs
 #[derive(Clone, Copy, PartialEq)]
 enum CaptionFont {
@@ -1265,6 +1271,21 @@ fn install_fonts(ctx: &egui::Context) -> CaptionFont {
         }
     }
 
+    // Golos Text (Paratype; free under the SIL Open Font License, whose notice is
+    // stored inside the font files) is built into the .exe and used for all text.
+    // Segoe UI stays behind it as a fallback for characters Golos doesn't have.
+    fonts.font_data.insert(
+        "golos".into(),
+        egui::FontData::from_static(include_bytes!("../assets/fonts/GolosText-Regular.ttf")),
+    );
+    fonts.font_data.insert(
+        "golos_sb".into(),
+        egui::FontData::from_static(include_bytes!("../assets/fonts/GolosText-SemiBold.ttf")),
+    );
+    if let Some(fam) = fonts.families.get_mut(&FontFamily::Proportional) {
+        fam.insert(0, "golos".into());
+    }
+
     // "semibold" family always exists (falls back to the proportional fonts)
     let mut semibold = fonts.families
         .get(&FontFamily::Proportional).cloned().unwrap_or_default();
@@ -1272,6 +1293,7 @@ fn install_fonts(ctx: &egui::Context) -> CaptionFont {
         fonts.font_data.insert("segoe_sb".into(), egui::FontData::from_owned(bytes));
         semibold.insert(0, "segoe_sb".into());
     }
+    semibold.insert(0, "golos_sb".into());
     fonts.families.insert(FontFamily::Name("semibold".into()), semibold);
 
     // The icon font has no ordinary characters, and egui refuses (panics) to build
@@ -1934,7 +1956,7 @@ fn scan_folder(path: &Path) -> Vec<PathBuf> {
         .map(|rd| {
             rd.filter_map(|e| e.ok())
                 .map(|e| e.path())
-                .filter(|p| p.is_file() && is_video_file(&p.to_string_lossy()))
+                .filter(|p| p.is_file() && is_media_file(&p.to_string_lossy()))
                 .collect()
         })
         .unwrap_or_default();
@@ -2322,12 +2344,26 @@ fn fmt_time(secs: f64) -> String {
     if h > 0 { format!("{h}:{m:02}:{s:02}") } else { format!("{m}:{s:02}") }
 }
 
-fn is_video_file(path: &str) -> bool {
-    matches!(
-        std::path::Path::new(path).extension()
-            .and_then(|e| e.to_str()).map(|s| s.to_lowercase()).as_deref(),
-        Some("mp4"|"mkv"|"avi"|"mov"|"wmv"|"flv"|"webm"|"m4v"|"ts"|"m2ts"|"mpg"|"mpeg"|"3gp"|"ogv")
-    )
+/// Video, music and animated-image files mpv plays (used for drag-and-drop and
+/// for the folder's previous / next list)
+const MEDIA_EXTS: &[&str] = &[
+    // video
+    "mp4", "mkv", "avi", "mov", "wmv", "flv", "webm", "m4v", "ts", "m2ts", "mts", "mpg", "mpeg", "3gp", "ogv",
+    // music
+    "mp3", "flac", "wav", "m4a", "aac", "ogg", "oga", "opus", "wma", "alac", "aiff", "aif", "ape", "wv", "mka",
+    // animated images
+    "gif",
+];
+
+fn has_ext(path: &str, exts: &[&str]) -> bool {
+    Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map_or(false, |e| exts.iter().any(|x| x.eq_ignore_ascii_case(e)))
+}
+
+fn is_media_file(path: &str) -> bool {
+    has_ext(path, MEDIA_EXTS)
 }
 
 fn main() -> eframe::Result<()> {
