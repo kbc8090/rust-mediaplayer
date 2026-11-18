@@ -1146,24 +1146,19 @@ fn poly(p: &egui::Painter, c: Pos2, pts: &[(f32, f32)], col: Color32, w: f32) {
     p.add(egui::Shape::line(v, Stroke::new(w, col)));
 }
 
-/// Same as `poly` / `closed_poly`, with the offsets scaled by the icon scale `K`
-fn kpoly(p: &egui::Painter, c: Pos2, pts: &[(f32, f32)], col: Color32, w: f32) {
-    let v: Vec<Pos2> = pts.iter().map(|&(x, y)| pos2(c.x + x * K, c.y + y * K)).collect();
-    p.add(egui::Shape::line(v, Stroke::new(w, col)));
-}
-
-fn kclosed(p: &egui::Painter, c: Pos2, pts: &[(f32, f32)], col: Color32, w: f32) {
-    let v: Vec<Pos2> = pts.iter().map(|&(x, y)| pos2(c.x + x * K, c.y + y * K)).collect();
-    p.add(egui::Shape::closed_line(v, Stroke::new(w, col)));
-}
-
 /// Click target (one full step wide, so neighbours never overlap) with a faint
 /// rounded hover highlight (8 px radius). Draw the icon afterwards.
 fn hit(ui: &mut egui::Ui, centre: Pos2, id: &str, tip: &str, t: f32) -> egui::Response {
+    hit_at(ui, centre, id, tip, t, true)
+}
+
+/// `hit` with the tooltip above (`above`) or below the button
+fn hit_at(ui: &mut egui::Ui, centre: Pos2, id: &str, tip: &str, t: f32, above: bool) -> egui::Response {
     let r = ui.interact(
         Rect::from_center_size(centre, vec2(BTN_STEP, 34.0)),
         ui.id().with(id),
-        Sense::click(),
+        // drags starting on a button must not move the window (see the window buttons)
+        Sense::click_and_drag(),
     );
     if r.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
@@ -1173,7 +1168,7 @@ fn hit(ui: &mut egui::Ui, centre: Pos2, id: &str, tip: &str, t: f32) -> egui::Re
             Color32::from_white_alpha((8.0 * t) as u8),
         );
     }
-    hover_tooltip(ui.ctx(), &r, Rect::from_center_size(centre, vec2(BTN_BOX, BTN_BOX)), tip, true);
+    hover_tooltip(ui.ctx(), &r, Rect::from_center_size(centre, vec2(BTN_BOX, BTN_BOX)), tip, above);
     r
 }
 
@@ -1244,6 +1239,17 @@ const SW: f32 = 1.35;
 /// Overall scale of the control-row icons
 const K: f32 = 0.92;
 
+/// Like `poly`, with the offsets scaled by the icon scale `K`
+fn kpoly(p: &egui::Painter, c: Pos2, pts: &[(f32, f32)], col: Color32, w: f32) {
+    let v: Vec<Pos2> = pts.iter().map(|&(x, y)| pos2(c.x + x * K, c.y + y * K)).collect();
+    p.add(egui::Shape::line(v, Stroke::new(w, col)));
+}
+
+fn kclosed(p: &egui::Painter, c: Pos2, pts: &[(f32, f32)], col: Color32, w: f32) {
+    let v: Vec<Pos2> = pts.iter().map(|&(x, y)| pos2(c.x + x * K, c.y + y * K)).collect();
+    p.add(egui::Shape::closed_line(v, Stroke::new(w, col)));
+}
+
 fn icon_pause(p: &egui::Painter, c: Pos2, col: Color32) {
     p.rect_filled(Rect::from_center_size(pos2(c.x - 3.5 * K, c.y), vec2(2.6 * K, 13.0 * K)), 0.5, col);
     p.rect_filled(Rect::from_center_size(pos2(c.x + 3.5 * K, c.y), vec2(2.6 * K, 13.0 * K)), 0.5, col);
@@ -1304,10 +1310,21 @@ fn icon_fullscreen(p: &egui::Painter, c: Pos2, col: Color32) {
     kpoly(p, c, &[(6.5, -1.5), (6.5, -6.5), (1.5, -6.5)], col, SW);
     kpoly(p, c, &[(-6.5, 1.5), (-6.5, 6.5), (-1.5, 6.5)], col, SW);
 }
-fn icon_more(p: &egui::Painter, c: Pos2, col: Color32) {
-    for dx in [-6.0_f32, 0.0, 6.0] {
-        p.circle_filled(pos2(c.x + dx * K, c.y), 1.4, col);
-    }
+/// Playback speed: a speedometer, an open dial with a needle pointing up-right
+fn icon_speed(p: &egui::Painter, c: Pos2, col: Color32) {
+    let c = pos2(c.x, c.y + 1.5 * K); // the dial is open at the bottom: sit it a little lower
+    let r = 8.0;
+    // 270° arc from bottom-left over the top to bottom-right (screen y points down)
+    let dial: Vec<(f32, f32)> = (0..=24)
+        .map(|i| {
+            let a = (135.0 + 270.0 * i as f32 / 24.0_f32).to_radians();
+            (r * a.cos(), r * a.sin())
+        })
+        .collect();
+    kpoly(p, c, &dial, col, SW);
+    let n = (-50.0_f32).to_radians();
+    kpoly(p, c, &[(0.0, 0.0), (5.5 * n.cos(), 5.5 * n.sin())], col, SW + 0.15);
+    p.circle_filled(c, 1.7 * K, col);
 }
 
 /// Slider thumb: light ring with an accent dot, both circles share one centre that is
@@ -1366,10 +1383,11 @@ fn draw_top_bar(app: &mut FluentMediaPlayer, ctx: &egui::Context, t: f32) {
             // Left: file name
             let y = 28.0;
             let right_limit = if fullscreen { screen.right() - 20.0 } else { screen.right() - WIN_BTN_W * 3.0 - 10.0 };
-            let clip = p.with_clip_rect(Rect::from_min_max(pos2(SIDE, 0.0), pos2(right_limit, TOP_H)));
+            let tx = SIDE;
+            let clip = p.with_clip_rect(Rect::from_min_max(pos2(tx, 0.0), pos2(right_limit, TOP_H)));
             let font = FontId::new(14.5, FontFamily::Name("semibold".into()));
-            clip.text(pos2(SIDE + 1.0, y + 1.0), Align2::LEFT_CENTER, &title, font.clone(), black(170, t));
-            clip.text(pos2(SIDE, y), Align2::LEFT_CENTER, &title, font, white);
+            clip.text(pos2(tx + 1.0, y + 1.0), Align2::LEFT_CENTER, &title, font.clone(), black(170, t));
+            clip.text(pos2(tx, y), Align2::LEFT_CENTER, &title, font, white);
 
             // Right: window buttons (not shown in fullscreen)
             if !fullscreen {
@@ -1378,7 +1396,10 @@ fn draw_top_bar(app: &mut FluentMediaPlayer, ctx: &egui::Context, t: f32) {
                         pos2(screen.right() - WIN_BTN_W * (3 - k) as f32, screen.top()),
                         vec2(WIN_BTN_W, WIN_BTN_H),
                     );
-                    let resp = ui.interact(r, ui.id().with(("winbtn", k)), Sense::click());
+                    // click_and_drag: a button must also "own" drags that start on it,
+                    // otherwise egui hands the drag to the draggable title strip behind
+                    // it and the window moves
+                    let resp = ui.interact(r, ui.id().with(("winbtn", k)), Sense::click_and_drag());
                     let label = match k {
                         0 => "Minimize",
                         1 if maximized => "Restore Down",
@@ -1613,14 +1634,14 @@ fn draw_bottom_bar(app: &mut FluentMediaPlayer, ctx: &egui::Context, t: f32) {
             if hit(ui, c, "ontop", "Always on top", t).clicked() { app.toggle_on_top(ctx); }
             icon_compact(&p, c, tint(app.on_top));
 
-            let c = pos2(lay.fs, row_y);
+            let c = pos2(lay.fullscreen, row_y);
             if hit(ui, c, "fs", "Full screen (F)", t).clicked() { app.toggle_fullscreen(ctx); }
             icon_fullscreen(&p, c, white);
 
             // "More" → playback speed menu
-            let c = pos2(lay.more, row_y);
+            let c = pos2(lay.speed, row_y);
             let more = hit(ui, c, "more", "Playback speed", t);
-            icon_more(&p, c, white);
+            icon_speed(&p, c, white);
             let popup_id = egui::Id::new(MORE_POPUP);
             if more.clicked() {
                 ui.memory_mut(|m| m.toggle_popup(popup_id));
@@ -1654,8 +1675,9 @@ struct RowLayout {
     repeat: f32,
     captions: f32,
     ontop: f32,
-    fs: f32,
-    more: f32,
+    speed: f32,
+    /// The last button, flush with the seek bar's right end
+    fullscreen: f32,
 }
 
 fn row_layout(left: f32, right: f32, time_w: f32) -> RowLayout {
@@ -1666,9 +1688,9 @@ fn row_layout(left: f32, right: f32, time_w: f32) -> RowLayout {
     let time_x = next + half + 10.0;
     let time_end = time_x + time_w;
 
-    let more = right - SIDE - half;
-    let fs = more - BTN_STEP;
-    let ontop = fs - BTN_STEP;
+    let fullscreen = right - SIDE - half;
+    let speed = fullscreen - BTN_STEP;
+    let ontop = speed - BTN_STEP;
     let captions = ontop - BTN_STEP;
     let repeat = captions - BTN_STEP;
 
@@ -1680,7 +1702,7 @@ fn row_layout(left: f32, right: f32, time_w: f32) -> RowLayout {
     } else {
         (repeat - BTN_STEP, None)
     };
-    RowLayout { play, prev, next, time_x, mute, vol_x, repeat, captions, ontop, fs, more }
+    RowLayout { play, prev, next, time_x, mute, vol_x, repeat, captions, ontop, speed, fullscreen }
 }
 
 // ── Folder navigation ─────────────────────────────────────────────────────────
