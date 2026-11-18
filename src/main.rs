@@ -254,10 +254,8 @@ struct FluentMediaPlayer {
     /// Window size last frame, and the end of the current live-resize (if any)
     last_size: egui::Vec2,
     resize_until: Option<std::time::Instant>,
-    /// mpv scaler settings saved while cheap ones are used during a resize
+    /// mpv settings saved while the live-resize ones are in use
     fast_scale_saved: Option<Vec<(String, String)>>,
-    /// Q: use fast rendering all the time
-    fast_always: bool,
     /// Live-resize statistics: frames, summed / worst frame interval, worst mpv render (ms)
     last_frame: std::time::Instant,
     rs_stats: (u32, f32, f32, f32),
@@ -382,7 +380,6 @@ impl FluentMediaPlayer {
             last_size: egui::Vec2::ZERO,
             resize_until: None,
             fast_scale_saved: None,
-            fast_always: false,
             last_frame: std::time::Instant::now(),
             rs_stats: (0, 0.0, 0.0, 0.0),
             hwnd: 0,
@@ -446,16 +443,10 @@ impl FluentMediaPlayer {
         self.show_info = true;
     }
 
-    /// Switch mpv to cheap scaling, returning the previous values to restore later
+    /// Settings used during a live resize (see the resize block in `update`),
+    /// returning the previous values to restore later
     fn set_fast_scaling(&self) -> Vec<(String, String)> {
-        const FAST: [(&str, &str); 6] = [
-            ("scale", "bilinear"),
-            ("dscale", "bilinear"),
-            ("cscale", "bilinear"),
-            ("correct-downscaling", "no"),
-            ("linear-downscaling", "no"),
-            ("sigmoid-upscaling", "no"),
-        ];
+        const FAST: [(&str, &str); 1] = [("dither-depth", "no")];
         let mut saved = Vec::new();
         if let Ok(mpv) = self.mpv.lock() {
             for (k, v) in FAST {
@@ -469,7 +460,7 @@ impl FluentMediaPlayer {
         saved
     }
 
-    /// Put back the scaler settings saved by `set_fast_scaling`
+    /// Put back the settings saved by `set_fast_scaling`
     fn restore_scaling(&mut self) {
         if let Some(saved) = self.fast_scale_saved.take() {
             if let Ok(mpv) = self.mpv.lock() {
@@ -548,8 +539,8 @@ impl FluentMediaPlayer {
         }
         let render_ms = RENDER_MS.with(|r| r.get());
         lines.push(format!(
-            "Render: {render_ms:.1} ms per frame, quality: {}  (Q to switch)",
-            if self.fast_always { "fast" } else if self.fast_scale_saved.is_some() { "fast while resizing" } else { "high" }
+            "Render: {render_ms:.1} ms per frame{}",
+            if self.fast_scale_saved.is_some() { " (dithering paused while resizing)" } else { "" }
         ));
         let (n, sum, worst, worst_render) = self.rs_stats;
         if n > 0 {
@@ -844,11 +835,13 @@ impl eframe::App for FluentMediaPlayer {
             return;
         }
 
-        // ── Live resize: cheap scalers while the size keeps changing ──────────
-        // Since mpv 0.37 the default rendering is "high quality" (more expensive
-        // scaling), and while you drag a window edge every frame is drawn at a new
-        // size. Use bilinear scaling until the size has been stable for 300 ms,
-        // then switch the quality settings back.
+        // ── Live resize: pause dithering while the size keeps changing ────────
+        // Newer mpv (seen in 0.42) writes the window HEIGHT as a constant into its
+        // dithering shader, so every 1 px height change forces a shader recompile
+        // before the next frame can be drawn (mpv 0.36 didn't). That made resizing
+        // jerky. With dithering off the shader doesn't depend on the size, so it is
+        // compiled once; 300 ms after the resize stops, dithering is switched back
+        // on (one compile at the final size).
         let now = std::time::Instant::now();
         let frame_ms = now.duration_since(self.last_frame).as_secs_f32() * 1000.0;
         self.last_frame = now;
@@ -871,12 +864,11 @@ impl eframe::App for FluentMediaPlayer {
                 }
             }
         }
+
         if let Some(until) = self.resize_until {
             if std::time::Instant::now() >= until {
                 self.resize_until = None;
-                if !self.fast_always {
-                    self.restore_scaling();
-                }
+                self.restore_scaling();
             } else {
                 ctx.request_repaint_after(std::time::Duration::from_millis(60));
             }
@@ -898,7 +890,6 @@ impl eframe::App for FluentMediaPlayer {
             n:     i.key_pressed(egui::Key::N),
             p:     i.key_pressed(egui::Key::P),
             info:  i.key_pressed(egui::Key::I),
-            q:     i.key_pressed(egui::Key::Q),
             hw:    i.key_pressed(egui::Key::H),
             esc:   i.key_pressed(egui::Key::Escape),
             scroll_y: i.raw_scroll_delta.y,
@@ -953,19 +944,7 @@ impl eframe::App for FluentMediaPlayer {
         if inp.p     { self.play_adjacent(-1); }
         if inp.info  { self.show_info = !self.show_info; }
         if inp.hw    { self.toggle_hw_decode(); }
-        if inp.q {
-            // Fast rendering all the time vs. mpv's high-quality default. Handy to
-            // tell mpv's drawing cost apart from the cost of resizing the window.
-            self.fast_always = !self.fast_always;
-            if self.fast_always {
-                if self.fast_scale_saved.is_none() {
-                    self.fast_scale_saved = Some(self.set_fast_scaling());
-                }
-            } else if self.resize_until.is_none() {
-                self.restore_scaling();
-            }
-            self.show_info = true;
-        }
+
 
         // Mouse wheel anywhere in the window = volume, 5 % per notch
         // (egui reports one wheel notch as 50 points)
@@ -1088,7 +1067,7 @@ impl eframe::App for FluentMediaPlayer {
 struct InputSnapshot {
     dropped: Vec<String>,
     space: bool, right: bool, left: bool, up: bool, down: bool,
-    f: bool, m: bool, n: bool, p: bool, info: bool, hw: bool, q: bool, esc: bool,
+    f: bool, m: bool, n: bool, p: bool, info: bool, hw: bool, esc: bool,
     scroll_y: f32,
     pressed: bool,
     moved: bool, active: bool,
