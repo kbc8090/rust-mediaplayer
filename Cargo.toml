@@ -13,6 +13,10 @@ egui_glow = "0.27"
 # Critical: You must tell libmpv2 to expose its internal OpenGL Init bindings
 libmpv2 = { version = "6.0.0", features = ["render"] }
 
+[target.'cfg(windows)'.build-dependencies]
+# Embeds assets/icon.ico into the .exe
+winresource = "0.1"
+
 [profile.release]
 opt-level = 3           # Maximize pure execution speed (replaces "s")
 lto = true              # Deep Link-Time Optimization across all crates
