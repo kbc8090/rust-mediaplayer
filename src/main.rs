@@ -131,6 +131,8 @@ struct Settings {
     multi: bool,
     /// Even out loud and quiet parts (menu). Off by default.
     normalize: bool,
+    /// 1 px accent-colour line around the window (menu). Off by default.
+    border: bool,
 }
 
 /// Order of the files that previous / next step through, like Explorer's "Sort by"
@@ -170,9 +172,10 @@ fn save_settings(st: &Settings) {
     let _ = std::fs::write(
         path,
         format!(
-            "{} {} {} {} {} {} {} {} {} {} {}",
+            "{} {} {} {} {} {} {} {} {} {} {} {}",
             st.volume, st.muted as u8, st.repeat as u8, st.on_top as u8, st.hwdec as u8, st.autoplay as u8,
-            st.sort_by.code(), st.sort_desc as u8, st.snap as u8, st.multi as u8, st.normalize as u8
+            st.sort_by.code(), st.sort_desc as u8, st.snap as u8, st.multi as u8, st.normalize as u8,
+            st.border as u8
         ),
     );
 }
@@ -190,6 +193,7 @@ fn load_settings() -> Settings {
     let snap = it.next().and_then(|t| t.parse::<u8>().ok()) != Some(0);
     let multi = it.next().and_then(|t| t.parse::<u8>().ok()) == Some(1);
     let normalize = it.next().and_then(|t| t.parse::<u8>().ok()) == Some(1);
+    let border = it.next().and_then(|t| t.parse::<u8>().ok()) == Some(1);
     Settings {
         volume: volume.map_or(80.0, |v| v.clamp(0.0, VOL_MAX)).round() as i32,
         muted,
@@ -202,6 +206,7 @@ fn load_settings() -> Settings {
         snap,
         multi,
         normalize,
+        border,
     }
 }
 
@@ -392,6 +397,8 @@ struct FluentMediaPlayer {
     multi: bool,
     /// Volume normalizer on
     normalize: bool,
+    /// Accent-colour window border
+    border: bool,
 }
 
 /// Buttons fire when the mouse button is released anywhere over them, like Windows'
@@ -573,6 +580,7 @@ impl FluentMediaPlayer {
             snap: st.snap,
             multi: st.multi,
             normalize: st.normalize,
+            border: st.border,
         }
     }
 
@@ -742,6 +750,7 @@ impl FluentMediaPlayer {
             snap: self.snap,
             multi: self.multi,
             normalize: self.normalize,
+            border: self.border,
         }
     }
 
@@ -1371,6 +1380,16 @@ impl eframe::App for FluentMediaPlayer {
             } else {
                 self.seek_osd = None;
             }
+        }
+
+        // Accent-colour border around the window (not when maximized / fullscreen,
+        // like Windows' own borders); grey while another window is active
+        if self.border && !self.is_fullscreen && !(self.hwnd != 0 && unsafe { IsZoomed(self.hwnd) != 0 }) {
+            let focused = ctx.input(|i| i.viewport().focused.unwrap_or(true));
+            let col = if focused { self.accent } else { Color32::from_rgb(70, 70, 72) };
+            let px = 1.0 / ctx.pixels_per_point(); // exactly one screen pixel
+            ctx.layer_painter(egui::LayerId::new(egui::Order::Tooltip, egui::Id::new("window_border")))
+                .rect_stroke(screen.shrink(px / 2.0), 0.0, Stroke::new(px, col));
         }
 
         // Technical info overlay (I)
@@ -2525,6 +2544,7 @@ fn draw_main_menu(app: &mut FluentMediaPlayer, ctx: &egui::Context) {
         MenuRow::Item { key: "normalize", label: "Normalize volume", hint: None, mark: Mark::Check(app.normalize) },
         MenuRow::Item { key: "snap", label: "Snap to screen edges", hint: None, mark: Mark::Check(app.snap) },
         MenuRow::Item { key: "multi", label: "Allow multiple windows", hint: None, mark: Mark::Check(app.multi) },
+        MenuRow::Item { key: "border", label: "Accent color border", hint: None, mark: Mark::Check(app.border) },
         MenuRow::Sep,
         MenuRow::Header("Previous / next order"),
     ];
@@ -2631,6 +2651,7 @@ fn draw_main_menu(app: &mut FluentMediaPlayer, ctx: &egui::Context) {
         Some("autoplay") => app.autoplay = !app.autoplay,
         Some("normalize") => app.toggle_normalize(),
         Some("multi") => app.multi = !app.multi,
+        Some("border") => app.border = !app.border,
         Some("snap") => {
             app.snap = !app.snap;
             taskbar::set_snap(app.snap);
