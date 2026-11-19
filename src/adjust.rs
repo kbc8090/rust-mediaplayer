@@ -169,8 +169,57 @@ impl Adjust {
         (self.mono, self.crossfeed, self.widen, self.keep_pitch) = (d.mono, d.crossfeed, d.widen, d.keep_pitch);
     }
 
-    /// mpv's `vf` list for the picture filters (plus mirroring), or None for no filters
-    pub fn vf_chain(&self, mirror: bool) -> Option<String> {
+    /// Colour temperature and vibrance work on RGB frames, so with either on the
+    /// video reaches mpv as RGB, and mpv's own colour controls then don't work
+    /// properly on it (Contrast had no effect; Saturation and Hue only work on
+    /// normal YUV video). In that case Brightness, Contrast, Saturation, Gamma and
+    /// Hue are done by FFmpeg filters instead, first in the chain while the video
+    /// is still YUV.
+    pub fn cpu_colour(&self) -> bool {
+        self.temperature != 0 || self.vibrance != 0
+    }
+
+    /// Values for mpv's own colour controls: zero while FFmpeg does them
+    pub fn gpu_colour(&self) -> [(&'static str, i32); 5] {
+        let k = if self.cpu_colour() { 0 } else { 1 };
+        [
+            ("brightness", self.brightness * k),
+            ("contrast", self.contrast * k),
+            ("saturation", self.saturation * k),
+            ("gamma", self.gamma * k),
+            ("hue", self.hue * k),
+        ]
+    }
+
+    /// FFmpeg `eq` settings matching mpv's controls: (name, value)
+    pub fn eq_values(&self) -> [(&'static str, String); 4] {
+        [
+            ("contrast", format!("{:.3}", 1.0 + self.contrast as f32 / 100.0)),
+            ("brightness", format!("{:.3}", self.brightness as f32 / 100.0)),
+            ("saturation", format!("{:.3}", 1.0 + self.saturation as f32 / 100.0)),
+            ("gamma", format!("{:.3}", 8f32.powf(self.gamma as f32 / 100.0))),
+        ]
+    }
+
+    /// Hue in degrees for FFmpeg's `hue` filter (mpv's ±100 is ±180°)
+    pub fn hue_degrees(&self) -> String {
+        format!("{:.1}", self.hue as f32 * 1.8)
+    }
+
+    /// mpv's `vf` list for the picture filters (plus mirroring), or None for no
+    /// filters. With `with_values` false the colour values are left out: comparing
+    /// those tells whether only colour values changed (then they're sent live).
+    pub fn vf_chain(&self, mirror: bool, with_values: bool) -> Option<String> {
+        let mut chain: Vec<String> = Vec::new();
+        if self.cpu_colour() {
+            let eq: Vec<String> = self
+                .eq_values()
+                .iter()
+                .map(|(k, v)| format!("{k}={}", if with_values { v.as_str() } else { "_" }))
+                .collect();
+            chain.push(format!("@adjeq:lavfi=[eq={}]", eq.join(":")));
+            chain.push(format!("@adjhue:lavfi=[hue=h={}]", if with_values { self.hue_degrees() } else { "_".to_owned() }));
+        }
         let mut f: Vec<String> = Vec::new();
         if self.denoise > 0 {
             f.push(format!("hqdn3d={}", [0, 2, 4, 7][self.denoise as usize]));
@@ -188,7 +237,10 @@ impl Adjust {
         if mirror {
             f.push("hflip".to_owned());
         }
-        (!f.is_empty()).then(|| format!("lavfi=[{}]", f.join(",")))
+        if !f.is_empty() {
+            chain.push(format!("lavfi=[{}]", f.join(",")));
+        }
+        (!chain.is_empty()).then(|| chain.join(","))
     }
 
     /// The equalizer's band gains as FFmpeg firequalizer wants them

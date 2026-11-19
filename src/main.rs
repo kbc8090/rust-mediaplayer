@@ -765,13 +765,7 @@ impl FluentMediaPlayer {
     /// Send every adjustment to mpv (at startup)
     fn apply_adjust_all(&mut self) {
         let a = self.adjust.clone();
-        for (name, v) in [
-            ("brightness", a.brightness),
-            ("contrast", a.contrast),
-            ("saturation", a.saturation),
-            ("gamma", a.gamma),
-            ("hue", a.hue),
-        ] {
+        for (name, v) in a.gpu_colour() {
             if v != 0 {
                 self.link.set(name, v);
             }
@@ -798,13 +792,8 @@ impl FluentMediaPlayer {
     /// Send what changed between `old` and the current adjustments to mpv
     fn apply_adjust_changes(&mut self, old: &adjust::Adjust, old_normalize: bool) {
         let a = self.adjust.clone();
-        for (name, before, now) in [
-            ("brightness", old.brightness, a.brightness),
-            ("contrast", old.contrast, a.contrast),
-            ("saturation", old.saturation, a.saturation),
-            ("gamma", old.gamma, a.gamma),
-            ("hue", old.hue, a.hue),
-        ] {
+        // mpv's own colour controls (zero while FFmpeg does them, see cpu_colour)
+        for ((name, before), (_, now)) in old.gpu_colour().into_iter().zip(a.gpu_colour()) {
             if before != now {
                 self.link.set(name, now);
             }
@@ -824,7 +813,22 @@ impl FluentMediaPlayer {
         if old.smooth != a.smooth {
             self.apply_smooth();
         }
-        self.apply_vf();
+        // While FFmpeg does the colour controls and only their values changed: send
+        // the new values to the running filters (no rebuild, no hitch)
+        let same_shape = old.vf_chain(self.mirror, false) == a.vf_chain(self.mirror, false);
+        if same_shape && a.cpu_colour() {
+            for ((name, before), (_, now)) in old.eq_values().into_iter().zip(a.eq_values()) {
+                if before != now {
+                    self.link.command("vf-command", &["adjeq", name, &now]);
+                }
+            }
+            if old.hue != a.hue {
+                self.link.command("vf-command", &["adjhue", "h", &a.hue_degrees()]);
+            }
+            self.last_vf = a.vf_chain(self.mirror, true);
+        } else {
+            self.apply_vf();
+        }
         // Only the equalizer's gains changed: send them to the running filters
         // (no rebuild, so dragging a slider doesn't make the sound drop out)
         let same_shape = old.af_chain(old_normalize, false) == a.af_chain(self.normalize, false);
@@ -844,7 +848,7 @@ impl FluentMediaPlayer {
 
     /// Picture filters plus mirroring, as one filter chain
     fn apply_vf(&mut self) {
-        let chain = self.adjust.vf_chain(self.mirror);
+        let chain = self.adjust.vf_chain(self.mirror, true);
         if chain != self.last_vf {
             match &chain {
                 Some(c) => self.link.command("vf", &["set", c]),
