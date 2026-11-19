@@ -112,9 +112,6 @@ fn adjust_path() -> PathBuf {
     settings_path().map_or_else(|| PathBuf::from("adjust.txt"), |p| p.with_file_name("adjust.txt"))
 }
 
-/// Smooth motion is on: the video drawing tells mpv when each frame was shown
-static SMOOTH_MOTION: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
 fn settings_path() -> Option<PathBuf> {
     std::env::var_os("APPDATA").map(|d| PathBuf::from(d).join("rust-mediaplayer").join("settings.txt"))
 }
@@ -764,12 +761,6 @@ impl FluentMediaPlayer {
         // once the key was released)
     }
 
-    /// High-quality upscaling on / off
-    fn toggle_hq(&mut self) {
-        self.hq = !self.hq;
-        self.link.set("scale", if self.hq { HQ_SCALE } else { NORMAL_SCALE });
-    }
-
     // ── Picture & sound adjustments ─────────────────────────────────────────
     /// Send every adjustment to mpv (at startup)
     fn apply_adjust_all(&mut self) {
@@ -877,8 +868,11 @@ impl FluentMediaPlayer {
 
     /// Smooth motion: show frames in step with the monitor's refresh, blending
     /// between them where needed
+    ///
+    /// (It used to also tell mpv when each frame reached the screen, but once mpv
+    /// gets those reports it relies on them for good, so turning smooth motion off
+    /// again left playback juddering and slow.)
     fn apply_smooth(&mut self) {
-        SMOOTH_MOTION.store(self.adjust.smooth, std::sync::atomic::Ordering::Relaxed);
         if self.adjust.smooth {
             // An embedded player has to tell mpv the monitor's refresh rate
             if let Some(hz) = taskbar::monitor_refresh_hz(self.hwnd) {
@@ -888,8 +882,11 @@ impl FluentMediaPlayer {
             self.link.set("video-sync", "display-resample");
             self.link.set("interpolation", "yes");
         } else {
+            // Everything back to mpv's defaults
             self.link.set("interpolation", "no");
             self.link.set("video-sync", "audio");
+            self.link.set("display-fps-override", 0);
+            self.link.set("display-fps", 0);
         }
     }
 
@@ -1576,6 +1573,9 @@ impl eframe::App for FluentMediaPlayer {
                 self.show_keys = false;
             } else if self.main_menu {
                 self.main_menu = false;
+            } else if self.adjust_ui.open || self.adjust_ui.eq_open {
+                self.adjust_ui.open = false;
+                self.adjust_ui.eq_open = false;
             } else if self.is_fullscreen {
                 self.exit_fullscreen(ctx);
             }
@@ -1624,11 +1624,6 @@ impl eframe::App for FluentMediaPlayer {
                                     // Acknowledge mpv's update first (its docs recommend calling
                                     // this after every update callback)
                                     let _ = rc.update();
-                                    // (smooth motion times frames by these reports: the
-                                    // previous frame has been shown by now)
-                                    if SMOOTH_MOTION.load(std::sync::atomic::Ordering::Relaxed) {
-                                        rc.report_swap();
-                                    }
                                     let _ = rc.render::<*mut std::os::raw::c_void>(
                                         0, vp.width_px, vp.height_px, true,
                                     );
@@ -1661,7 +1656,11 @@ impl eframe::App for FluentMediaPlayer {
         }
         // Picture & sound panel and the equalizer
         let (before, before_norm) = (self.adjust.clone(), self.normalize);
-        adjust::draw_panel(ctx, &mut self.adjust_ui, &mut self.adjust, &mut self.normalize, self.accent);
+        let hq_before = self.hq;
+        adjust::draw_panel(ctx, &mut self.adjust_ui, &mut self.adjust, &mut self.normalize, &mut self.hq, self.accent);
+        if self.hq != hq_before {
+            self.link.set("scale", if self.hq { HQ_SCALE } else { NORMAL_SCALE });
+        }
         adjust::draw_eq(ctx, &mut self.adjust_ui, &mut self.adjust, self.accent);
         if self.adjust != before || self.normalize != before_norm {
             self.adjust_changed = std::time::Instant::now();
@@ -3009,13 +3008,12 @@ fn draw_main_menu(app: &mut FluentMediaPlayer, ctx: &egui::Context) {
 
     let mut rows = vec![
         MenuRow::Item { key: "open", label: "Open file\u{2026}", hint: Some("Ctrl+O"), mark: Mark::None },
-        MenuRow::Sep,
-        MenuRow::Item { key: "autoplay", label: "Auto-play next file in folder", hint: None, mark: Mark::Check(app.autoplay) },
         MenuRow::Item { key: "adjust", label: "Picture & sound", hint: Some("E"), mark: Mark::None },
-        MenuRow::Item { key: "hq", label: "High-quality upscaling", hint: None, mark: Mark::Check(app.hq) },
+        MenuRow::Sep,
         MenuRow::Item { key: "snap", label: "Snap to screen edges", hint: None, mark: Mark::Check(app.snap) },
         MenuRow::Item { key: "multi", label: "Allow multiple windows", hint: None, mark: Mark::Check(app.multi) },
         MenuRow::Item { key: "border", label: "Accent color border", hint: None, mark: Mark::Check(app.border) },
+        MenuRow::Item { key: "autoplay", label: "Auto-play next file in folder", hint: None, mark: Mark::Check(app.autoplay) },
         MenuRow::Sep,
         MenuRow::Header("Previous / next order"),
     ];
@@ -3126,7 +3124,6 @@ fn draw_main_menu(app: &mut FluentMediaPlayer, ctx: &egui::Context) {
         Some("quit") => app.quit(),
         Some("autoplay") => app.autoplay = !app.autoplay,
         Some("adjust") => app.adjust_ui.open = true,
-        Some("hq") => app.toggle_hq(),
         Some("multi") => app.multi = !app.multi,
         Some("border") => app.border = !app.border,
         Some("snap") => {

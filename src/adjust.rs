@@ -331,6 +331,10 @@ fn header(ui: &mut egui::Ui, p: &egui::Painter, rect: Rect, title: &str, id: &st
 
 /// A key cap button ("−" / "+"); returns true when clicked
 fn cap(ui: &mut egui::Ui, p: &egui::Painter, rect: Rect, label: &str, id: egui::Id) -> bool {
+    cap_sized(ui, p, rect, label, id, VALUE_SIZE)
+}
+
+fn cap_sized(ui: &mut egui::Ui, p: &egui::Painter, rect: Rect, label: &str, id: egui::Id, size: f32) -> bool {
     let resp = ui.interact(rect, id, Sense::click());
     let pressed = resp.is_pointer_button_down_on();
     let fill = if pressed {
@@ -349,7 +353,7 @@ fn cap(ui: &mut egui::Ui, p: &egui::Painter, rect: Rect, label: &str, id: egui::
         );
     }
     let off = if pressed { 0.5 } else { -0.5 };
-    p.text(rect.center() + vec2(0.0, off), Align2::CENTER_CENTER, label, semibold(VALUE_SIZE), TEXT);
+    p.text(rect.center() + vec2(0.0, off), Align2::CENTER_CENTER, label, semibold(size), TEXT);
     resp.clicked()
 }
 
@@ -430,16 +434,24 @@ enum SwitchKey {
     Crossfeed,
     Widen,
     Pitch,
+    Hq,
 }
 
-fn step(a: &mut Adjust, key: StepKey, dir: i32) {
+/// The controls that go −100…100 (they get both ±5 and small ±1 buttons)
+fn has_fine(key: StepKey) -> bool {
+    matches!(key, StepKey::Brightness | StepKey::Contrast | StepKey::Saturation | StepKey::Gamma | StepKey::Hue)
+}
+
+/// One step up (dir 1) or down (−1); `fine` = ±1 instead of ±5 for the −100…100 ones
+fn step(a: &mut Adjust, key: StepKey, dir: i32, fine: bool) {
     let s = |v: &mut i32, by: i32, lo: i32, hi: i32| *v = (*v + by * dir).clamp(lo, hi);
+    let big = if fine { 1 } else { 5 };
     match key {
-        StepKey::Brightness => s(&mut a.brightness, 5, -100, 100),
-        StepKey::Contrast => s(&mut a.contrast, 5, -100, 100),
-        StepKey::Saturation => s(&mut a.saturation, 5, -100, 100),
-        StepKey::Gamma => s(&mut a.gamma, 5, -100, 100),
-        StepKey::Hue => s(&mut a.hue, 5, -100, 100),
+        StepKey::Brightness => s(&mut a.brightness, big, -100, 100),
+        StepKey::Contrast => s(&mut a.contrast, big, -100, 100),
+        StepKey::Saturation => s(&mut a.saturation, big, -100, 100),
+        StepKey::Gamma => s(&mut a.gamma, big, -100, 100),
+        StepKey::Hue => s(&mut a.hue, big, -100, 100),
         StepKey::Temperature => s(&mut a.temperature, 1, -5, 5),
         StepKey::Vibrance => s(&mut a.vibrance, 1, -5, 5),
         StepKey::Sharpen => s(&mut a.sharpen, 1, 0, 5),
@@ -448,7 +460,7 @@ fn step(a: &mut Adjust, key: StepKey, dir: i32) {
     }
 }
 
-fn flip(a: &mut Adjust, normalize: &mut bool, key: SwitchKey) {
+fn flip(a: &mut Adjust, normalize: &mut bool, hq: &mut bool, key: SwitchKey) {
     let f = |v: &mut bool| *v = !*v;
     match key {
         SwitchKey::Deband => f(&mut a.deband),
@@ -461,10 +473,11 @@ fn flip(a: &mut Adjust, normalize: &mut bool, key: SwitchKey) {
         SwitchKey::Crossfeed => f(&mut a.crossfeed),
         SwitchKey::Widen => f(&mut a.widen),
         SwitchKey::Pitch => f(&mut a.keep_pitch),
+        SwitchKey::Hq => f(hq),
     }
 }
 
-fn rows(a: &Adjust, normalize: bool, tab: Tab) -> Vec<Row> {
+fn rows(a: &Adjust, normalize: bool, hq: bool, tab: Tab) -> Vec<Row> {
     let level = |v: i32| (signed(v), v != 0);
     match tab {
         Tab::Picture => {
@@ -495,6 +508,7 @@ fn rows(a: &Adjust, normalize: bool, tab: Tab) -> Vec<Row> {
                 Row::Switch("Deband", "Smooths visible steps in gradients such as skies and dark scenes.", a.deband, SwitchKey::Deband),
                 Row::Switch("Deinterlace", "Removes comb-like lines from old TV recordings and DVDs.", a.deinterlace, SwitchKey::Deinterlace),
                 Row::Switch("Smooth motion", "Matches the video to your monitor's refresh rate, so panning shots in films judder less.", a.smooth, SwitchKey::Smooth),
+                Row::Switch("High-quality upscaling", "A sharper, cleaner scaler when the video is smaller than the window (e.g. 1080p on a 4K screen). Uses more graphics card time.", hq, SwitchKey::Hq),
             ]
         }
         Tab::Sound => {
@@ -523,13 +537,13 @@ pub const PANEL_TOP: f32 = 44.0;
 const BOTTOM_GAP: f32 = 112.0;
 const PANEL_W: f32 = 300.0;
 
-pub fn draw_panel(ctx: &egui::Context, ui_state: &mut AdjustUi, a: &mut Adjust, normalize: &mut bool, accent: Color32) {
+pub fn draw_panel(ctx: &egui::Context, ui_state: &mut AdjustUi, a: &mut Adjust, normalize: &mut bool, hq: &mut bool, accent: Color32) {
     if !ui_state.open {
         ui_state.panel_rect = Rect::NOTHING;
         return;
     }
     let screen = ctx.screen_rect();
-    let list = rows(a, *normalize, ui_state.tab);
+    let list = rows(a, *normalize, *hq, ui_state.tab);
     let row_h = |r: &Row| if matches!(r, Row::Sep) { 9.0 } else { ROW_H };
     let content_h: f32 = list.iter().map(row_h).sum();
     const TABS_H: f32 = 42.0;
@@ -554,7 +568,10 @@ pub fn draw_panel(ctx: &egui::Context, ui_state: &mut AdjustUi, a: &mut Adjust, 
         }
         if reset {
             match ui_state.tab {
-                Tab::Picture => a.reset_picture(),
+                Tab::Picture => {
+                    a.reset_picture();
+                    *hq = false;
+                }
                 Tab::Sound => {
                     a.reset_sound();
                     *normalize = false;
@@ -569,16 +586,19 @@ pub fn draw_panel(ctx: &egui::Context, ui_state: &mut AdjustUi, a: &mut Adjust, 
             let tr = Rect::from_min_size(pos2(tabs.left() + i as f32 * (half + 4.0), tabs.top()), vec2(half, tabs.height()));
             let resp = ui.interact(tr, ui.id().with(("tab", i)), Sense::click());
             let on = ui_state.tab == tab;
-            let fill = if on {
-                Color32::from_rgba_premultiplied(26, 26, 26, 26)
-            } else if resp.hovered() {
-                Color32::from_rgba_premultiplied(16, 16, 16, 16)
-            } else {
-                Color32::from_rgba_premultiplied(8, 8, 8, 8)
-            };
-            p.rect_filled(tr, 5.0, fill);
             if on {
-                p.rect_filled(Rect::from_min_max(pos2(tr.left() + 2.0, tr.bottom() - 2.0), pos2(tr.right() - 2.0, tr.bottom())), 1.0, accent);
+                // The selected tab: an accent shape with the tab drawn over it 2 px
+                // higher, leaving an accent edge along the bottom that follows the
+                // rounded corners up the sides
+                p.rect_filled(tr, 5.0, accent);
+                p.with_clip_rect(tr).rect_filled(tr.translate(vec2(0.0, -2.0)), 5.0, Color32::from_rgb(68, 68, 68));
+            } else {
+                let fill = if resp.hovered() {
+                    Color32::from_rgba_premultiplied(16, 16, 16, 16)
+                } else {
+                    Color32::from_rgba_premultiplied(8, 8, 8, 8)
+                };
+                p.rect_filled(tr, 5.0, fill);
             }
             let (font, col) = if on { (semibold(NAME_SIZE), TEXT) } else { (FontId::proportional(NAME_SIZE), Color32::from_rgb(200, 200, 200)) };
             p.text(tr.center(), Align2::CENTER_CENTER, label, font, col);
@@ -606,23 +626,35 @@ pub fn draw_panel(ctx: &egui::Context, ui_state: &mut AdjustUi, a: &mut Adjust, 
                             hovered_desc = Some((r, desc));
                         }
                         p.text(pos2(r.left() + 10.0, r.center().y), Align2::LEFT_CENTER, *name, FontId::proportional(NAME_SIZE), TEXT);
-                        let plus = Rect::from_center_size(pos2(r.right() - 20.0, r.center().y), vec2(24.0, 21.0));
-                        let minus = plus.translate(vec2(-90.0, 0.0));
+                        // Outer caps: the normal step (±5 for the −100…100 ones), a size
+                        // bigger; inner tiny caps on those: ±1
+                        let plus = Rect::from_center_size(pos2(r.right() - 19.0, r.center().y), vec2(26.0, 22.0));
+                        let minus = plus.translate(vec2(-112.0, 0.0));
                         let col = if *changed { accent } else { Color32::from_rgb(189, 189, 189) };
                         p.text(pos2((minus.right() + plus.left()) / 2.0, r.center().y), Align2::CENTER_CENTER, value, FontId::proportional(VALUE_SIZE), col);
-                        if cap(ui, &p, minus, "\u{2212}", ui.id().with((*name, "minus"))) {
-                            step(a, *key, -1);
+                        if cap_sized(ui, &p, minus, "\u{2212}", ui.id().with((*name, "minus")), 14.5) {
+                            step(a, *key, -1, false);
                         }
-                        if cap(ui, &p, plus, "+", ui.id().with((*name, "plus"))) {
-                            step(a, *key, 1);
+                        if cap_sized(ui, &p, plus, "+", ui.id().with((*name, "plus")), 14.5) {
+                            step(a, *key, 1, false);
                         }
-                        // The wheel over a row steps it too
+                        if has_fine(*key) {
+                            let fplus = Rect::from_center_size(pos2(plus.left() - 12.0, r.center().y), vec2(15.0, 15.0));
+                            let fminus = Rect::from_center_size(pos2(minus.right() + 12.0, r.center().y), vec2(15.0, 15.0));
+                            if cap_sized(ui, &p, fminus, "\u{2212}", ui.id().with((*name, "minus1")), 10.0) {
+                                step(a, *key, -1, true);
+                            }
+                            if cap_sized(ui, &p, fplus, "+", ui.id().with((*name, "plus1")), 10.0) {
+                                step(a, *key, 1, true);
+                            }
+                        }
+                        // The wheel over a row steps it too (the normal step)
                         if ui.rect_contains_pointer(r) {
                             let wheel = ui.input(|i| i.raw_scroll_delta.y);
                             if wheel > 0.0 {
-                                step(a, *key, 1);
+                                step(a, *key, 1, false);
                             } else if wheel < 0.0 {
-                                step(a, *key, -1);
+                                step(a, *key, -1, false);
                             }
                         }
                     }
@@ -635,7 +667,7 @@ pub fn draw_panel(ctx: &egui::Context, ui_state: &mut AdjustUi, a: &mut Adjust, 
                         p.text(pos2(r.left() + 10.0, r.center().y), Align2::LEFT_CENTER, *name, FontId::proportional(NAME_SIZE), TEXT);
                         switch(&p, Rect::from_center_size(pos2(r.right() - 28.0, r.center().y), vec2(38.0, 19.0)), *on, accent);
                         if resp.clicked() {
-                            flip(a, normalize, *key);
+                            flip(a, normalize, hq, *key);
                         }
                     }
                     Row::Equalizer(on) => {
