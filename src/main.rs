@@ -447,6 +447,8 @@ struct FluentMediaPlayer {
     /// Open submenu of the main menu (and its row), and the row hovered (since when)
     menu_sub: Option<(&'static str, Rect)>,
     menu_hover: Option<(&'static str, std::time::Instant)>,
+    /// Where the pointer last was on the "Sort folder by" row (for heading into its submenu)
+    menu_aim: Option<Pos2>,
     menu_anchor: Rect,
     /// Previous frame, for moving the time display on smoothly
     last_tick: std::time::Instant,
@@ -664,6 +666,7 @@ impl FluentMediaPlayer {
             speed_menu: false,
             speed_anchor: Rect::NOTHING,
             menu_hover: None,
+            menu_aim: None,
             menu_anchor: Rect::NOTHING,
             last_tick: std::time::Instant::now(),
             scan_gen: 0,
@@ -2130,6 +2133,33 @@ fn icon_speed(p: &egui::Painter, c: Pos2, col: Color32) {
 
 /// Slider thumb: light ring with an accent dot, both circles share one centre that is
 /// snapped to the physical pixel grid so the dot can never look off-centre.
+/// A bar with fully round ends (a pill), drawn with smooth half circles (egui's own
+/// rounded corners are only a few points at this size, and look square)
+fn pill(p: &egui::Painter, rect: Rect, color: Color32) {
+    let r = rect.height() / 2.0;
+    if rect.width() <= 0.0 || r <= 0.0 {
+        return;
+    }
+    if rect.width() <= rect.height() {
+        p.circle_filled(rect.center(), rect.width().min(rect.height()) / 2.0, color);
+        return;
+    }
+    const N: usize = 12;
+    let y = rect.center().y;
+    let (cl, cr) = (pos2(rect.left() + r, y), pos2(rect.right() - r, y));
+    let mut pts = Vec::with_capacity(2 * (N + 1));
+    // Clockwise on screen: right end top → bottom, then left end bottom → top
+    for i in 0..=N {
+        let a = -std::f32::consts::FRAC_PI_2 + std::f32::consts::PI * i as f32 / N as f32;
+        pts.push(cr + r * vec2(a.cos(), a.sin()));
+    }
+    for i in 0..=N {
+        let a = std::f32::consts::FRAC_PI_2 + std::f32::consts::PI * i as f32 / N as f32;
+        pts.push(cl + r * vec2(a.cos(), a.sin()));
+    }
+    p.add(egui::Shape::convex_polygon(pts, color, Stroke::NONE));
+}
+
 fn draw_knob(p: &egui::Painter, ppp: f32, centre: Pos2, hot: bool, accent: Color32, t: f32) {
     let snap = |v: f32| (v * ppp).round() / ppp;
     let c = pos2(snap(centre.x), snap(centre.y));
@@ -2342,16 +2372,11 @@ fn draw_bottom_bar(app: &mut FluentMediaPlayer, ctx: &egui::Context, t: f32) {
             } else { 0.0 });
             let hot = seek.hovered() || dragging;
 
-            let track_h = if hot { 3.0 } else { 2.0 };
-            p.rect_filled(
-                Rect::from_min_max(pos2(sr.left(), seek_y - track_h / 2.0), pos2(sr.right(), seek_y + track_h / 2.0)),
-                track_h / 2.0, TRACK.gamma_multiply(t), // round ends (pill)
-            );
+            let track_h = if hot { 4.0 } else { 3.0 };
+            let (y0, y1) = (seek_y - track_h / 2.0, seek_y + track_h / 2.0);
+            pill(&p, Rect::from_min_max(pos2(sr.left(), y0), pos2(sr.right(), y1)), TRACK.gamma_multiply(t));
             let fill_x = k0 + kw * frac;
-            p.rect_filled(
-                Rect::from_min_max(pos2(sr.left(), seek_y - 1.5), pos2(fill_x, seek_y + 1.5)),
-                1.5, accent,
-            );
+            pill(&p, Rect::from_min_max(pos2(sr.left(), y0), pos2(fill_x, y1)), accent);
             // Chapter marks: small gaps in the bar
             if app.duration > 0.0 {
                 let ppp = ctx.pixels_per_point();
@@ -2359,7 +2384,7 @@ fn draw_bottom_bar(app: &mut FluentMediaPlayer, ctx: &egui::Context, t: f32) {
                     if start > 0.5 && start < app.duration - 0.5 {
                         let x = ((k0 + kw * (start / app.duration) as f32) * ppp).round() / ppp;
                         p.rect_filled(
-                            Rect::from_center_size(pos2(x, seek_y), vec2(2.0, 3.0)),
+                            Rect::from_center_size(pos2(x, seek_y), vec2(2.0, track_h)),
                             0.0, Color32::from_black_alpha((200.0 * t) as u8),
                         );
                     }
@@ -2454,20 +2479,14 @@ fn draw_bottom_bar(app: &mut FluentMediaPlayer, ctx: &egui::Context, t: f32) {
             }
             let vf = (app.volume / VOL_MAX).clamp(0.0, 1.0) as f32;
             let vhot = vresp.hovered() || vresp.dragged();
-            p.rect_filled(
-                Rect::from_min_max(pos2(vl, row_y - 1.0), pos2(vl + vw, row_y + 1.0)),
-                1.0, VOL_TRACK.gamma_multiply(t), // round ends (pill)
-            );
+            pill(&p, Rect::from_min_max(pos2(vl, row_y - 1.5), pos2(vl + vw, row_y + 1.5)), VOL_TRACK.gamma_multiply(t));
             // Small tick marking 100 % (everything right of it is boost)
             let x100 = vl + vw * (100.0 / VOL_MAX) as f32;
             p.line_segment(
                 [pos2(x100, row_y - 4.0), pos2(x100, row_y + 4.0)],
                 Stroke::new(1.0_f32, VOL_TRACK.gamma_multiply(t * 0.8)),
             );
-            p.rect_filled(
-                Rect::from_min_max(pos2(vl, row_y - 1.5), pos2(vl + vw * vf, row_y + 1.5)),
-                1.5, accent,
-            );
+            pill(&p, Rect::from_min_max(pos2(vl, row_y - 1.5), pos2(vl + vw * vf, row_y + 1.5)), accent);
             draw_knob(&p, ctx.pixels_per_point(), pos2(vl + vw * vf, row_y), vhot, accent, t);
             }
 
@@ -2846,10 +2865,10 @@ fn draw_osd(
         pos2(rect.left() + 14.0, rect.bottom() - 9.0),
         pos2(rect.right() - 14.0, rect.bottom() - 6.0),
     );
-    p.rect_filled(bar, 1.5, VOL_TRACK.gamma_multiply(alpha * 0.6));
-    p.rect_filled(
+    pill(&p, bar, VOL_TRACK.gamma_multiply(alpha * 0.6));
+    pill(
+        &p,
         Rect::from_min_max(bar.min, pos2(bar.left() + bar.width() * frac.clamp(0.0, 1.0), bar.max.y)),
-        1.5,
         accent.gamma_multiply(alpha),
     );
 }
@@ -3056,9 +3075,30 @@ const MENU_SEP_H: f32 = 7.0;
 const SUBMENU_DELAY: f32 = 0.3;
 
 fn menu_row_h(r: &MenuRow) -> f32 {
-    match r {
-        MenuRow::Sep => MENU_SEP_H,
-        _ => MENU_ITEM_H,
+    MenuSize::NORMAL.row_h(r)
+}
+
+/// Row sizes and fonts of a menu: the main menu, or the smaller speed menu
+#[derive(Clone, Copy)]
+struct MenuSize {
+    item_h: f32,
+    sep_h: f32,
+    font: f32,
+    small_font: f32,
+    /// Distance of the text / the mark from the row's left edge
+    text_x: f32,
+    mark_x: f32,
+}
+
+impl MenuSize {
+    const NORMAL: Self = Self { item_h: MENU_ITEM_H, sep_h: MENU_SEP_H, font: 14.5, small_font: 13.5, text_x: 28.0, mark_x: 14.0 };
+    const COMPACT: Self = Self { item_h: 22.0, sep_h: 5.0, font: 13.0, small_font: 12.5, text_x: 22.0, mark_x: 11.0 };
+
+    fn row_h(&self, r: &MenuRow) -> f32 {
+        match r {
+            MenuRow::Sep => self.sep_h,
+            _ => self.item_h,
+        }
     }
 }
 
@@ -3069,6 +3109,7 @@ fn draw_menu_rows(
     rows: &[MenuRow],
     sub_open: Option<&'static str>,
     selected: Option<Color32>,
+    size: MenuSize,
 ) -> (Option<&'static str>, Option<&'static str>, Vec<(&'static str, Rect)>) {
     // The menu's own background swallows clicks (so they don't reach the video)
     ui.allocate_rect(rect, Sense::click_and_drag());
@@ -3080,14 +3121,15 @@ fn draw_menu_rows(
 
     let text = Color32::from_rgb(240, 240, 240);
     let dim = Color32::from_rgb(160, 160, 160);
-    let font = FontId::proportional(14.5);
-    let text_x = rect.left() + MENU_PAD + 28.0;
-    let mark_x = rect.left() + MENU_PAD + 14.0;
+    let font = FontId::proportional(size.font);
+    let small = FontId::proportional(size.small_font);
+    let text_x = rect.left() + MENU_PAD + size.text_x;
+    let mark_x = rect.left() + MENU_PAD + size.mark_x;
     let (mut picked, mut hovered, mut subs) = (None, None, Vec::new());
 
     let mut top = rect.top() + MENU_PAD;
     for row in rows {
-        let h = menu_row_h(row);
+        let h = size.row_h(row);
         let cy = top + h / 2.0;
         let ir = Rect::from_min_size(pos2(rect.left() + MENU_PAD, top), vec2(rect.width() - 2.0 * MENU_PAD, h));
         match row {
@@ -3098,7 +3140,7 @@ fn draw_menu_rows(
                 );
             }
             MenuRow::Title(label) => {
-                p.text(pos2(rect.center().x, cy), Align2::CENTER_CENTER, *label, FontId::proportional(13.5), dim);
+                p.text(pos2(rect.center().x, cy), Align2::CENTER_CENTER, *label, small.clone(), dim);
             }
             MenuRow::Item { key, label, hint, mark } => {
                 let resp = ui.interact(ir, ui.id().with(*key), Sense::click_and_drag());
@@ -3114,13 +3156,13 @@ fn draw_menu_rows(
                         poly(&p, pos2(mark_x, cy), &[(-4.5, 0.0), (-1.5, 3.2), (4.5, -3.5)], text, 1.5);
                     }
                     Mark::Dot(true) => {
-                        p.circle_filled(pos2(mark_x, cy), 3.0, text);
+                        p.circle_filled(pos2(mark_x, cy), if size.item_h < MENU_ITEM_H { 2.5 } else { 3.0 }, text);
                     }
                     _ => {}
                 }
                 p.text(pos2(text_x, cy), Align2::LEFT_CENTER, *label, font.clone(), text);
                 if let Some(hint) = hint {
-                    p.text(pos2(rect.right() - MENU_PAD - 10.0, cy), Align2::RIGHT_CENTER, *hint, FontId::proportional(13.5), dim);
+                    p.text(pos2(rect.right() - MENU_PAD - 10.0, cy), Align2::RIGHT_CENTER, *hint, small.clone(), dim);
                 }
                 if resp.hovered() {
                     hovered = Some(*key);
@@ -3140,7 +3182,7 @@ fn draw_menu_rows(
                 let c = pos2(rect.right() - MENU_PAD - 13.0, cy);
                 p.line_segment([c + vec2(-2.5, -4.5), c + vec2(2.0, 0.0)], Stroke::new(1.3_f32, text));
                 p.line_segment([c + vec2(2.0, 0.0), c + vec2(-2.5, 4.5)], Stroke::new(1.3_f32, text));
-                p.text(pos2(c.x - 14.0, cy), Align2::RIGHT_CENTER, *hint, FontId::proportional(13.5), dim);
+                p.text(pos2(c.x - 14.0, cy), Align2::RIGHT_CENTER, *hint, small.clone(), dim);
                 if resp.hovered() {
                     hovered = Some(*key);
                 }
@@ -3155,10 +3197,18 @@ fn draw_menu_rows(
     (picked, hovered, subs)
 }
 
+/// Is `p` inside the triangle a, b, c (either winding)?
+fn in_triangle(p: Pos2, a: Pos2, b: Pos2, c: Pos2) -> bool {
+    let side = |u: Pos2, v: Pos2| (v.x - u.x) * (p.y - u.y) - (v.y - u.y) * (p.x - u.x);
+    let (d1, d2, d3) = (side(a, b), side(b, c), side(c, a));
+    !((d1 < 0.0 || d2 < 0.0 || d3 < 0.0) && (d1 > 0.0 || d2 > 0.0 || d3 > 0.0))
+}
+
 fn draw_main_menu(app: &mut FluentMediaPlayer, ctx: &egui::Context) {
     if !app.main_menu {
         app.menu_sub = None;
         app.menu_hover = None;
+        app.menu_aim = None;
         return;
     }
     const W: f32 = 272.0;
@@ -3226,7 +3276,7 @@ fn draw_main_menu(app: &mut FluentMediaPlayer, ctx: &egui::Context) {
     let sub_open = app.menu_sub.map(|(k, _)| k);
     let mut out = (None, None, Vec::new());
     egui::Area::new(id).order(egui::Order::Foreground).fixed_pos(rect.min).show(ctx, |ui| {
-        out = draw_menu_rows(ui, rect, &rows, sub_open, None);
+        out = draw_menu_rows(ui, rect, &rows, sub_open, None, MenuSize::NORMAL);
     });
     ctx.move_to_top(egui::LayerId::new(egui::Order::Foreground, id));
     let (mut picked, hovered, subs) = out;
@@ -3235,7 +3285,7 @@ fn draw_main_menu(app: &mut FluentMediaPlayer, ctx: &egui::Context) {
     if let Some(sr) = sub_rect {
         let sid = egui::Id::new("main_menu_sub");
         egui::Area::new(sid).order(egui::Order::Foreground).fixed_pos(sr.min).show(ctx, |ui| {
-            sub_picked = draw_menu_rows(ui, sr, &sub_rows, None, None).0;
+            sub_picked = draw_menu_rows(ui, sr, &sub_rows, None, None, MenuSize::NORMAL).0;
         });
         ctx.move_to_top(egui::LayerId::new(egui::Order::Foreground, sid));
     }
@@ -3251,20 +3301,36 @@ fn draw_main_menu(app: &mut FluentMediaPlayer, ctx: &egui::Context) {
         ctx.request_repaint_after(std::time::Duration::from_millis(60));
     }
     let row_of = |key: &str| subs.iter().find(|(k, _)| *k == key).map(|(_, r)| *r);
+    let was_open = app.menu_sub.is_some();
+    let pointer = ctx.input(|i| i.pointer.hover_pos());
+    if hovered == Some("sort") {
+        app.menu_aim = pointer;
+    }
     if picked == Some("sort") {
         // Clicking the row opens / closes it straight away
         app.menu_sub = if app.menu_sub.is_some() { None } else { row_of("sort").map(|r| ("sort", r)) };
         picked = None;
-    } else if let (true, Some((key, _))) = (rested, app.menu_hover) {
-        if key == "sort" {
-            if app.menu_sub.is_none() {
-                app.menu_sub = row_of("sort").map(|r| ("sort", r));
+    } else if hovered.map_or(false, |k| k != "sort") {
+        // On another row the submenu closes straight away, unless the pointer is
+        // still moving across towards it (through the triangle between where it
+        // left the row and the submenu's near edge, like Windows' menus)
+        let heading_in = match (sub_rect, app.menu_aim, pointer) {
+            (Some(s), Some(from), Some(p)) => {
+                ctx.input(|i| i.pointer.time_since_last_movement()) < 0.12
+                    && in_triangle(p, from - vec2(2.0, 0.0), s.left_top() - vec2(0.0, 4.0), s.left_bottom() + vec2(0.0, 4.0))
             }
+            _ => false,
+        };
+        if heading_in {
+            ctx.request_repaint_after(std::time::Duration::from_millis(40));
         } else {
             app.menu_sub = None;
         }
+    } else if rested && hovered == Some("sort") && app.menu_sub.is_none() {
+        app.menu_sub = row_of("sort").map(|r| ("sort", r));
     }
-    if app.menu_sub.is_some() && sub_rect.is_none() {
+    // Opened or closed after this frame was laid out: draw again right away
+    if app.menu_sub.is_some() != was_open {
         ctx.request_repaint();
     }
     if sub_picked.is_some() {
@@ -3305,12 +3371,12 @@ fn draw_speed_menu(app: &mut FluentMediaPlayer, ctx: &egui::Context) {
     if !app.speed_menu {
         return;
     }
-    const W: f32 = 150.0;
+    const W: f32 = 124.0;
     let mut rows = vec![MenuRow::Title("Playback speed"), MenuRow::Sep];
     for (s, label) in SPEEDS {
         rows.push(MenuRow::Item { key: label, label, hint: None, mark: Mark::Dot((app.speed - s).abs() < 1e-6) });
     }
-    let h = MENU_PAD * 2.0 + rows.iter().map(menu_row_h).sum::<f32>();
+    let h = MENU_PAD * 2.0 + rows.iter().map(|r| MenuSize::COMPACT.row_h(r)).sum::<f32>();
     let screen = ctx.screen_rect();
     let anchor = app.speed_anchor;
     let x = (anchor.center().x + BTN_BOX / 2.0 - W).clamp(screen.left() + 4.0, screen.right() - 4.0 - W);
@@ -3330,7 +3396,7 @@ fn draw_speed_menu(app: &mut FluentMediaPlayer, ctx: &egui::Context) {
     let mut picked = None;
     let selected = app.accent.gamma_multiply(0.38);
     egui::Area::new(id).order(egui::Order::Foreground).fixed_pos(rect.min).show(ctx, |ui| {
-        picked = draw_menu_rows(ui, rect, &rows, None, Some(selected)).0;
+        picked = draw_menu_rows(ui, rect, &rows, None, Some(selected), MenuSize::COMPACT).0;
     });
     ctx.move_to_top(egui::LayerId::new(egui::Order::Foreground, id));
     if let Some(key) = picked {
