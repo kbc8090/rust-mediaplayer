@@ -2728,24 +2728,17 @@ fn reg_dword(sub_key: &str, value: &str) -> Option<u32> {
 }
 
 /// The accent colour the controls use (seek and volume bars, switches, selected
-/// items): Windows' title-bar accent, the same calm shade as the window border.
-/// Only an accent too dark to see on the dark control bar is brightened, just
-/// enough to stand out (at least 3:1 against black).
+/// items): halfway between Windows' calm title-bar accent (the window border's
+/// colour) and a fully vivid version of it, so it stands out on the dark control
+/// bar without glaring.
 fn system_accent() -> Color32 {
     let c = border_accent();
-    let lin = |v: f32| {
-        let v = v / 255.0;
-        if v <= 0.04045 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) }
-    };
-    let lum = |c: [f32; 3]| 0.2126 * lin(c[0]) + 0.7152 * lin(c[1]) + 0.0722 * lin(c[2]);
-    let mut rgb = [c.r() as f32, c.g() as f32, c.b() as f32];
-    for _ in 0..60 {
-        if lum(rgb) >= 0.10 {
-            break;
-        }
-        rgb = rgb.map(|v| (v * 1.04 + 2.0).min(255.0));
-    }
-    Color32::from_rgb(rgb[0].round() as u8, rgb[1].round() as u8, rgb[2].round() as u8)
+    let (h, s, v) = rgb_to_hsv(c.r() as f32 / 255.0, c.g() as f32 / 255.0, c.b() as f32 / 255.0);
+    // The vivid end: more saturated, near full brightness (genuinely grey accents stay grey)
+    let s_vivid = if s < 0.12 { s } else { (s * 1.25).clamp(0.65, 1.0) };
+    let v_vivid = v.max(0.96);
+    let (r, g, b) = hsv_to_rgb(h, (s + s_vivid) / 2.0, (v + v_vivid) / 2.0);
+    Color32::from_rgb((r * 255.0).round() as u8, (g * 255.0).round() as u8, (b * 255.0).round() as u8)
 }
 
 /// Windows' "Show accent colour on title bars and window borders" (Settings →
@@ -2765,6 +2758,39 @@ fn border_accent() -> Color32 {
     Color32::from_rgb(ch(v), ch(v >> 8), ch(v >> 16))
 }
 
+/// h in 0..360, s and v in 0..1
+fn rgb_to_hsv(r: f32, g: f32, b: f32) -> (f32, f32, f32) {
+    let max = r.max(g).max(b);
+    let min = r.min(g).min(b);
+    let d = max - min;
+    let h = if d == 0.0 {
+        0.0
+    } else if max == r {
+        60.0 * (((g - b) / d).rem_euclid(6.0))
+    } else if max == g {
+        60.0 * ((b - r) / d + 2.0)
+    } else {
+        60.0 * ((r - g) / d + 4.0)
+    };
+    (h, if max == 0.0 { 0.0 } else { d / max }, max)
+}
+
+fn hsv_to_rgb(h: f32, s: f32, v: f32) -> (f32, f32, f32) {
+    let c = v * s;
+    let x = c * (1.0 - ((h / 60.0).rem_euclid(2.0) - 1.0).abs());
+    let m = v - c;
+    let (r, g, b) = match (h / 60.0) as u32 % 6 {
+        0 => (c, x, 0.0),
+        1 => (x, c, 0.0),
+        2 => (0.0, c, x),
+        3 => (0.0, x, c),
+        4 => (x, 0.0, c),
+        _ => (c, 0.0, x),
+    };
+    (r + m, g + m, b + m)
+}
+
+// ── Pop-ups ───────────────────────────────────────────────────────────────────
 /// Pill in the top left: icon, value, and a slim bar showing `frac`
 fn draw_osd(
     ctx: &egui::Context,
@@ -3320,7 +3346,7 @@ fn draw_speed_menu(app: &mut FluentMediaPlayer, ctx: &egui::Context) {
     }
     let id = egui::Id::new("speed_menu");
     let mut picked = None;
-    let selected = app.accent.gamma_multiply(0.5);
+    let selected = app.accent.gamma_multiply(0.42);
     egui::Area::new(id).order(egui::Order::Foreground).fixed_pos(rect.min).show(ctx, |ui| {
         picked = draw_menu_rows(ui, rect, &rows, None, Some(selected), MenuSize::COMPACT).0;
     });
