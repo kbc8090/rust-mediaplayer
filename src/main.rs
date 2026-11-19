@@ -277,12 +277,12 @@ const MORE_POPUP: &str = "more_popup";
 const MENU_X: f32 = 8.0 + BTN_BOX / 2.0;
 const MENU_Y: f32 = 7.0 + BTN_BOX / 2.0;
 
-/// The pop-up in the top right after seeking with the keys (accumulated amount)
-/// or the mouse (seek bar dragged from this time)
+/// The pop-up in the top right after seeking with the arrow keys (the amount,
+/// adding up quick repeats). Seeking with the mouse doesn't show it: the seek bar's
+/// time preview and thumbnail already show where you are.
 #[derive(Clone, Copy)]
 enum SeekOsd {
     Step(f64),
-    Drag(f64),
 }
 /// Volume normalizer: FFmpeg's "dynamic audio normalizer" (built into mpv). It looks
 /// ~1 s ahead and smoothly raises quiet passages / lowers loud ones, so dialogue and
@@ -925,7 +925,7 @@ impl FluentMediaPlayer {
         self.seek_to(new_pos);
     }
 
-    /// Skip with the keys / taskbar buttons, and show "+10 s" (adding up quick repeats
+    /// Skip with the keys / taskbar buttons, and show "+5 s" (adding up quick repeats
     /// in the same direction)
     fn step(&mut self, secs: f64) {
         if !self.has_file {
@@ -1333,8 +1333,8 @@ impl eframe::App for FluentMediaPlayer {
             if is_media_file(s) || is_playlist_file(s) { self.open_file(s); }
         }
         if inp.space { self.toggle_play_pause(); }
-        if inp.right { self.step(10.0); }
-        if inp.left  { self.step(-10.0); }
+        if inp.right { self.step(5.0); }
+        if inp.left  { self.step(-5.0); }
         if inp.up    { self.nudge_volume(5.0); }
         if inp.down  { self.nudge_volume(-5.0); }
         if inp.m     { let m = !self.muted; self.set_mute(m); self.volume_osd = Some(std::time::Instant::now()); self.seek_osd = None; }
@@ -2050,13 +2050,6 @@ fn draw_bottom_bar(app: &mut FluentMediaPlayer, ctx: &egui::Context, t: f32) {
             if dragging {
                 if let Some(pos) = seek.interact_pointer_pos() {
                     let f = frac_at(pos.x);
-                    // Seek pop-up: remembers where the drag started
-                    let from = match (app.drag_frac, app.seek_osd) {
-                        (Some(_), Some((_, SeekOsd::Drag(from)))) => from,
-                        _ => app.time_pos,
-                    };
-                    app.seek_osd = Some((std::time::Instant::now(), SeekOsd::Drag(from)));
-                    app.volume_osd = None;
                     app.drag_frac = Some(f);
                     if app.duration > 0.0 { app.seek_to(f as f64 * app.duration); }
                 }
@@ -2599,8 +2592,7 @@ fn draw_volume_osd(ctx: &egui::Context, volume: f64, muted: bool, accent: Color3
     draw_osd(ctx, &|p, c, col| icon_volume(p, c, col, volume, muted), &label, frac, accent, alpha, fullscreen);
 }
 
-/// "⏩ +10 s" after the arrow keys, or "⏩ 12:34" (the new time) while dragging the
-/// seek bar; the bar shows the position in the video
+/// "⏩ +5 s" after the arrow keys; the bar shows the position in the video
 fn draw_seek_osd(ctx: &egui::Context, kind: SeekOsd, target: f64, duration: f64, accent: Color32, alpha: f32, fullscreen: bool) {
     let (forward, label) = match kind {
         SeekOsd::Step(secs) => {
@@ -2608,7 +2600,6 @@ fn draw_seek_osd(ctx: &egui::Context, kind: SeekOsd, target: f64, duration: f64,
             let a = secs.abs();
             (secs >= 0.0, if a < 60.0 { format!("{sign}{} s", a.round()) } else { format!("{sign}{}", fmt_time(a)) })
         }
-        SeekOsd::Drag(from) => (target >= from, fmt_time(target)),
     };
     let frac = if duration > 0.0 { (target / duration) as f32 } else { 0.0 };
     draw_osd(ctx, &|p, c, col| icon_seek(p, c, col, forward), &label, frac, accent, alpha, fullscreen);
@@ -2634,7 +2625,7 @@ fn icon_seek(p: &egui::Painter, c: Pos2, col: Color32, forward: bool) {
 /// Keys (each drawn as a key cap) and what they do
 const SHORTCUTS: &[(&[&str], &str)] = &[
     (&["Space"], "Play / pause"),
-    (&["\u{2190}", "\u{2192}"], "Back / forward 10 seconds"),
+    (&["\u{2190}", "\u{2192}"], "Back / forward 5 seconds"),
     (&["D"], "Previous frame"),
     (&["F"], "Next frame"),
     (&["\u{2191}", "\u{2193}"], "Volume up / down"),
