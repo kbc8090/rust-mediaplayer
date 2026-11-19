@@ -283,6 +283,8 @@ const BTN_BOX: f32 = 28.0;
 const BTN_STEP: f32 = 32.0;
 /// Volume slider track length
 const VOL_W: f32 = 90.0;
+/// Space between the volume button and the start of the slider
+const VOL_GAP: f32 = 7.0;
 const WIN_BTN_W: f32 = 46.0;
 const WIN_BTN_H: f32 = 34.0;
 /// Playback speeds in the speed menu
@@ -2463,7 +2465,8 @@ fn draw_bottom_bar(app: &mut FluentMediaPlayer, ctx: &egui::Context, t: f32) {
 
             if let Some(vl) = lay.vol_x {
             let vw = VOL_W;
-            let vr = Rect::from_min_max(pos2(vl - 8.0, row_y - 12.0), pos2(vl + vw + 8.0, row_y + 12.0));
+            // (its grab area stops where the volume button's starts)
+            let vr = Rect::from_min_max(pos2(vl - VOL_GAP, row_y - 12.0), pos2(vl + vw + 8.0, row_y + 12.0));
             let vresp = ui.interact(vr, ui.id().with("vol"), Sense::click_and_drag());
             if vresp.is_pointer_button_down_on() || vresp.dragged() {
                 if let Some(pos) = vresp.interact_pointer_pos() {
@@ -2575,7 +2578,7 @@ fn row_layout(left: f32, right: f32, time_w: f32) -> RowLayout {
     let fits = |mute: f32| mute - half >= time_end + 14.0;
     let with_slider = |first: f32| {
         let vol_x = first - half - 12.0 - VOL_W;
-        (vol_x - 14.0 - half, vol_x) // room for the knob at 0 %
+        (vol_x - VOL_GAP - half, vol_x) // just room for the knob at 0 %
     };
     let (mute, vol_x, rotate, mirror) = {
         let (m, v) = with_slider(rotate);
@@ -2813,9 +2816,12 @@ fn draw_osd(
     icon(&p, pos2(rect.left() + 26.0, rect.center().y - 3.0), white);
     p.text(pos2(rect.right() - 16.0, rect.center().y - 3.0), Align2::RIGHT_CENTER, label, font, white);
 
+    // 4 px tall and lined up with whole screen pixels, so its round ends show
+    let ppp = ctx.pixels_per_point();
+    let snap = |v: f32| (v * ppp).round() / ppp;
     let bar = Rect::from_min_max(
-        pos2(rect.left() + 14.0, rect.bottom() - 9.0),
-        pos2(rect.right() - 14.0, rect.bottom() - 6.0),
+        pos2(snap(rect.left() + 14.0), snap(rect.bottom() - 10.0)),
+        pos2(snap(rect.right() - 14.0), snap(rect.bottom() - 6.0)),
     );
     pill(&p, bar, VOL_TRACK.gamma_multiply(alpha * 0.6));
     pill(
