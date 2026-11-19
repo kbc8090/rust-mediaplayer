@@ -432,6 +432,9 @@ struct FluentMediaPlayer {
     main_menu: bool,
     /// The keyboard shortcuts panel is open
     show_keys: bool,
+    /// Open submenu of the main menu (and its row), and the row hovered (since when)
+    menu_sub: Option<(&'static str, Rect)>,
+    menu_hover: Option<(&'static str, std::time::Instant)>,
     menu_anchor: Rect,
     /// Previous frame, for moving the time display on smoothly
     last_tick: std::time::Instant,
@@ -645,6 +648,8 @@ impl FluentMediaPlayer {
             snap_eof: false,
             main_menu: false,
             show_keys: false,
+            menu_sub: None,
+            menu_hover: None,
             menu_anchor: Rect::NOTHING,
             last_tick: std::time::Instant::now(),
             scan_gen: 0,
@@ -2992,7 +2997,8 @@ fn draw_shortcuts(app: &mut FluentMediaPlayer, ctx: &egui::Context) {
 // ── Main menu (top left) ──────────────────────────────────────────────────────
 enum MenuRow {
     Item { key: &'static str, label: &'static str, hint: Option<&'static str>, mark: Mark },
-    Header(&'static str),
+    /// Opens a submenu to the right; `hint` is the current choice, shown at the right
+    Sub { key: &'static str, label: &'static str, hint: &'static str },
     Sep,
 }
 
@@ -3011,17 +3017,124 @@ const SORT_CHOICES: [(SortBy, &str); 4] = [
     (SortBy::Size, "Size"),
 ];
 
+/// "Ascending" / "Descending" in words that fit the sort
+fn order_labels(by: SortBy) -> (&'static str, &'static str) {
+    match by {
+        SortBy::Name => ("A to Z", "Z to A"),
+        SortBy::Size => ("Smallest first", "Largest first"),
+        SortBy::Modified | SortBy::Created => ("Oldest first", "Newest first"),
+    }
+}
+
+const MENU_ITEM_H: f32 = 28.0;
+const MENU_PAD: f32 = 3.0;
+const MENU_SEP_H: f32 = 7.0;
+/// Hovering a row this long opens its submenu (or closes another one)
+const SUBMENU_DELAY: f32 = 0.3;
+
+fn menu_row_h(r: &MenuRow) -> f32 {
+    match r {
+        MenuRow::Sep => MENU_SEP_H,
+        _ => MENU_ITEM_H,
+    }
+}
+
+/// Glass panel with rows; returns (row picked, hovered row key, rect of each Sub row)
+fn draw_menu_rows(
+    ui: &mut egui::Ui,
+    rect: Rect,
+    rows: &[MenuRow],
+    sub_open: Option<&'static str>,
+) -> (Option<&'static str>, Option<&'static str>, Vec<(&'static str, Rect)>) {
+    // The menu's own background swallows clicks (so they don't reach the video)
+    ui.allocate_rect(rect, Sense::click_and_drag());
+    let p = ui.painter().clone();
+    let r = 8.0;
+    glass::shadow(&p, rect, r, 1.0);
+    glass::fill(&p, rect, r, Color32::from_rgb(44, 44, 44), 1.0);
+    p.rect_stroke(rect.shrink(0.5), r, Stroke::new(1.0_f32, glass::edge(Color32::from_rgba_premultiplied(30, 30, 30, 30))));
+
+    let text = Color32::from_rgb(240, 240, 240);
+    let dim = Color32::from_rgb(160, 160, 160);
+    let font = FontId::proportional(14.5);
+    let text_x = rect.left() + MENU_PAD + 28.0;
+    let mark_x = rect.left() + MENU_PAD + 14.0;
+    let (mut picked, mut hovered, mut subs) = (None, None, Vec::new());
+
+    let mut top = rect.top() + MENU_PAD;
+    for row in rows {
+        let h = menu_row_h(row);
+        let cy = top + h / 2.0;
+        let ir = Rect::from_min_size(pos2(rect.left() + MENU_PAD, top), vec2(rect.width() - 2.0 * MENU_PAD, h));
+        match row {
+            MenuRow::Sep => {
+                p.line_segment(
+                    [pos2(rect.left() + 1.0, cy), pos2(rect.right() - 1.0, cy)],
+                    Stroke::new(1.0_f32, Color32::from_rgba_premultiplied(26, 26, 26, 26)),
+                );
+            }
+            MenuRow::Item { key, label, hint, mark } => {
+                let resp = ui.interact(ir, ui.id().with(*key), Sense::click_and_drag());
+                if let Some(c) = adjust::state_fill(&resp) {
+                    p.rect_filled(ir, 4.0, c);
+                }
+                match mark {
+                    Mark::Check(true) => {
+                        poly(&p, pos2(mark_x, cy), &[(-4.5, 0.0), (-1.5, 3.2), (4.5, -3.5)], text, 1.5);
+                    }
+                    Mark::Dot(true) => {
+                        p.circle_filled(pos2(mark_x, cy), 3.0, text);
+                    }
+                    _ => {}
+                }
+                p.text(pos2(text_x, cy), Align2::LEFT_CENTER, *label, font.clone(), text);
+                if let Some(hint) = hint {
+                    p.text(pos2(rect.right() - MENU_PAD - 10.0, cy), Align2::RIGHT_CENTER, *hint, FontId::proportional(13.5), dim);
+                }
+                if resp.hovered() {
+                    hovered = Some(*key);
+                }
+                if resp.activated() {
+                    picked = Some(*key);
+                }
+            }
+            MenuRow::Sub { key, label, hint } => {
+                let resp = ui.interact(ir, ui.id().with(*key), Sense::click_and_drag());
+                // Highlighted while hovered, or while its submenu is open
+                let fill = adjust::state_fill(&resp).or((sub_open == Some(*key)).then_some(adjust::HOVER));
+                if let Some(c) = fill {
+                    p.rect_filled(ir, 4.0, c);
+                }
+                p.text(pos2(text_x, cy), Align2::LEFT_CENTER, *label, font.clone(), text);
+                let c = pos2(rect.right() - MENU_PAD - 13.0, cy);
+                p.line_segment([c + vec2(-2.5, -4.5), c + vec2(2.0, 0.0)], Stroke::new(1.3_f32, text));
+                p.line_segment([c + vec2(2.0, 0.0), c + vec2(-2.5, 4.5)], Stroke::new(1.3_f32, text));
+                p.text(pos2(c.x - 14.0, cy), Align2::RIGHT_CENTER, *hint, FontId::proportional(13.5), dim);
+                if resp.hovered() {
+                    hovered = Some(*key);
+                }
+                if resp.activated() {
+                    picked = Some(*key);
+                }
+                subs.push((*key, ir));
+            }
+        }
+        top += h;
+    }
+    (picked, hovered, subs)
+}
+
 fn draw_main_menu(app: &mut FluentMediaPlayer, ctx: &egui::Context) {
     if !app.main_menu {
+        app.menu_sub = None;
+        app.menu_hover = None;
         return;
     }
-    const W: f32 = 240.0;
-    const ITEM_H: f32 = 28.0;
-    const HEAD_H: f32 = 24.0;
-    const PAD: f32 = 3.0;
-    const SEP_H: f32 = 7.0;
+    const W: f32 = 272.0;
+    const SUB_W: f32 = 190.0;
 
-    let mut rows = vec![
+    let sort_label = SORT_CHOICES.iter().find(|(by, _)| *by == app.sort_by).map_or("Name", |(_, l)| *l);
+    let rows = vec![
         MenuRow::Item { key: "open", label: "Open file\u{2026}", hint: Some("Ctrl+O"), mark: Mark::None },
         MenuRow::Sep,
         MenuRow::Item { key: "adjust", label: "Picture & Sound", hint: Some("E"), mark: Mark::None },
@@ -3031,106 +3144,106 @@ fn draw_main_menu(app: &mut FluentMediaPlayer, ctx: &egui::Context) {
         MenuRow::Item { key: "glass", label: "Frosted glass menus", hint: None, mark: Mark::Check(app.glass) },
         MenuRow::Sep,
         MenuRow::Item { key: "autoplay", label: "Auto-play next file in folder", hint: None, mark: Mark::Check(app.autoplay) },
-        MenuRow::Header("Previous / next order"),
+        MenuRow::Sub { key: "sort", label: "Sort folder by", hint: sort_label },
+        MenuRow::Sep,
+        MenuRow::Item { key: "keys", label: "Keyboard shortcuts", hint: None, mark: Mark::None },
+        MenuRow::Item { key: "quit", label: "Quit", hint: Some("Alt+F4"), mark: Mark::None },
     ];
-    for (by, label) in SORT_CHOICES {
-        rows.push(MenuRow::Item { key: label, label, hint: None, mark: Mark::Dot(app.sort_by == by) });
-    }
-    rows.push(MenuRow::Sep);
-    rows.push(MenuRow::Item { key: "asc", label: "Ascending", hint: None, mark: Mark::Dot(!app.sort_desc) });
-    rows.push(MenuRow::Item { key: "desc", label: "Descending", hint: None, mark: Mark::Dot(app.sort_desc) });
-    rows.push(MenuRow::Sep);
-    rows.push(MenuRow::Item { key: "keys", label: "Keyboard shortcuts", hint: None, mark: Mark::None });
-    rows.push(MenuRow::Item { key: "quit", label: "Quit", hint: Some("Alt+F4"), mark: Mark::None });
-    let row_h = |r: &MenuRow| match r {
-        MenuRow::Item { .. } => ITEM_H,
-        MenuRow::Header(_) => HEAD_H,
-        MenuRow::Sep => SEP_H,
-    };
+    let (asc, desc) = order_labels(app.sort_by);
+    let mut sub_rows: Vec<MenuRow> = SORT_CHOICES
+        .iter()
+        .map(|(by, label)| MenuRow::Item { key: label, label, hint: None, mark: Mark::Dot(app.sort_by == *by) })
+        .collect();
+    sub_rows.push(MenuRow::Sep);
+    sub_rows.push(MenuRow::Item { key: "asc", label: asc, hint: None, mark: Mark::Dot(!app.sort_desc) });
+    sub_rows.push(MenuRow::Item { key: "desc", label: desc, hint: None, mark: Mark::Dot(app.sort_desc) });
 
+    let screen = ctx.screen_rect();
     let box_left = MENU_X - BTN_BOX / 2.0;
     let rect = Rect::from_min_size(
         pos2(box_left, MENU_Y + BTN_BOX / 2.0 + 4.0),
-        vec2(W, PAD * 2.0 + rows.iter().map(row_h).sum::<f32>()),
+        vec2(W, MENU_PAD * 2.0 + rows.iter().map(menu_row_h).sum::<f32>()),
     );
+    // The submenu sits beside its row (last frame's position of the row), or over
+    // the menu's right side when the window is too narrow
+    let sub_h = MENU_PAD * 2.0 + sub_rows.iter().map(menu_row_h).sum::<f32>();
+    let sub_rect = app.menu_sub.map(|(_, row)| {
+        let x = if rect.right() - 2.0 + SUB_W <= screen.right() - 4.0 {
+            rect.right() - 2.0
+        } else {
+            (screen.right() - 4.0 - SUB_W).max(screen.left() + 4.0)
+        };
+        let y = (row.top() - MENU_PAD).min(screen.bottom() - 4.0 - sub_h).max(screen.top() + 4.0);
+        Rect::from_min_size(pos2(x, y), vec2(SUB_W, sub_h))
+    });
 
-    // Any press outside the menu (and its button, which toggles it) closes it
+    // Any press outside the menus (and the menu button, which toggles it) closes it
     let anchor = app.menu_anchor;
     let pressed_outside = ctx.input(|i| {
         i.pointer.any_pressed()
-            && i.pointer.press_origin().map_or(false, |o| !rect.contains(o) && !anchor.contains(o))
+            && i.pointer.press_origin().map_or(false, |o| {
+                !rect.contains(o) && !anchor.contains(o) && !sub_rect.map_or(false, |s| s.contains(o))
+            })
     });
     if pressed_outside {
         app.main_menu = false;
+        app.menu_sub = None;
         return;
     }
 
     let id = egui::Id::new("main_menu");
-    let mut picked: Option<&'static str> = None;
-    egui::Area::new(id)
-        .order(egui::Order::Foreground)
-        .fixed_pos(rect.min)
-        .show(ctx, |ui| {
-            // The menu's own background swallows clicks (so they don't reach the video)
-            ui.allocate_rect(rect, Sense::click_and_drag());
-            let p = ui.painter().clone();
-            let r = 8.0;
-            glass::shadow(&p, rect, r, 1.0);
-            glass::fill(&p, rect, r, Color32::from_rgb(44, 44, 44), 1.0);
-            p.rect_stroke(rect.shrink(0.5), r, Stroke::new(1.0_f32, glass::edge(Color32::from_rgba_premultiplied(30, 30, 30, 30))));
-
-            let text = Color32::from_rgb(240, 240, 240);
-            let dim = Color32::from_rgb(160, 160, 160);
-            let font = FontId::proportional(14.5);
-            let text_x = rect.left() + PAD + 28.0;
-            let mark_x = rect.left() + PAD + 14.0;
-
-            let mut top = rect.top() + PAD;
-            for row in &rows {
-                let h = row_h(row);
-                let cy = top + h / 2.0;
-                match row {
-                    MenuRow::Sep => {
-                        p.line_segment(
-                            [pos2(rect.left() + 1.0, cy), pos2(rect.right() - 1.0, cy)],
-                            Stroke::new(1.0_f32, Color32::from_rgba_premultiplied(26, 26, 26, 26)),
-                        );
-                    }
-                    MenuRow::Header(label) => {
-                        p.text(pos2(text_x, cy + 2.0), Align2::LEFT_CENTER, *label, FontId::proportional(13.0), dim);
-                    }
-                    MenuRow::Item { key, label, hint, mark } => {
-                        let ir = Rect::from_min_size(pos2(rect.left() + PAD, top), vec2(W - 2.0 * PAD, h));
-                        let resp = ui.interact(ir, ui.id().with(*key), Sense::click_and_drag());
-                        if let Some(c) = adjust::state_fill(&resp) {
-                            p.rect_filled(ir, 4.0, c);
-                        }
-                        match mark {
-                            Mark::Check(true) => {
-                                poly(&p, pos2(mark_x, cy), &[(-4.5, 0.0), (-1.5, 3.2), (4.5, -3.5)], text, 1.5);
-                            }
-                            Mark::Dot(true) => {
-                                p.circle_filled(pos2(mark_x, cy), 3.0, text);
-                            }
-                            _ => {}
-                        }
-                        p.text(pos2(text_x, cy), Align2::LEFT_CENTER, *label, font.clone(), text);
-                        if let Some(hint) = hint {
-                            p.text(pos2(rect.right() - PAD - 10.0, cy), Align2::RIGHT_CENTER, *hint, FontId::proportional(13.5), dim);
-                        }
-                        if resp.activated() {
-                            picked = Some(key);
-                        }
-                    }
-                }
-                top += h;
-            }
-        });
+    let sub_open = app.menu_sub.map(|(k, _)| k);
+    let mut out = (None, None, Vec::new());
+    egui::Area::new(id).order(egui::Order::Foreground).fixed_pos(rect.min).show(ctx, |ui| {
+        out = draw_menu_rows(ui, rect, &rows, sub_open);
+    });
     ctx.move_to_top(egui::LayerId::new(egui::Order::Foreground, id));
+    let (mut picked, hovered, subs) = out;
+
+    let mut sub_picked = None;
+    if let Some(sr) = sub_rect {
+        let sid = egui::Id::new("main_menu_sub");
+        egui::Area::new(sid).order(egui::Order::Foreground).fixed_pos(sr.min).show(ctx, |ui| {
+            sub_picked = draw_menu_rows(ui, sr, &sub_rows, None).0;
+        });
+        ctx.move_to_top(egui::LayerId::new(egui::Order::Foreground, sid));
+    }
+
+    // Submenu opening / closing, with a short delay like Windows' menus (so the
+    // pointer can cross other rows on its way into the submenu)
+    let now = std::time::Instant::now();
+    if hovered != app.menu_hover.map(|(k, _)| k) {
+        app.menu_hover = hovered.map(|k| (k, now));
+    }
+    let rested = app.menu_hover.map_or(false, |(_, t0)| t0.elapsed().as_secs_f32() >= SUBMENU_DELAY);
+    if app.menu_hover.is_some() && !rested {
+        ctx.request_repaint_after(std::time::Duration::from_millis(60));
+    }
+    let row_of = |key: &str| subs.iter().find(|(k, _)| *k == key).map(|(_, r)| *r);
+    if picked == Some("sort") {
+        // Clicking the row opens / closes it straight away
+        app.menu_sub = if app.menu_sub.is_some() { None } else { row_of("sort").map(|r| ("sort", r)) };
+        picked = None;
+    } else if let (true, Some((key, _))) = (rested, app.menu_hover) {
+        if key == "sort" {
+            if app.menu_sub.is_none() {
+                app.menu_sub = row_of("sort").map(|r| ("sort", r));
+            }
+        } else {
+            app.menu_sub = None;
+        }
+    }
+    if app.menu_sub.is_some() && sub_rect.is_none() {
+        ctx.request_repaint();
+    }
+    if sub_picked.is_some() {
+        picked = sub_picked;
+    }
 
     // Any choice closes the menu
     if picked.is_some() {
         app.main_menu = false;
+        app.menu_sub = None;
     }
     match picked {
         Some("open") => app.show_open_dialog(),

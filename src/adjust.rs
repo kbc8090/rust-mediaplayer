@@ -412,13 +412,13 @@ fn cap_sized(ui: &mut egui::Ui, p: &egui::Painter, rect: Rect, label: &str, id: 
         CAP
     };
     p.rect_filled(rect, 4.0, fill);
-    if !pressed {
-        p.rect_filled(
-            Rect::from_min_max(pos2(rect.left() + 1.0, rect.bottom() - 2.0), pos2(rect.right() - 1.0, rect.bottom())),
-            2.0,
-            CAP_EDGE,
-        );
-    }
+    // (the darker bottom edge stays when pressed, so the cap keeps its size; only
+    // the label sinks a little)
+    p.rect_filled(
+        Rect::from_min_max(pos2(rect.left() + 1.0, rect.bottom() - 2.0), pos2(rect.right() - 1.0, rect.bottom())),
+        2.0,
+        CAP_EDGE,
+    );
     let off = if pressed { 0.5 } else { -0.5 };
     p.text(rect.center() + vec2(0.0, off), Align2::CENTER_CENTER, label, semibold(size), TEXT);
     resp.clicked()
