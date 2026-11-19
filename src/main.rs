@@ -277,13 +277,18 @@ const MORE_POPUP: &str = "more_popup";
 const MENU_X: f32 = 8.0 + BTN_BOX / 2.0;
 const MENU_Y: f32 = 7.0 + BTN_BOX / 2.0;
 
-/// The pop-up in the top right after seeking with the arrow keys (the amount,
+/// The pop-up in the top left after seeking with the arrow keys (the amount,
 /// adding up quick repeats). Seeking with the mouse doesn't show it: the seek bar's
 /// time preview and thumbnail already show where you are.
 #[derive(Clone, Copy)]
 enum SeekOsd {
     Step(f64),
 }
+/// Volume / seek pop-up position (top left, below the menu button), and the info
+/// overlay (I) below where the pop-up appears
+const OSD_LEFT: f32 = MENU_X - BTN_BOX / 2.0;
+const OSD_TOP: f32 = MENU_Y + BTN_BOX / 2.0 + 11.0;
+const INFO_TOP: f32 = OSD_TOP + 42.0 + 10.0;
 /// Volume normalizer: FFmpeg's "dynamic audio normalizer" (built into mpv). It looks
 /// ~1 s ahead and smoothly raises quiet passages / lowers loud ones, so dialogue and
 /// explosions (or songs from different albums) come out at a more even level.
@@ -387,7 +392,7 @@ struct FluentMediaPlayer {
     win_state: WinState,
     win_saved: WinState,
     win_changed: std::time::Instant,
-    /// Seek pop-up (top right), and when it was last refreshed
+    /// Seek pop-up (top left), and when it was last refreshed
     seek_osd: Option<(std::time::Instant, SeekOsd)>,
     /// Chapters of the current file (start time, title)
     chapters: Arc<Vec<(f64, String)>>,
@@ -920,21 +925,28 @@ impl FluentMediaPlayer {
         self.load_entry(&path);
     }
 
-    fn skip(&mut self, secs: f64) {
-        let new_pos = (self.time_pos + secs).clamp(0.0, self.duration);
-        self.seek_to(new_pos);
-    }
-
-    /// Skip with the keys / taskbar buttons, and show "+5 s" (adding up quick repeats
+    /// Skip with the keys / taskbar buttons, and show "+5 sec" (adding up quick repeats
     /// in the same direction)
     fn step(&mut self, secs: f64) {
         if !self.has_file {
             return;
         }
-        self.skip(secs);
+        // Count only what the jump really moved: near the start or end of the
+        // video a 5 sec step can be shorter, and at the very start / end nothing
+        let from = self.time_pos;
+        let to = (from + secs).clamp(0.0, self.duration.max(0.0));
+        let moved = to - from;
+        if moved.abs() < 0.05 {
+            // Already at the start / end: just keep the pop-up showing a moment longer
+            if let Some((t0, _)) = self.seek_osd.as_mut() {
+                *t0 = std::time::Instant::now();
+            }
+            return;
+        }
+        self.seek_to(to);
         let total = match self.seek_osd {
-            Some((t0, SeekOsd::Step(prev))) if t0.elapsed().as_secs_f32() < 1.2 && prev.signum() == secs.signum() => prev + secs,
-            _ => secs,
+            Some((t0, SeekOsd::Step(prev))) if t0.elapsed().as_secs_f32() < 1.2 && prev.signum() == moved.signum() => prev + moved,
+            _ => moved,
         };
         self.seek_osd = Some((std::time::Instant::now(), SeekOsd::Step(total)));
         self.volume_osd = None;
@@ -1445,14 +1457,14 @@ impl eframe::App for FluentMediaPlayer {
             ctx.set_cursor_icon(icon);
         }
 
-        // Volume / seek pop-up (top right) for a moment after a change
+        // Volume / seek pop-up (top left) for a moment after a change
         let osd_alpha = |t0: std::time::Instant| {
             let age = t0.elapsed().as_secs_f32();
             (age < 1.6).then(|| if age > 1.2 { 1.0 - (age - 1.2) / 0.4 } else { 1.0 })
         };
         if let Some(t0) = self.volume_osd {
             if let Some(alpha) = osd_alpha(t0) {
-                draw_volume_osd(ctx, self.volume, self.muted, self.accent, alpha, self.is_fullscreen);
+                draw_volume_osd(ctx, self.volume, self.muted, self.accent, alpha);
                 ctx.request_repaint_after(std::time::Duration::from_millis(30));
             } else {
                 self.volume_osd = None;
@@ -1461,7 +1473,7 @@ impl eframe::App for FluentMediaPlayer {
         if let Some((t0, kind)) = self.seek_osd {
             if let Some(alpha) = osd_alpha(t0) {
                 let target = self.drag_frac.map_or(self.time_pos, |f| f as f64 * self.duration);
-                draw_seek_osd(ctx, kind, target, self.duration, self.accent, alpha, self.is_fullscreen);
+                draw_seek_osd(ctx, kind, target, self.duration, self.accent, alpha);
                 ctx.request_repaint_after(std::time::Duration::from_millis(30));
             } else {
                 self.seek_osd = None;
@@ -2549,7 +2561,7 @@ fn hsv_to_rgb(h: f32, s: f32, v: f32) -> (f32, f32, f32) {
 }
 
 // ── Pop-ups ───────────────────────────────────────────────────────────────────
-/// Pill in the top right: icon, value, and a slim bar showing `frac`
+/// Pill in the top left: icon, value, and a slim bar showing `frac`
 fn draw_osd(
     ctx: &egui::Context,
     icon: &dyn Fn(&egui::Painter, Pos2, Color32),
@@ -2557,16 +2569,14 @@ fn draw_osd(
     frac: f32,
     accent: Color32,
     alpha: f32,
-    fullscreen: bool,
 ) {
     let screen = ctx.screen_rect();
     let p = ctx.layer_painter(egui::LayerId::new(egui::Order::Tooltip, egui::Id::new("osd")));
     let font = FontId::new(17.0, FontFamily::Name("semibold".into()));
     let label_w = p.layout_no_wrap(label.to_owned(), font.clone(), Color32::WHITE).size().x;
-    // Sit below the window buttons (they aren't shown in fullscreen)
-    let top = if fullscreen { 16.0 } else { WIN_BTN_H + 12.0 };
+    // Top left, just below the menu button and lined up with it
     let size = vec2((label_w + 66.0).max(116.0).round(), 42.0);
-    let rect = Rect::from_min_size(pos2(screen.right() - 16.0 - size.x, screen.top() + top), size);
+    let rect = Rect::from_min_size(pos2(screen.left() + OSD_LEFT, screen.top() + OSD_TOP), size);
     p.rect_filled(rect, 8.0, Color32::from_rgba_unmultiplied(24, 24, 24, (225.0 * alpha) as u8));
 
     let white = Color32::WHITE.gamma_multiply(alpha);
@@ -2586,23 +2596,23 @@ fn draw_osd(
 }
 
 /// "🔊 55 %" with the volume level
-fn draw_volume_osd(ctx: &egui::Context, volume: f64, muted: bool, accent: Color32, alpha: f32, fullscreen: bool) {
+fn draw_volume_osd(ctx: &egui::Context, volume: f64, muted: bool, accent: Color32, alpha: f32) {
     let label = if muted { "Muted".to_owned() } else { format!("{}%", volume.round() as i32) };
     let frac = if muted { 0.0 } else { (volume / VOL_MAX) as f32 };
-    draw_osd(ctx, &|p, c, col| icon_volume(p, c, col, volume, muted), &label, frac, accent, alpha, fullscreen);
+    draw_osd(ctx, &|p, c, col| icon_volume(p, c, col, volume, muted), &label, frac, accent, alpha);
 }
 
-/// "⏩ +5 s" after the arrow keys; the bar shows the position in the video
-fn draw_seek_osd(ctx: &egui::Context, kind: SeekOsd, target: f64, duration: f64, accent: Color32, alpha: f32, fullscreen: bool) {
+/// "⏩ +5 sec" after the arrow keys; the bar shows the position in the video
+fn draw_seek_osd(ctx: &egui::Context, kind: SeekOsd, target: f64, duration: f64, accent: Color32, alpha: f32) {
     let (forward, label) = match kind {
         SeekOsd::Step(secs) => {
             let sign = if secs < 0.0 { "\u{2212}" } else { "+" };
             let a = secs.abs();
-            (secs >= 0.0, if a < 60.0 { format!("{sign}{} s", a.round()) } else { format!("{sign}{}", fmt_time(a)) })
+            (secs >= 0.0, if a < 60.0 { format!("{sign}{} sec", a.round()) } else { format!("{sign}{}", fmt_time(a)) })
         }
     };
     let frac = if duration > 0.0 { (target / duration) as f32 } else { 0.0 };
-    draw_osd(ctx, &|p, c, col| icon_seek(p, c, col, forward), &label, frac, accent, alpha, fullscreen);
+    draw_osd(ctx, &|p, c, col| icon_seek(p, c, col, forward), &label, frac, accent, alpha);
 }
 
 /// Fast-forward (two triangles), mirrored for rewind
@@ -2926,7 +2936,7 @@ fn draw_info_overlay(ctx: &egui::Context, lines: &[String]) {
         .fold(0.0_f32, f32::max);
     let screen = ctx.screen_rect();
     let rect = Rect::from_min_size(
-        pos2(screen.left() + 20.0, screen.top() + 64.0),
+        pos2(screen.left() + OSD_LEFT, screen.top() + INFO_TOP),
         vec2(text_w + 28.0, lines.len() as f32 * line_h + 16.0),
     );
     p.rect_filled(rect, 8.0, Color32::from_rgba_unmultiplied(24, 24, 24, 215));
