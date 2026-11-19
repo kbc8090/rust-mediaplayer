@@ -695,11 +695,14 @@ pub fn draw_panel(ctx: &egui::Context, ui_state: &mut AdjustUi, a: &mut Adjust, 
             let resp = ui.interact(tr, ui.id().with(("tab", i)), Sense::click_and_drag());
             let on = ui_state.tab == tab;
             if on {
-                // The selected tab: an accent shape with the tab drawn over it 2 px
-                // higher, leaving an accent edge along the bottom that follows the
-                // rounded corners up the sides
-                p.rect_filled(tr, 5.0, accent);
-                p.with_clip_rect(tr).rect_filled(tr.translate(vec2(0.0, -2.0)), 5.0, Color32::from_rgb(68, 68, 68));
+                // The selected tab: an accent shape (bottom half only, so none of
+                // it peeks out at the top corners) with the tab drawn over it 2 px
+                // shorter, leaving an accent edge along the bottom that follows the
+                // rounded corners up the sides. The top corners keep the same
+                // radius as the other tab.
+                let lower = Rect::from_min_max(pos2(tr.left() - 1.0, tr.center().y), pos2(tr.right() + 1.0, tr.bottom() + 1.0));
+                p.with_clip_rect(lower).rect_filled(tr, 5.0, accent);
+                p.rect_filled(Rect::from_min_max(tr.min, pos2(tr.right(), tr.bottom() - 2.0)), 5.0, Color32::from_rgb(68, 68, 68));
             } else {
                 let fill = state_fill(&resp).unwrap_or(Color32::from_rgba_premultiplied(8, 8, 8, 8));
                 p.rect_filled(tr, 5.0, fill);

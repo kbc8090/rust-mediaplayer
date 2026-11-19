@@ -1,7 +1,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use eframe::egui::{self, pos2, vec2, Align2, Color32, FontFamily, FontId, Pos2, Rect, Sense, Stroke};
-use libmpv2::{Mpv, render::{RenderContext, OpenGLInitParams, RenderParam, RenderParamApiType}};
+use libmpv2::{Mpv, render::{mpv_render_update, RenderContext, OpenGLInitParams, RenderParam, RenderParamApiType}};
+use egui_glow::glow::{self, HasContext};
 mod adjust;
 mod glass;
 mod mpv_link;
@@ -58,6 +59,89 @@ thread_local! {
     /// The most recent single render call, unsmoothed (for resize statistics)
     static RENDER_LAST_MS: std::cell::Cell<f32> = const { std::cell::Cell::new(0.0) };
     static TLS_RENDER_CTX: RefCell<Option<RenderContext<'static>>> = const { RefCell::new(None) };
+    /// The last video frame mpv drew, kept so it can be shown again without asking
+    /// mpv to redraw it (see `paint_video`)
+    static VIDEO_TARGET: RefCell<Option<VideoTarget>> = const { RefCell::new(None) };
+}
+
+/// Off-screen texture the video is drawn into. Allocated a little larger than the
+/// window, so it isn't remade on every step of a resize.
+struct VideoTarget {
+    fbo: glow::NativeFramebuffer,
+    tex: glow::NativeTexture,
+    w: i32,
+    h: i32,
+}
+
+/// Show the video in the window's (x, y, w, h) pixels.
+///
+/// mpv only draws a new picture when it has one: a new frame while playing, or a
+/// redraw it asks for (a picture setting changed while paused, say). Every other
+/// repaint of the window (the pointer moving over a paused video, menus, the
+/// controls fading) copies the last picture, which costs the GPU next to nothing.
+/// Before, every one of those repaints ran mpv's whole scaling pipeline again,
+/// which with a fast mouse meant hundreds of full redraws a second.
+unsafe fn paint_video(gl: &glow::Context, rc: &mut RenderContext<'static>, x: i32, y: i32, w: i32, h: i32) -> bool {
+    if w <= 0 || h <= 0 {
+        return false;
+    }
+    // Acknowledge mpv's update (its docs ask for this after every update callback);
+    // it says whether mpv has a new picture for us
+    let new_frame = rc.update().map_or(true, |f| f & mpv_render_update::Frame != 0);
+    VIDEO_TARGET.with(|t| {
+        let mut t = t.borrow_mut();
+        let mut fresh = false;
+        let fits = t.as_ref().map_or(false, |v| v.w >= w && v.h >= h && v.w <= w + 512 && v.h <= h + 512);
+        if !fits {
+            if let Some(old) = t.take() {
+                gl.delete_framebuffer(old.fbo);
+                gl.delete_texture(old.tex);
+            }
+            let (tw, th) = ((w + 255) / 256 * 256, (h + 255) / 256 * 256);
+            if let (Ok(tex), Ok(fbo)) = (gl.create_texture(), gl.create_framebuffer()) {
+                gl.bind_texture(glow::TEXTURE_2D, Some(tex));
+                gl.tex_image_2d(glow::TEXTURE_2D, 0, glow::RGBA8 as i32, tw, th, 0, glow::RGBA, glow::UNSIGNED_BYTE, None);
+                gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::NEAREST as i32);
+                gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, glow::NEAREST as i32);
+                gl.bind_texture(glow::TEXTURE_2D, None);
+                gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
+                gl.framebuffer_texture_2d(glow::FRAMEBUFFER, glow::COLOR_ATTACHMENT0, glow::TEXTURE_2D, Some(tex), 0);
+                let ok = gl.check_framebuffer_status(glow::FRAMEBUFFER) == glow::FRAMEBUFFER_COMPLETE;
+                gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+                if ok {
+                    *t = Some(VideoTarget { fbo, tex, w: tw, h: th });
+                    fresh = true;
+                } else {
+                    gl.delete_framebuffer(fbo);
+                    gl.delete_texture(tex);
+                }
+            }
+        }
+        // egui clips with the scissor test; it mustn't cut into mpv's drawing
+        // (egui switches it back on after this callback)
+        gl.disable(glow::SCISSOR_TEST);
+        let Some(v) = t.as_ref() else {
+            // No off-screen texture on this PC: draw straight into the window, as before
+            let _ = rc.render::<*mut std::os::raw::c_void>(0, w, h, true);
+            return true;
+        };
+        // The size is part of the picture too: a resize always redraws
+        let size_changed = VIDEO_SIZE.with(|s| s.replace((w, h)) != (w, h));
+        let drew = fresh || new_frame || size_changed;
+        if drew {
+            let _ = rc.render::<*mut std::os::raw::c_void>(v.fbo.0.get() as i32, w, h, true);
+        }
+        gl.bind_framebuffer(glow::READ_FRAMEBUFFER, Some(v.fbo));
+        gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, None);
+        gl.blit_framebuffer(0, 0, w, h, x, y, x + w, y + h, glow::COLOR_BUFFER_BIT, glow::NEAREST);
+        gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+        drew
+    })
+}
+
+thread_local! {
+    /// The size the cached video picture was drawn at
+    static VIDEO_SIZE: std::cell::Cell<(i32, i32)> = const { std::cell::Cell::new((0, 0)) };
 }
 
 /// End the process immediately, without running any DLL or runtime shutdown code.
@@ -1652,23 +1736,22 @@ impl eframe::App for FluentMediaPlayer {
                 } else if self.render_ctx_initialized {
                     ui.painter().add(egui::PaintCallback {
                         rect,
-                        callback: Arc::new(egui_glow::CallbackFn::new(move |info, _painter| {
+                        callback: Arc::new(egui_glow::CallbackFn::new(move |info, painter| {
                             // Render at the real pixel size so HiDPI scaling stays correct
                             let vp = info.viewport_in_pixels();
                             let started = std::time::Instant::now();
-                            TLS_RENDER_CTX.with(|c| {
-                                if let Some(rc) = c.borrow_mut().as_mut() {
-                                    // Acknowledge mpv's update first (its docs recommend calling
-                                    // this after every update callback)
-                                    let _ = rc.update();
-                                    let _ = rc.render::<*mut std::os::raw::c_void>(
-                                        0, vp.width_px, vp.height_px, true,
-                                    );
-                                }
+                            let drew = TLS_RENDER_CTX.with(|c| match c.borrow_mut().as_mut() {
+                                Some(rc) => unsafe {
+                                    paint_video(painter.gl(), rc, vp.left_px, vp.from_bottom_px, vp.width_px, vp.height_px)
+                                },
+                                None => false,
                             });
-                            let ms = started.elapsed().as_secs_f32() * 1000.0;
-                            RENDER_MS.with(|r| r.set(r.get() * 0.8 + ms * 0.2));
-                            RENDER_LAST_MS.with(|r| r.set(ms));
+                            // (timings only count real mpv draws, not copies of the last picture)
+                            if drew {
+                                let ms = started.elapsed().as_secs_f32() * 1000.0;
+                                RENDER_MS.with(|r| r.set(r.get() * 0.8 + ms * 0.2));
+                                RENDER_LAST_MS.with(|r| r.set(ms));
+                            }
                         })),
                     });
                 }
