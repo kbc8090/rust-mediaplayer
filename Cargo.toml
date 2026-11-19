@@ -9,7 +9,9 @@ path = "src/main.rs"
 
 [dependencies]
 # Activates eframe with the native OpenGL/Glow window management hooks
-eframe = { version = "0.27", features = ["glow"] }
+# (default features off: drops the screen-reader bridge and Linux-only window
+# backends the player doesn't use; "x11" only matters when checking on Linux)
+eframe = { version = "0.27", default-features = false, features = ["glow", "default_fonts", "x11"] }
 
 # Explicitly pull in egui_glow to get access to native canvas paint callbacks
 egui_glow = "0.27"
