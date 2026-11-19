@@ -1537,6 +1537,10 @@ impl eframe::App for FluentMediaPlayer {
             if frame.gl().is_some() {
                 self.thumbs.init_gl(ctx, gl_proc_address);
             }
+            // Videos only: music and pictures have no thumbnails to get ready
+            if matches!(media_kind(&self.current_file), Some(MediaKind::Video)) {
+                self.thumbs.warm(ctx, self.time_pos);
+            }
         }
 
         // Minimised (the taskbar timer still wakes us): nothing to draw

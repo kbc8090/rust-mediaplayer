@@ -104,10 +104,16 @@ fn run(mpv: Arc<Mutex<Mpv>>, rx: mpsc::Receiver<Job>, state: Arc<Mutex<Snapshot>
     // Chapters are re-read only when the file or the chapter count changes
     let mut chapter_key: (String, i64) = (String::new(), -1);
     let mut chapters: Arc<Vec<(f64, String)>> = Arc::new(Vec::new());
+    // Just after a file is opened, the snapshot is refreshed more often, so its
+    // length, chapters and picture size reach the UI without waiting a full tick
+    let mut quick_until: Option<Instant> = None;
     loop {
-        // Wait for work, or refresh the snapshot every 100 ms
+        // Wait for work, or refresh the snapshot every 100 ms (25 ms just after a
+        // file was opened)
+        let quick = quick_until.map_or(false, |t| Instant::now() < t);
+        let tick = Duration::from_millis(if quick { 25 } else { 100 });
         let mut jobs = Vec::new();
-        match rx.recv_timeout(Duration::from_millis(100)) {
+        match rx.recv_timeout(tick) {
             Ok(job) => jobs.push(job),
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => return,
@@ -133,6 +139,9 @@ fn run(mpv: Arc<Mutex<Mpv>>, rx: mpsc::Receiver<Job>, state: Arc<Mutex<Snapshot>
                     }
                 }
                 Job::Command(name, args) => {
+                    if name == "loadfile" {
+                        quick_until = Some(Instant::now() + Duration::from_millis(1500));
+                    }
                     let args: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
                     let _ = m.command(&name, &args);
                 }

@@ -5,11 +5,12 @@
 //! (to the nearest keyframe, which is quick), draws that frame small into an
 //! off-screen texture, and the texture is copied into the window above the seek bar.
 //!
-//! The thumbnail mpv is started the first time the seek bar is hovered, and a file is
-//! only opened in it once the pointer is over the seek bar (not when the file starts
-//! playing, so it never competes with the main player then, nor holds memory for
-//! files whose seek bar is never hovered). Like the main mpv it is only ever talked
-//! to through its own background thread (mpv_link.rs).
+//! The thumbnail mpv is started the first time the seek bar is hovered. From then on,
+//! each new file is also opened in it a moment after it starts playing (`warm`), so
+//! the first hover over its seek bar only has to seek, not open the file. (The short
+//! wait keeps it from competing with the main player while that one is starting.)
+//! Until thumbnails have been used once, nothing is opened. Like the main mpv it is
+//! only ever talked to through its own background thread (mpv_link.rs).
 
 use crate::mpv_link::MpvLink;
 use eframe::egui;
@@ -19,9 +20,13 @@ use libmpv2::Mpv;
 use std::cell::RefCell;
 use std::ffi::c_void;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 /// The thumbnail's height in points; the width follows the video's shape
 pub const THUMB_H: f32 = 90.0;
+
+/// How long a new file plays before the thumbnail player opens it as well
+const WARM_DELAY: Duration = Duration::from_millis(1200);
 
 /// GL objects; they live on the window's (drawing) thread
 struct Gl {
@@ -56,17 +61,30 @@ pub struct Thumbs {
     synced: bool,
     /// The time last asked for
     requested: Option<f64>,
+    /// When the pending file was handed over (it's opened ahead of time once it has
+    /// been playing for WARM_DELAY)
+    pending_since: Option<Instant>,
 }
 
 impl Thumbs {
     pub fn new() -> Self {
-        Self { mpv: None, gl_ready: false, gl_failed: false, pending: None, wanted: false, synced: false, requested: None }
+        Self {
+            mpv: None,
+            gl_ready: false,
+            gl_failed: false,
+            pending: None,
+            wanted: false,
+            synced: false,
+            requested: None,
+            pending_since: None,
+        }
     }
 
     /// A new file is playing: remember it for the thumbnail player (opened on the
     /// first hover), and let go of the previous one
     pub fn load(&mut self, path: &str) {
         self.pending = Some(path.to_owned());
+        self.pending_since = Some(Instant::now());
         self.requested = None;
         if let Some((_, link)) = &self.mpv {
             link.command("stop", &[]);
@@ -111,6 +129,33 @@ impl Thumbs {
         }
     }
 
+    /// Call every frame with the playing position. Once thumbnails have been used and
+    /// the current file has been playing for a moment, open it in the thumbnail
+    /// player too (at that position), so the first hover only needs a seek.
+    pub fn warm(&mut self, ctx: &egui::Context, secs: f64) {
+        if !self.gl_ready || self.pending.is_none() {
+            return;
+        }
+        let Some(since) = self.pending_since else { return };
+        let wait = WARM_DELAY.saturating_sub(since.elapsed());
+        if wait.is_zero() {
+            self.open_pending(secs);
+        } else {
+            ctx.request_repaint_after(wait);
+        }
+    }
+
+    /// Open the waiting file in the thumbnail player, right at `secs`
+    fn open_pending(&mut self, secs: f64) {
+        let Some((_, link)) = &self.mpv else { return };
+        let Some(path) = self.pending.take() else { return };
+        self.pending_since = None;
+        link.set("start", format!("{secs:.2}"));
+        link.command("loadfile", &[&path]);
+        self.requested = Some(secs);
+        self.synced = false;
+    }
+
     /// Turn / mirror the thumbnails like the main picture
     pub fn set_view(&self, rotation: i32, mirror: bool) {
         if let Some((_, link)) = &self.mpv {
@@ -145,16 +190,13 @@ impl Thumbs {
             }
             return;
         }
-        let Some((_, link)) = &self.mpv else { return };
-        let at = format!("{secs:.2}");
-        if let Some(path) = self.pending.take() {
-            // Open the file right at the hovered time
-            link.set("start", &at);
-            link.command("loadfile", &[&path]);
-            self.requested = Some(secs);
-            self.synced = false;
+        if self.pending.is_some() {
+            // Not opened ahead of time yet: open it right at the hovered time
+            self.open_pending(secs);
             return;
         }
+        let Some((_, link)) = &self.mpv else { return };
+        let at = format!("{secs:.2}");
         // Once it has loaded, catch up with wherever the pointer went meanwhile
         let resend = !self.synced && {
             let s = link.snapshot();
