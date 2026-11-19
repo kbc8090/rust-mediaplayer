@@ -936,10 +936,17 @@ impl FluentMediaPlayer {
         let from = self.time_pos;
         let to = (from + secs).clamp(0.0, self.duration.max(0.0));
         let moved = to - from;
-        if moved.abs() < 0.05 {
-            // Already at the start / end: just keep the pop-up showing a moment longer
+        // Pressed at (or within a moment of) the start / end: go there, but don't
+        // add the tiny distance to the pop-up. (The video keeps playing between
+        // presses, so each press at the start moved back a fraction of a second,
+        // which slowly added up to "−1 sec", "−2 sec"…)
+        let clamped = (to - (from + secs)).abs() > 1e-9;
+        if moved.abs() < 0.05 || (clamped && moved.abs() < 1.0) {
+            if moved.abs() >= 0.05 {
+                self.seek_to(to);
+            }
             if let Some((t0, _)) = self.seek_osd.as_mut() {
-                *t0 = std::time::Instant::now();
+                *t0 = std::time::Instant::now(); // keep the pop-up up a moment longer
             }
             return;
         }
