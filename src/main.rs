@@ -1674,6 +1674,17 @@ impl eframe::App for FluentMediaPlayer {
         }
         glass::set_style(self.glass, self.border_color);
 
+        // A click on the video itself (not on the bars, menus or panels) closes the
+        // menu and the Picture & Sound / equalizer panels
+        let on_video = ctx.input(|i| i.pointer.any_pressed().then(|| i.pointer.press_origin()).flatten())
+            .and_then(|p| ctx.layer_id_at(p))
+            .map_or(false, |l| l.order == egui::Order::Background);
+        if on_video {
+            self.main_menu = false;
+            self.adjust_ui.open = false;
+            self.adjust_ui.eq_open = false;
+        }
+
         // Picture & sound panel and the equalizer
         let (before, before_norm) = (self.adjust.clone(), self.normalize);
         let hq_before = self.hq;
@@ -1894,7 +1905,7 @@ fn hit_at(ui: &mut egui::Ui, centre: Pos2, id: &str, tip: &str, t: f32, above: b
     if r.hovered() || pressed {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
         // hover, and a little brighter while the mouse button is held on it
-        let a = if pressed { 13.0 } else { 8.0 };
+        let a = if pressed { 22.0 } else { 8.0 };
         ui.painter().rect_filled(
             Rect::from_center_size(centre, vec2(BTN_BOX, BTN_BOX)),
             8.0,

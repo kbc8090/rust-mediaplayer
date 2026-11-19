@@ -350,7 +350,7 @@ const CAP: Color32 = Color32::from_rgb(64, 64, 66);
 const CAP_EDGE: Color32 = Color32::from_rgb(52, 52, 54);
 /// Highlight under the pointer, and while the mouse button is held on it
 pub const HOVER: Color32 = Color32::from_rgba_premultiplied(26, 26, 26, 26);
-pub const PRESS: Color32 = Color32::from_rgba_premultiplied(50, 50, 50, 50);
+pub const PRESS: Color32 = Color32::from_rgba_premultiplied(58, 58, 58, 58);
 
 /// The highlight for a clickable item: pressed (button held with the pointer still
 /// on it), hovered, or none
@@ -419,7 +419,7 @@ fn cap_sized(ui: &mut egui::Ui, p: &egui::Painter, rect: Rect, label: &str, id: 
     let inside = resp.ctx.input(|i| i.pointer.latest_pos()).map_or(false, |p| rect.contains(p));
     let pressed = resp.is_pointer_button_down_on() && inside;
     let fill = if pressed {
-        Color32::from_rgb(98, 98, 100)
+        Color32::from_rgb(112, 112, 114)
     } else if resp.hovered() {
         Color32::from_rgb(82, 82, 84)
     } else {
