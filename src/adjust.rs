@@ -315,11 +315,25 @@ pub struct AdjustUi {
     /// volume, and the mouse cursor isn't hidden over them)
     pub panel_rect: Rect,
     pub eq_rect: Rect,
+    /// The row whose description is pending / showing, since when, and whether
+    /// it's showing
+    tip_row: Option<&'static str>,
+    tip_since: std::time::Instant,
+    tip_shown: bool,
 }
 
 impl AdjustUi {
     pub fn new() -> Self {
-        Self { open: false, eq_open: false, tab: Tab::Picture, panel_rect: Rect::NOTHING, eq_rect: Rect::NOTHING }
+        Self {
+            open: false,
+            eq_open: false,
+            tab: Tab::Picture,
+            panel_rect: Rect::NOTHING,
+            eq_rect: Rect::NOTHING,
+            tip_row: None,
+            tip_since: std::time::Instant::now(),
+            tip_shown: false,
+        }
     }
 
     pub fn contains(&self, p: Pos2) -> bool {
@@ -438,11 +452,6 @@ fn switch(p: &egui::Painter, rect: Rect, on: bool, accent: Color32) {
 
 /// Description box beside a hovered row (after the pointer rests a moment)
 fn description(ctx: &egui::Context, row: Rect, panel: Rect, text: &str) {
-    let still = ctx.input(|i| i.pointer.time_since_last_movement());
-    if still < 0.35 {
-        ctx.request_repaint_after(std::time::Duration::from_millis(120));
-        return;
-    }
     let p = ctx.layer_painter(egui::LayerId::new(egui::Order::Tooltip, egui::Id::new("adjust_tip")));
     let g = p.layout(text.to_owned(), FontId::proportional(12.5), Color32::from_rgb(232, 232, 232), 240.0);
     let size = g.size() + vec2(20.0, 16.0);
@@ -767,8 +776,32 @@ pub fn draw_panel(ctx: &egui::Context, ui_state: &mut AdjustUi, a: &mut Adjust, 
     if open_eq {
         ui_state.eq_open = !ui_state.eq_open;
     }
-    if let Some((row, desc)) = hovered_desc {
-        description(ctx, row, rect, desc);
+    // A row's description appears after the pointer has been on that row for a
+    // moment, then stays while the pointer is anywhere on the row (moving or not).
+    // Moving to another row while one is showing switches straight to the new one.
+    const TIP_DELAY: f32 = 0.35;
+    match hovered_desc {
+        Some((row, desc)) => {
+            if ui_state.tip_row != Some(desc) {
+                let now = std::time::Instant::now();
+                ui_state.tip_since = if ui_state.tip_shown {
+                    now.checked_sub(std::time::Duration::from_secs_f32(TIP_DELAY)).unwrap_or(now)
+                } else {
+                    now
+                };
+                ui_state.tip_row = Some(desc);
+            }
+            ui_state.tip_shown = ui_state.tip_since.elapsed().as_secs_f32() >= TIP_DELAY;
+            if ui_state.tip_shown {
+                description(ctx, row, rect, desc);
+            } else {
+                ctx.request_repaint_after(std::time::Duration::from_millis(60));
+            }
+        }
+        None => {
+            ui_state.tip_row = None;
+            ui_state.tip_shown = false;
+        }
     }
 }
 
