@@ -263,7 +263,7 @@ const VOL_TRACK:  Color32 = Color32::from_rgb(160, 158, 155); // unplayed volume
 const TOP_H: f32 = 64.0;              // title strip + gradient height
 const BOTTOM_H: f32 = 104.0;          // control area + gradient height
 const SIDE: f32 = 20.0;               // left/right margin of the seek bar (and the button row)
-const SEEK_FROM_BOTTOM: f32 = 53.0;   // seek bar centre line
+const SEEK_FROM_BOTTOM: f32 = 52.0;   // seek bar centre line
 const ROW_FROM_BOTTOM: f32 = 27.0;    // button row centre line
 /// Control-row buttons: hover highlight size and centre-to-centre spacing
 const BTN_BOX: f32 = 28.0;
@@ -709,7 +709,9 @@ impl FluentMediaPlayer {
         }
         self.link.command(if forward { "frame-step" } else { "frame-back-step" }, &[]);
         self.is_playing = false;
-        self.touch();
+        // (no touch() here: it holds the displayed time still for a moment, and
+        // holding the key down kept renewing that, so the seek bar only caught up
+        // once the key was released)
     }
 
     /// Volume normalizer on / off
@@ -2780,7 +2782,7 @@ fn draw_main_menu(app: &mut FluentMediaPlayer, ctx: &egui::Context) {
     if !app.main_menu {
         return;
     }
-    const W: f32 = 228.0;
+    const W: f32 = 240.0;
     const ITEM_H: f32 = 28.0;
     const HEAD_H: f32 = 24.0;
     const PAD: f32 = 3.0;
@@ -2847,7 +2849,7 @@ fn draw_main_menu(app: &mut FluentMediaPlayer, ctx: &egui::Context) {
 
             let text = Color32::from_rgb(240, 240, 240);
             let dim = Color32::from_rgb(160, 160, 160);
-            let font = FontId::proportional(13.5);
+            let font = FontId::proportional(14.5);
             let text_x = rect.left() + PAD + 28.0;
             let mark_x = rect.left() + PAD + 14.0;
 
@@ -2863,7 +2865,7 @@ fn draw_main_menu(app: &mut FluentMediaPlayer, ctx: &egui::Context) {
                         );
                     }
                     MenuRow::Header(label) => {
-                        p.text(pos2(text_x, cy + 2.0), Align2::LEFT_CENTER, *label, FontId::proportional(12.0), dim);
+                        p.text(pos2(text_x, cy + 2.0), Align2::LEFT_CENTER, *label, FontId::proportional(13.0), dim);
                     }
                     MenuRow::Item { key, label, hint, mark } => {
                         let ir = Rect::from_min_size(pos2(rect.left() + PAD, top), vec2(W - 2.0 * PAD, h));
@@ -2882,7 +2884,7 @@ fn draw_main_menu(app: &mut FluentMediaPlayer, ctx: &egui::Context) {
                         }
                         p.text(pos2(text_x, cy), Align2::LEFT_CENTER, *label, font.clone(), text);
                         if let Some(hint) = hint {
-                            p.text(pos2(rect.right() - PAD - 10.0, cy), Align2::RIGHT_CENTER, *hint, FontId::proportional(12.5), dim);
+                            p.text(pos2(rect.right() - PAD - 10.0, cy), Align2::RIGHT_CENTER, *hint, FontId::proportional(13.5), dim);
                         }
                         if resp.activated() {
                             picked = Some(key);
