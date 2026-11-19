@@ -3019,14 +3019,14 @@ fn draw_main_menu(app: &mut FluentMediaPlayer, ctx: &egui::Context) {
 
     let mut rows = vec![
         MenuRow::Item { key: "open", label: "Open file\u{2026}", hint: Some("Ctrl+O"), mark: Mark::None },
-        MenuRow::Item { key: "adjust", label: "Picture & sound", hint: Some("E"), mark: Mark::None },
         MenuRow::Sep,
+        MenuRow::Item { key: "adjust", label: "Picture & sound", hint: Some("E"), mark: Mark::None },
         MenuRow::Item { key: "snap", label: "Snap to screen edges", hint: None, mark: Mark::Check(app.snap) },
         MenuRow::Item { key: "multi", label: "Allow multiple windows", hint: None, mark: Mark::Check(app.multi) },
         MenuRow::Item { key: "border", label: "Accent color border", hint: None, mark: Mark::Check(app.border) },
         MenuRow::Item { key: "glass", label: "Frosted glass menus", hint: None, mark: Mark::Check(app.glass) },
-        MenuRow::Item { key: "autoplay", label: "Auto-play next file in folder", hint: None, mark: Mark::Check(app.autoplay) },
         MenuRow::Sep,
+        MenuRow::Item { key: "autoplay", label: "Auto-play next file in folder", hint: None, mark: Mark::Check(app.autoplay) },
         MenuRow::Header("Previous / next order"),
     ];
     for (by, label) in SORT_CHOICES {

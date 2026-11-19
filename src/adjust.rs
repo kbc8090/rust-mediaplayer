@@ -41,7 +41,7 @@ pub struct Adjust {
     pub gamma: i32,
     pub hue: i32,
     // Picture: FFmpeg filters
-    /// −20 (cool) … +20 (warm), 150 K per step
+    /// −5 (cool) … +5 (warm), 600 K per step
     pub temperature: i32,
     /// −20 … +20, 0.05 of FFmpeg's vibrance strength per step
     pub vibrance: i32,
@@ -113,8 +113,9 @@ impl Adjust {
                 "gamma" => a.gamma = n.clamp(-100, 100),
                 "hue" => a.hue = n.clamp(-100, 100),
                 // (older files: −5…+5 in steps four times as big)
-                "temperature" => a.temperature = (n * 4).clamp(-20, 20),
-                "temperature_fine" => a.temperature = n.clamp(-20, 20),
+                "temperature" => a.temperature = n.clamp(-5, 5),
+                // (briefly saved on a 4× finer scale)
+                "temperature_fine" => a.temperature = ((n as f32) / 4.0).round() as i32,
                 "vibrance" => a.vibrance = (n * 4).clamp(-20, 20),
                 "vibrance_fine" => a.vibrance = n.clamp(-20, 20),
                 "sharpen" => a.sharpen = n.clamp(0, 5),
@@ -146,7 +147,7 @@ impl Adjust {
         let b = |v: bool| if v { 1 } else { 0 };
         let eq: Vec<String> = self.eq.iter().map(|g| g.to_string()).collect();
         let text = format!(
-            "brightness={}\ncontrast={}\nsaturation={}\ngamma={}\nhue={}\ntemperature_fine={}\nvibrance_fine={}\n\
+            "brightness={}\ncontrast={}\nsaturation={}\ngamma={}\nhue={}\ntemperature={}\nvibrance_fine={}\n\
              sharpen={}\ndenoise={}\ndeband={}\ndeinterlace={}\nsmooth={}\nnight={}\ndialogue={}\n\
              delay_ms={}\nmono={}\ncrossfeed={}\nwiden={}\nkeep_pitch={}\neq_on={}\npreamp={}\neq={}\n",
             self.brightness, self.contrast, self.saturation, self.gamma, self.hue, self.temperature,
@@ -230,7 +231,7 @@ impl Adjust {
         }
         if self.temperature != 0 {
             // 6500 K is neutral; lower is warmer
-            f.push(format!("colortemperature=temperature={}", 6500 - self.temperature * 150));
+            f.push(format!("colortemperature=temperature={}", 6500 - self.temperature * 600));
         }
         if self.vibrance != 0 {
             f.push(format!("vibrance=intensity={:.3}", self.vibrance as f32 * 0.05));
@@ -491,7 +492,7 @@ enum SwitchKey {
 fn has_fine(key: StepKey) -> bool {
     matches!(
         key,
-        StepKey::Brightness | StepKey::Contrast | StepKey::Saturation | StepKey::Gamma | StepKey::Hue | StepKey::Vibrance | StepKey::Temperature
+        StepKey::Brightness | StepKey::Contrast | StepKey::Saturation | StepKey::Gamma | StepKey::Hue | StepKey::Vibrance
     )
 }
 
@@ -505,7 +506,7 @@ fn step(a: &mut Adjust, key: StepKey, dir: i32, fine: bool) {
         StepKey::Saturation => s(&mut a.saturation, big, -100, 100),
         StepKey::Gamma => s(&mut a.gamma, big, -100, 100),
         StepKey::Hue => s(&mut a.hue, big, -100, 100),
-        StepKey::Temperature => s(&mut a.temperature, big, -20, 20),
+        StepKey::Temperature => s(&mut a.temperature, 1, -5, 5),
         StepKey::Vibrance => s(&mut a.vibrance, big, -20, 20),
         StepKey::Sharpen => s(&mut a.sharpen, 1, 0, 5),
         StepKey::Denoise => s(&mut a.denoise, 1, 0, 3),

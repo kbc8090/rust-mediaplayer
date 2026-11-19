@@ -27,7 +27,7 @@ const TINT: (f32, f32) = (30.0 / 255.0, 0.70);
 /// Captured area is shrunk by this before blurring (cheaper, and a wider blur)
 const DOWN: i32 = 4;
 /// Extra pixels captured around the panel so the blur has something at its edges
-const MARGIN: i32 = 32;
+const MARGIN: i32 = 40;
 
 pub fn set_style(enabled: bool, edge: Color32) {
     ENABLED.store(enabled, Ordering::Relaxed);
@@ -341,7 +341,7 @@ impl Gl {
         gl.active_texture(glow::TEXTURE0);
         gl.uniform_1_i32(self.blur_tex.as_ref(), 0);
         gl.viewport(0, 0, lw, lh);
-        for spread in [1.0_f32, 2.0] {
+        for spread in [1.3_f32, 2.5] {
             for (from, to, dx, dy) in [(&self.a, &self.b, 1.0, 0.0), (&self.b, &self.a, 0.0, 1.0)] {
                 gl.bind_framebuffer(glow::FRAMEBUFFER, Some(to.fbo));
                 gl.bind_texture(glow::TEXTURE_2D, Some(from.tex));
