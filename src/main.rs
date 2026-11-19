@@ -134,6 +134,8 @@ struct Settings {
     normalize: bool,
     /// Accent-colour window border (menu). Off by default.
     border: bool,
+    /// Sharper upscaling, mpv's "high-quality" scaler (menu). Off by default.
+    hq: bool,
 }
 
 /// Order of the files that previous / next step through, like Explorer's "Sort by"
@@ -173,10 +175,10 @@ fn save_settings(st: &Settings) {
     let _ = std::fs::write(
         path,
         format!(
-            "{} {} {} {} {} {} {} {} {} {} {} {}",
+            "{} {} {} {} {} {} {} {} {} {} {} {} {}",
             st.volume, st.muted as u8, st.repeat as u8, st.on_top as u8, st.hwdec, st.autoplay as u8,
             st.sort_by.code(), st.sort_desc as u8, st.snap as u8, st.multi as u8, st.normalize as u8,
-            st.border as u8
+            st.border as u8, st.hq as u8
         ),
     );
 }
@@ -198,6 +200,7 @@ fn load_settings() -> Settings {
     let multi = it.next().and_then(|t| t.parse::<u8>().ok()) == Some(1);
     let normalize = it.next().and_then(|t| t.parse::<u8>().ok()) == Some(1);
     let border = it.next().and_then(|t| t.parse::<u8>().ok()) == Some(1);
+    let hq = it.next().and_then(|t| t.parse::<u8>().ok()) == Some(1);
     Settings {
         volume: volume.map_or(80.0, |v| v.clamp(0.0, VOL_MAX)).round() as i32,
         muted,
@@ -211,6 +214,7 @@ fn load_settings() -> Settings {
         multi,
         normalize,
         border,
+        hq,
     }
 }
 
@@ -276,6 +280,8 @@ const MORE_POPUP: &str = "more_popup";
 /// Menu button (top left): centre. Its highlight sits 8 px from the left, 7 px from the top.
 const MENU_X: f32 = 8.0 + BTN_BOX / 2.0;
 const MENU_Y: f32 = 7.0 + BTN_BOX / 2.0;
+/// Where the filename starts (right of the menu button)
+const TITLE_X: f32 = MENU_X + BTN_BOX / 2.0 + 8.0;
 
 /// The pop-up in the top left after seeking with the arrow keys (the amount,
 /// adding up quick repeats). Seeking with the mouse doesn't show it: the seek bar's
@@ -284,11 +290,21 @@ const MENU_Y: f32 = 7.0 + BTN_BOX / 2.0;
 enum SeekOsd {
     Step(f64),
 }
-/// Volume / seek pop-up position (top left, below the menu button), and the info
-/// overlay (I) below where the pop-up appears
-const OSD_LEFT: f32 = MENU_X - BTN_BOX / 2.0;
+/// Controls hide this long after the mouse stops (while playing), in seconds
+const HIDE_AFTER: f32 = 2.5;
+/// Time for a fullscreen switch to settle, during which the overlays are held
+const FS_SETTLE: f32 = 0.45;
+/// Volume / seek pop-up position (top left, below the menu button and lined up with
+/// the filename), and the info overlay (I) below where the pop-up appears
+const OSD_LEFT: f32 = TITLE_X;
 const OSD_TOP: f32 = MENU_Y + BTN_BOX / 2.0 + 11.0;
 const INFO_TOP: f32 = OSD_TOP + 42.0 + 10.0;
+/// Picture quality. Since mpv 0.37 its defaults are already its old "high quality"
+/// settings (good downscaling, dithering, gamma-correct scaling); the remaining
+/// difference in its "high-quality" profile is the upscaler used when the video
+/// is smaller than the window: a sharper, cleaner one that costs more GPU time.
+const HQ_SCALE: &str = "ewa_lanczossharp";
+const NORMAL_SCALE: &str = "lanczos";
 /// Volume normalizer: FFmpeg's "dynamic audio normalizer" (built into mpv). It looks
 /// ~1 s ahead and smoothly raises quiet passages / lowers loud ones, so dialogue and
 /// explosions (or songs from different albums) come out at a more even level.
@@ -369,6 +385,14 @@ struct FluentMediaPlayer {
     fs_settle: Option<std::time::Instant>,
     /// In fullscreen the overlays only appear once the mouse has left the screen edges
     fs_armed: bool,
+    /// Just entered fullscreen with the controls showing: they stay up (bottom bar
+    /// only) for the usual time, then hide. Started at this moment.
+    fs_grace: Option<std::time::Instant>,
+    /// Draw only the bottom bar this frame (the fullscreen grace period)
+    hide_top: bool,
+    /// Whether the controls were showing before this frame's input (a key press
+    /// itself counts as activity, so Enter would otherwise always count as "showing")
+    shown_before_input: bool,
     /// Icon font used for the window buttons
     caption_font: CaptionFont,
     /// Window size last frame, and the end of the current live-resize (if any)
@@ -430,6 +454,8 @@ struct FluentMediaPlayer {
     accent_borders: bool,
     /// Accent-colour window border (menu)
     border: bool,
+    /// High-quality upscaling (menu)
+    hq: bool,
     /// Windows 11: Windows draws our rounded corners and border; the colour last
     /// sent to it
     win11_frame: bool,
@@ -522,6 +548,9 @@ impl FluentMediaPlayer {
         if st.normalize {
             let _ = mpv.set_property("af", NORMALIZER);
         }
+        if st.hq {
+            let _ = mpv.set_property("scale", HQ_SCALE);
+        }
         let _ = mpv.set_property("volume", volume);
         let _ = mpv.set_property("mute", muted);
         if st.repeat {
@@ -583,6 +612,9 @@ impl FluentMediaPlayer {
             start_time: std::time::Instant::now(),
             fs_settle: None,
             fs_armed: true,
+            fs_grace: None,
+            hide_top: false,
+            shown_before_input: true,
             caption_font,
             last_size: egui::Vec2::ZERO,
             resize_until: None,
@@ -619,6 +651,7 @@ impl FluentMediaPlayer {
             normalize: st.normalize,
             accent_borders: accent_borders_on(),
             border: st.border,
+            hq: st.hq,
             win11_frame: false,
             border_sent: None,
         }
@@ -717,6 +750,12 @@ impl FluentMediaPlayer {
         // (no touch() here: it holds the displayed time still for a moment, and
         // holding the key down kept renewing that, so the seek bar only caught up
         // once the key was released)
+    }
+
+    /// High-quality upscaling on / off
+    fn toggle_hq(&mut self) {
+        self.hq = !self.hq;
+        self.link.set("scale", if self.hq { HQ_SCALE } else { NORMAL_SCALE });
     }
 
     /// Volume normalizer on / off
@@ -822,6 +861,7 @@ impl FluentMediaPlayer {
             multi: self.multi,
             normalize: self.normalize,
             border: self.border,
+            hq: self.hq,
         }
     }
 
@@ -972,6 +1012,10 @@ impl FluentMediaPlayer {
     /// row) is what made the picture flicker and lag. Windows hides the taskbar by
     /// itself for a frameless window that covers its monitor.
     fn enter_fullscreen(&mut self, ctx: &egui::Context) {
+        // If the controls are up right now (mouse recently moved, paused, or the
+        // button was clicked), keep the bottom bar up for the usual time once the
+        // window has settled; if they're already hidden, they stay hidden
+        self.fs_grace = (self.shown_before_input && self.has_file).then(std::time::Instant::now);
         // Hold the overlays hidden, with no fade, while the window changes size
         self.fs_settle = Some(std::time::Instant::now());
         self.fs_armed = false;
@@ -987,6 +1031,7 @@ impl FluentMediaPlayer {
     }
 
     fn exit_fullscreen(&mut self, ctx: &egui::Context) {
+        self.fs_grace = None;
         self.fs_settle = Some(std::time::Instant::now());
         self.show_controls = true;
         self.is_fullscreen = false;
@@ -1318,6 +1363,7 @@ impl eframe::App for FluentMediaPlayer {
         });
 
         // ── Controls visibility logic ─────────────────────────────────────────
+        self.shown_before_input = self.show_controls;
         if inp.moved || inp.active || inp.scroll_y != 0.0 {
             self.last_mouse_move = std::time::Instant::now();
         }
@@ -1325,7 +1371,7 @@ impl eframe::App for FluentMediaPlayer {
             .map_or(false, |p| p.y < TOP_H || p.y > screen.bottom() - BOTTOM_H);
         let menu_open = self.main_menu || self.show_keys || ctx.memory(|m| m.is_popup_open(egui::Id::new(MORE_POPUP)));
         let idle = self.last_mouse_move.elapsed().as_secs_f32();
-        let settling = self.fs_settle.map_or(false, |t0| t0.elapsed().as_secs_f32() < 0.45);
+        let settling = self.fs_settle.map_or(false, |t0| t0.elapsed().as_secs_f32() < FS_SETTLE);
         if !settling {
             self.fs_settle = None;
         }
@@ -1336,11 +1382,24 @@ impl eframe::App for FluentMediaPlayer {
             if !near_edge {
                 self.fs_armed = true;
             }
-            self.show_controls = !settling && self.fs_armed && (near_edge || menu_open);
+            let edge_show = !settling && self.fs_armed && (near_edge || menu_open);
+            // Grace period after entering fullscreen: the settle time, then the usual
+            // 2.5 s the controls stay up after the mouse stops
+            let grace = self.fs_grace.map_or(false, |t0| t0.elapsed().as_secs_f32() < FS_SETTLE + HIDE_AFTER);
+            if !grace {
+                self.fs_grace = None;
+            } else {
+                ctx.request_repaint_after(std::time::Duration::from_millis(100));
+            }
+            let grace_show = grace && !settling;
+            self.show_controls = edge_show || grace_show;
+            self.hide_top = grace_show && !edge_show;
         } else if settling {
             self.show_controls = true;
+            self.hide_top = false;
         } else {
-            self.show_controls = !self.has_file || !self.is_playing || menu_open || near_edge || idle < 2.5;
+            self.show_controls = !self.has_file || !self.is_playing || menu_open || near_edge || idle < HIDE_AFTER;
+            self.hide_top = false;
         }
         // Hide the mouse cursor too once it has been still for a moment
         if !self.show_controls && self.has_file && idle > 2.0 {
@@ -1451,7 +1510,9 @@ impl eframe::App for FluentMediaPlayer {
             ctx.request_repaint_after(std::time::Duration::from_millis(16));
         }
         if t > 0.0 {
-            draw_top_bar(self, ctx, t);
+            if !self.hide_top {
+                draw_top_bar(self, ctx, t);
+            }
             draw_bottom_bar(self, ctx, t);
             draw_main_menu(self, ctx);
         } else {
@@ -1937,7 +1998,7 @@ fn draw_top_bar(app: &mut FluentMediaPlayer, ctx: &egui::Context, t: f32) {
             // (text centred on its line box sits a little low next to the icon)
             let y = MENU_Y - 1.0;
             let right_limit = if fullscreen { screen.right() - 20.0 } else { screen.right() - WIN_BTN_W * 3.0 - 10.0 };
-            let tx = MENU_X + BTN_BOX / 2.0 + 8.0;
+            let tx = TITLE_X;
             let clip = p.with_clip_rect(Rect::from_min_max(pos2(tx, 0.0), pos2(right_limit, TOP_H)));
             let font = FontId::new(14.5, FontFamily::Name("semibold".into()));
             clip.text(pos2(tx + 1.0, y + 1.0), Align2::LEFT_CENTER, &title, font.clone(), black(170, t));
@@ -2250,7 +2311,7 @@ fn draw_bottom_bar(app: &mut FluentMediaPlayer, ctx: &egui::Context, t: f32) {
             egui::popup_above_or_below_widget(ui, popup_id, &more, egui::AboveOrBelow::Above, |ui| {
                 ui.set_min_width(110.0);
                 ui.label("Playback speed");
-                for s in [0.5_f64, 0.75, 1.0, 1.25, 1.5, 2.0] {
+                for s in [0.25_f64, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0] {
                     if ui.selectable_label((app.speed - s).abs() < 1e-6, format!("{s}x")).clicked() {
                         app.set_speed(s);
                         ui.memory_mut(|m| m.close_popup());
@@ -2801,6 +2862,7 @@ fn draw_main_menu(app: &mut FluentMediaPlayer, ctx: &egui::Context) {
         MenuRow::Sep,
         MenuRow::Item { key: "autoplay", label: "Auto-play next file in folder", hint: None, mark: Mark::Check(app.autoplay) },
         MenuRow::Item { key: "normalize", label: "Normalize volume", hint: None, mark: Mark::Check(app.normalize) },
+        MenuRow::Item { key: "hq", label: "High-quality upscaling", hint: None, mark: Mark::Check(app.hq) },
         MenuRow::Item { key: "snap", label: "Snap to screen edges", hint: None, mark: Mark::Check(app.snap) },
         MenuRow::Item { key: "multi", label: "Allow multiple windows", hint: None, mark: Mark::Check(app.multi) },
         MenuRow::Item { key: "border", label: "Accent color border", hint: None, mark: Mark::Check(app.border) },
@@ -2914,6 +2976,7 @@ fn draw_main_menu(app: &mut FluentMediaPlayer, ctx: &egui::Context) {
         Some("quit") => app.quit(),
         Some("autoplay") => app.autoplay = !app.autoplay,
         Some("normalize") => app.toggle_normalize(),
+        Some("hq") => app.toggle_hq(),
         Some("multi") => app.multi = !app.multi,
         Some("border") => app.border = !app.border,
         Some("snap") => {
