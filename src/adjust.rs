@@ -541,7 +541,7 @@ fn rows(a: &Adjust, normalize: bool, hq: bool, tab: Tab) -> Vec<Row> {
             let (g, gc) = level(a.gamma);
             let (h, hc) = level(a.hue);
             let temp = match a.temperature {
-                0 => "0".to_owned(),
+                0 => "Off".to_owned(),
                 t if t > 0 => format!("Warm {t}"),
                 t => format!("Cool {}", -t),
             };

@@ -130,6 +130,9 @@ struct Gl {
     a: Target,
     b: Target,
     size: (i32, i32),
+    /// Half-size step of the shrink, and its size
+    half: Target,
+    half_size: (i32, i32),
 }
 
 const VERTEX: &str = r#"
@@ -156,8 +159,8 @@ void main() {
 }
 "#;
 
-// Blurred backdrop: a little extra colour, the dark tint, faint grain, and the
-// rounded-corner shape (anti-aliased)
+// Blurred backdrop: a little extra colour, the dark tint, and the rounded-corner
+// shape (anti-aliased)
 const COMPOSITE: &str = r#"
 uniform sampler2D u_tex;
 uniform vec4 u_uv;
@@ -166,13 +169,11 @@ uniform float u_radius;
 uniform vec4 u_tint;
 uniform float u_alpha;
 IN vec2 v_uv;
-float hash(vec2 p) { return fract(sin(dot(p, vec2(12.9898, 78.233))) * 43758.5453); }
 void main() {
     vec3 b = TEX(u_tex, u_uv.xy + v_uv * u_uv.zw).rgb;
     float l = dot(b, vec3(0.299, 0.587, 0.114));
     b = clamp(mix(vec3(l), b, 1.5), 0.0, 1.0);
     vec3 c = b * (1.0 - u_tint.a) + u_tint.rgb;
-    c += (hash(floor(gl_FragCoord.xy)) - 0.5) * 0.035;
     vec2 p = v_uv * u_size;
     vec2 h = u_size * 0.5;
     vec2 q = abs(p - h) - (h - vec2(u_radius));
@@ -262,6 +263,7 @@ impl Gl {
         let size = (64, 64);
         let a = target(gl, size.0, size.1)?;
         let b = target(gl, size.0, size.1)?;
+        let half = target(gl, size.0, size.1)?;
         Some(Self {
             blur_tex: gl.get_uniform_location(blur, "u_tex"),
             blur_step: gl.get_uniform_location(blur, "u_step"),
@@ -278,12 +280,20 @@ impl Gl {
             a,
             b,
             size,
+            half,
+            half_size: size,
         })
     }
 
     /// Make the work textures exactly w × h (so the blur's edge clamping works at
     /// the edges of the captured area, not of some larger, stale texture)
-    unsafe fn ensure_size(&mut self, gl: &glow::Context, w: i32, h: i32) {
+    unsafe fn ensure_size(&mut self, gl: &glow::Context, w: i32, h: i32, hw: i32, hh: i32) {
+        if (hw, hh) != self.half_size {
+            gl.bind_texture(glow::TEXTURE_2D, Some(self.half.tex));
+            gl.tex_image_2d(glow::TEXTURE_2D, 0, glow::RGBA8 as i32, hw, hh, 0, glow::RGBA, glow::UNSIGNED_BYTE, None);
+            gl.bind_texture(glow::TEXTURE_2D, None);
+            self.half_size = (hw, hh);
+        }
         if (w, h) == self.size {
             return;
         }
@@ -327,14 +337,20 @@ impl Gl {
             return;
         }
         let (lw, lh) = ((cw + DOWN - 1) / DOWN, (ch + DOWN - 1) / DOWN);
-        self.ensure_size(gl, lw, lh);
+        let (hw, hh) = ((cw + 1) / 2, (ch + 1) / 2);
+        self.ensure_size(gl, lw, lh, hw, hh);
         let (tw, th) = (self.size.0 as f32, self.size.1 as f32);
 
         gl.disable(glow::SCISSOR_TEST);
         gl.disable(glow::BLEND);
+        // Screen → half size → quarter size: each halving averages 2×2 pixels
         gl.bind_framebuffer(glow::READ_FRAMEBUFFER, None);
+        gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, Some(self.half.fbo));
+        gl.blit_framebuffer(cx0, cy0, cx1, cy1, 0, 0, hw, hh, glow::COLOR_BUFFER_BIT, glow::LINEAR);
+        gl.bind_framebuffer(glow::READ_FRAMEBUFFER, Some(self.half.fbo));
         gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, Some(self.a.fbo));
-        gl.blit_framebuffer(cx0, cy0, cx1, cy1, 0, 0, lw, lh, glow::COLOR_BUFFER_BIT, glow::LINEAR);
+        gl.blit_framebuffer(0, 0, hw, hh, 0, 0, lw, lh, glow::COLOR_BUFFER_BIT, glow::LINEAR);
+        gl.bind_framebuffer(glow::READ_FRAMEBUFFER, None);
 
         // Blur: horizontal + vertical, twice (the second time wider)
         gl.use_program(Some(self.blur));
