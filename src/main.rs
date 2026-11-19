@@ -287,7 +287,16 @@ const BTN_STEP: f32 = 32.0;
 const VOL_W: f32 = 90.0;
 const WIN_BTN_W: f32 = 46.0;
 const WIN_BTN_H: f32 = 34.0;
-const MORE_POPUP: &str = "more_popup";
+/// Playback speeds in the speed menu
+const SPEEDS: [(f64, &str); 7] = [
+    (0.25, "0.25\u{d7}"),
+    (0.5, "0.5\u{d7}"),
+    (0.75, "0.75\u{d7}"),
+    (1.0, "Normal"),
+    (1.25, "1.25\u{d7}"),
+    (1.5, "1.5\u{d7}"),
+    (2.0, "2\u{d7}"),
+];
 /// Menu button (top left): centre. Its highlight sits 8 px from the left, 7 px from the top.
 const MENU_X: f32 = 8.0 + BTN_BOX / 2.0;
 const MENU_Y: f32 = 7.0 + BTN_BOX / 2.0;
@@ -432,6 +441,9 @@ struct FluentMediaPlayer {
     main_menu: bool,
     /// The keyboard shortcuts panel is open
     show_keys: bool,
+    /// The playback speed menu is open, and where its button is
+    speed_menu: bool,
+    speed_anchor: Rect,
     /// Open submenu of the main menu (and its row), and the row hovered (since when)
     menu_sub: Option<(&'static str, Rect)>,
     menu_hover: Option<(&'static str, std::time::Instant)>,
@@ -649,6 +661,8 @@ impl FluentMediaPlayer {
             main_menu: false,
             show_keys: false,
             menu_sub: None,
+            speed_menu: false,
+            speed_anchor: Rect::NOTHING,
             menu_hover: None,
             menu_anchor: Rect::NOTHING,
             last_tick: std::time::Instant::now(),
@@ -1519,7 +1533,7 @@ impl eframe::App for FluentMediaPlayer {
         }
         let near_edge = inp.pointer
             .map_or(false, |p| p.y < TOP_H || p.y > screen.bottom() - BOTTOM_H || self.adjust_ui.contains(p));
-        let menu_open = self.main_menu || self.show_keys || ctx.memory(|m| m.is_popup_open(egui::Id::new(MORE_POPUP)));
+        let menu_open = self.main_menu || self.show_keys || self.speed_menu;
         let idle = self.last_mouse_move.elapsed().as_secs_f32();
         let settling = self.fs_settle.map_or(false, |t0| t0.elapsed().as_secs_f32() < FS_SETTLE);
         if !settling {
@@ -1536,7 +1550,7 @@ impl eframe::App for FluentMediaPlayer {
             let armed = !settling && self.fs_armed;
             let over_top = inp.pointer.map_or(false, |p| p.y < TOP_H);
             let over_bottom = inp.pointer.map_or(false, |p| p.y > screen.bottom() - BOTTOM_H);
-            let speed_menu = ctx.memory(|m| m.is_popup_open(egui::Id::new(MORE_POPUP)));
+            let speed_menu = self.speed_menu;
             self.show_controls = speed_menu || (armed && over_bottom);
             self.show_top = self.main_menu || (armed && over_top);
         } else if settling {
@@ -1589,6 +1603,8 @@ impl eframe::App for FluentMediaPlayer {
         if inp.esc {
             if self.show_keys {
                 self.show_keys = false;
+            } else if self.speed_menu {
+                self.speed_menu = false;
             } else if self.main_menu {
                 self.main_menu = false;
             } else if self.adjust_ui.open || self.adjust_ui.eq_open {
@@ -1671,6 +1687,9 @@ impl eframe::App for FluentMediaPlayer {
         }
         if t > 0.0 {
             draw_bottom_bar(self, ctx, t);
+            draw_speed_menu(self, ctx);
+        } else {
+            self.speed_menu = false;
         }
         glass::set_style(self.glass, self.border_color);
 
@@ -1681,6 +1700,7 @@ impl eframe::App for FluentMediaPlayer {
             .map_or(false, |l| l.order == egui::Order::Background);
         if on_video {
             self.main_menu = false;
+            self.speed_menu = false;
             self.adjust_ui.open = false;
             self.adjust_ui.eq_open = false;
         }
@@ -1905,7 +1925,7 @@ fn hit_at(ui: &mut egui::Ui, centre: Pos2, id: &str, tip: &str, t: f32, above: b
     if r.hovered() || pressed {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
         // hover, and a little brighter while the mouse button is held on it
-        let a = if pressed { 22.0 } else { 8.0 };
+        let a = if pressed { 13.0 } else { 6.0 };
         ui.painter().rect_filled(
             Rect::from_center_size(centre, vec2(BTN_BOX, BTN_BOX)),
             8.0,
@@ -2325,12 +2345,12 @@ fn draw_bottom_bar(app: &mut FluentMediaPlayer, ctx: &egui::Context, t: f32) {
             let track_h = if hot { 3.0 } else { 2.0 };
             p.rect_filled(
                 Rect::from_min_max(pos2(sr.left(), seek_y - track_h / 2.0), pos2(sr.right(), seek_y + track_h / 2.0)),
-                1.0, TRACK.gamma_multiply(t),
+                track_h / 2.0, TRACK.gamma_multiply(t), // round ends (pill)
             );
             let fill_x = k0 + kw * frac;
             p.rect_filled(
                 Rect::from_min_max(pos2(sr.left(), seek_y - 1.5), pos2(fill_x, seek_y + 1.5)),
-                1.0, accent,
+                1.5, accent,
             );
             // Chapter marks: small gaps in the bar
             if app.duration > 0.0 {
@@ -2407,7 +2427,7 @@ fn draw_bottom_bar(app: &mut FluentMediaPlayer, ctx: &egui::Context, t: f32) {
             icon_next(&p, c, if app.has_next() { white } else { dim });
 
             // Time
-            p.text(pos2(lay.time_x, row_y), Align2::LEFT_CENTER, time_text, time_font, white);
+            p.text(pos2(lay.time_x, row_y - 1.0), Align2::LEFT_CENTER, time_text, time_font, white);
 
             // Volume icon (click = mute) + slider (the slider is left out when the
             // window is too narrow for it; the wheel and arrow keys still work)
@@ -2436,7 +2456,7 @@ fn draw_bottom_bar(app: &mut FluentMediaPlayer, ctx: &egui::Context, t: f32) {
             let vhot = vresp.hovered() || vresp.dragged();
             p.rect_filled(
                 Rect::from_min_max(pos2(vl, row_y - 1.0), pos2(vl + vw, row_y + 1.0)),
-                1.0, VOL_TRACK.gamma_multiply(t),
+                1.0, VOL_TRACK.gamma_multiply(t), // round ends (pill)
             );
             // Small tick marking 100 % (everything right of it is boost)
             let x100 = vl + vw * (100.0 / VOL_MAX) as f32;
@@ -2446,7 +2466,7 @@ fn draw_bottom_bar(app: &mut FluentMediaPlayer, ctx: &egui::Context, t: f32) {
             );
             p.rect_filled(
                 Rect::from_min_max(pos2(vl, row_y - 1.5), pos2(vl + vw * vf, row_y + 1.5)),
-                1.0, accent,
+                1.5, accent,
             );
             draw_knob(&p, ctx.pixels_per_point(), pos2(vl + vw * vf, row_y), vhot, accent, t);
             }
@@ -2485,20 +2505,10 @@ fn draw_bottom_bar(app: &mut FluentMediaPlayer, ctx: &egui::Context, t: f32) {
             let c = pos2(lay.speed, row_y);
             let more = hit(ui, c, "more", "Playback speed", t);
             icon_speed(&p, c, white);
-            let popup_id = egui::Id::new(MORE_POPUP);
+            app.speed_anchor = more.rect;
             if more.activated() {
-                ui.memory_mut(|m| m.toggle_popup(popup_id));
+                app.speed_menu = !app.speed_menu;
             }
-            egui::popup_above_or_below_widget(ui, popup_id, &more, egui::AboveOrBelow::Above, |ui| {
-                ui.set_min_width(110.0);
-                ui.label("Playback speed");
-                for s in [0.25_f64, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0] {
-                    if ui.selectable_label((app.speed - s).abs() < 1e-6, format!("{s}x")).clicked() {
-                        app.set_speed(s);
-                        ui.memory_mut(|m| m.close_popup());
-                    }
-                }
-            });
         });
 }
 
@@ -3010,6 +3020,8 @@ enum MenuRow {
     Item { key: &'static str, label: &'static str, hint: Option<&'static str>, mark: Mark },
     /// Opens a submenu to the right; `hint` is the current choice, shown at the right
     Sub { key: &'static str, label: &'static str, hint: &'static str },
+    /// Centred heading
+    Title(&'static str),
     Sep,
 }
 
@@ -3056,6 +3068,7 @@ fn draw_menu_rows(
     rect: Rect,
     rows: &[MenuRow],
     sub_open: Option<&'static str>,
+    selected: Option<Color32>,
 ) -> (Option<&'static str>, Option<&'static str>, Vec<(&'static str, Rect)>) {
     // The menu's own background swallows clicks (so they don't reach the video)
     ui.allocate_rect(rect, Sense::click_and_drag());
@@ -3084,8 +3097,15 @@ fn draw_menu_rows(
                     Stroke::new(1.0_f32, Color32::from_rgba_premultiplied(26, 26, 26, 26)),
                 );
             }
+            MenuRow::Title(label) => {
+                p.text(pos2(rect.center().x, cy), Align2::CENTER_CENTER, *label, FontId::proportional(13.5), dim);
+            }
             MenuRow::Item { key, label, hint, mark } => {
                 let resp = ui.interact(ir, ui.id().with(*key), Sense::click_and_drag());
+                // The current choice (speed menu): tinted with the accent colour
+                if let (Some(sel), Mark::Dot(true)) = (selected, mark) {
+                    p.rect_filled(ir, 4.0, sel);
+                }
                 if let Some(c) = adjust::state_fill(&resp) {
                     p.rect_filled(ir, 4.0, c);
                 }
@@ -3206,7 +3226,7 @@ fn draw_main_menu(app: &mut FluentMediaPlayer, ctx: &egui::Context) {
     let sub_open = app.menu_sub.map(|(k, _)| k);
     let mut out = (None, None, Vec::new());
     egui::Area::new(id).order(egui::Order::Foreground).fixed_pos(rect.min).show(ctx, |ui| {
-        out = draw_menu_rows(ui, rect, &rows, sub_open);
+        out = draw_menu_rows(ui, rect, &rows, sub_open, None);
     });
     ctx.move_to_top(egui::LayerId::new(egui::Order::Foreground, id));
     let (mut picked, hovered, subs) = out;
@@ -3215,7 +3235,7 @@ fn draw_main_menu(app: &mut FluentMediaPlayer, ctx: &egui::Context) {
     if let Some(sr) = sub_rect {
         let sid = egui::Id::new("main_menu_sub");
         egui::Area::new(sid).order(egui::Order::Foreground).fixed_pos(sr.min).show(ctx, |ui| {
-            sub_picked = draw_menu_rows(ui, sr, &sub_rows, None).0;
+            sub_picked = draw_menu_rows(ui, sr, &sub_rows, None, None).0;
         });
         ctx.move_to_top(egui::LayerId::new(egui::Order::Foreground, sid));
     }
@@ -3277,6 +3297,47 @@ fn draw_main_menu(app: &mut FluentMediaPlayer, ctx: &egui::Context) {
             }
         }
         None => {}
+    }
+}
+
+/// Playback speed menu, above its button in the control bar
+fn draw_speed_menu(app: &mut FluentMediaPlayer, ctx: &egui::Context) {
+    if !app.speed_menu {
+        return;
+    }
+    const W: f32 = 150.0;
+    let mut rows = vec![MenuRow::Title("Playback speed"), MenuRow::Sep];
+    for (s, label) in SPEEDS {
+        rows.push(MenuRow::Item { key: label, label, hint: None, mark: Mark::Dot((app.speed - s).abs() < 1e-6) });
+    }
+    let h = MENU_PAD * 2.0 + rows.iter().map(menu_row_h).sum::<f32>();
+    let screen = ctx.screen_rect();
+    let anchor = app.speed_anchor;
+    let x = (anchor.center().x + BTN_BOX / 2.0 - W).clamp(screen.left() + 4.0, screen.right() - 4.0 - W);
+    let y = (anchor.top() - 4.0 - h).max(screen.top() + 4.0);
+    let rect = Rect::from_min_size(pos2(x, y), vec2(W, h));
+
+    // A press outside (other than on its button, which toggles it) closes it
+    let pressed_outside = ctx.input(|i| {
+        i.pointer.any_pressed()
+            && i.pointer.press_origin().map_or(false, |o| !rect.contains(o) && !anchor.contains(o))
+    });
+    if pressed_outside {
+        app.speed_menu = false;
+        return;
+    }
+    let id = egui::Id::new("speed_menu");
+    let mut picked = None;
+    let selected = app.accent.gamma_multiply(0.38);
+    egui::Area::new(id).order(egui::Order::Foreground).fixed_pos(rect.min).show(ctx, |ui| {
+        picked = draw_menu_rows(ui, rect, &rows, None, Some(selected)).0;
+    });
+    ctx.move_to_top(egui::LayerId::new(egui::Order::Foreground, id));
+    if let Some(key) = picked {
+        if let Some((s, _)) = SPEEDS.iter().find(|(_, l)| *l == key) {
+            app.set_speed(*s);
+        }
+        app.speed_menu = false;
     }
 }
 

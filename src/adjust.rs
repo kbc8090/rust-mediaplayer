@@ -354,6 +354,13 @@ pub const PRESS: Color32 = Color32::from_rgba_premultiplied(58, 58, 58, 58);
 
 /// The highlight for a clickable item: pressed (button held with the pointer still
 /// on it), hovered, or none
+/// Fires when the mouse button is released anywhere over the item, like Windows'
+/// buttons (a plain "click" also needs the pointer to have stayed nearly still)
+pub fn activated(resp: &egui::Response) -> bool {
+    resp.clicked()
+        || (resp.drag_stopped() && resp.ctx.input(|i| i.pointer.latest_pos()).map_or(false, |p| resp.rect.contains(p)))
+}
+
 pub fn state_fill(resp: &egui::Response) -> Option<Color32> {
     let inside = resp.ctx.input(|i| i.pointer.latest_pos()).map_or(false, |p| resp.rect.contains(p));
     if resp.is_pointer_button_down_on() && inside {
@@ -387,7 +394,7 @@ fn header(ui: &mut egui::Ui, p: &egui::Painter, rect: Rect, title: &str, id: &st
     p.text(pos2(rect.left() + 16.0, cy), Align2::LEFT_CENTER, title, semibold(14.5), TEXT);
 
     let xr = Rect::from_center_size(pos2(rect.right() - 22.0, cy), vec2(28.0, 28.0));
-    let x = ui.interact(xr, ui.id().with((id, "close")), Sense::click());
+    let x = ui.interact(xr, ui.id().with((id, "close")), Sense::click_and_drag());
     if let Some(c) = state_fill(&x) {
         p.rect_filled(xr, 4.0, c);
     }
@@ -399,7 +406,7 @@ fn header(ui: &mut egui::Ui, p: &egui::Painter, rect: Rect, title: &str, id: &st
     let font = FontId::proportional(12.5);
     let g = p.layout_no_wrap("Reset".to_owned(), font, DIM);
     let rr = Rect::from_center_size(pos2(xr.left() - 10.0 - g.size().x / 2.0, cy), g.size() + vec2(10.0, 8.0));
-    let reset = ui.interact(rr, ui.id().with((id, "reset")), Sense::click());
+    let reset = ui.interact(rr, ui.id().with((id, "reset")), Sense::click_and_drag());
     if let Some(c) = state_fill(&reset) {
         p.rect_filled(rr, 4.0, c);
     }
@@ -410,12 +417,12 @@ fn header(ui: &mut egui::Ui, p: &egui::Painter, rect: Rect, title: &str, id: &st
         [pos2(rect.left() + 1.0, rect.top() + HEAD_H - 0.5), pos2(rect.right() - 1.0, rect.top() + HEAD_H - 0.5)],
         Stroke::new(1.0_f32, LINE),
     );
-    (reset.clicked(), x.clicked())
+    (activated(&reset), activated(&x))
 }
 
 /// A key cap button ("−" / "+") with its label at `size`; returns true when clicked
 fn cap_sized(ui: &mut egui::Ui, p: &egui::Painter, rect: Rect, label: &str, id: egui::Id, size: f32) -> bool {
-    let resp = ui.interact(rect, id, Sense::click());
+    let resp = ui.interact(rect, id, Sense::click_and_drag());
     let inside = resp.ctx.input(|i| i.pointer.latest_pos()).map_or(false, |p| rect.contains(p));
     let pressed = resp.is_pointer_button_down_on() && inside;
     let fill = if pressed {
@@ -435,7 +442,7 @@ fn cap_sized(ui: &mut egui::Ui, p: &egui::Painter, rect: Rect, label: &str, id: 
     );
     let off = if pressed { 0.5 } else { -0.5 };
     p.text(rect.center() + vec2(0.0, off), Align2::CENTER_CENTER, label, semibold(size), TEXT);
-    resp.clicked()
+    activated(&resp)
 }
 
 /// Windows 11-style on/off switch
@@ -663,7 +670,7 @@ pub fn draw_panel(ctx: &egui::Context, ui_state: &mut AdjustUi, a: &mut Adjust, 
         for (i, (tab, label)) in [(Tab::Picture, "Picture"), (Tab::Sound, "Sound")].into_iter().enumerate() {
             let half = (tabs.width() - 4.0) / 2.0;
             let tr = Rect::from_min_size(pos2(tabs.left() + i as f32 * (half + 4.0), tabs.top()), vec2(half, tabs.height()));
-            let resp = ui.interact(tr, ui.id().with(("tab", i)), Sense::click());
+            let resp = ui.interact(tr, ui.id().with(("tab", i)), Sense::click_and_drag());
             let on = ui_state.tab == tab;
             if on {
                 // The selected tab: an accent shape with the tab drawn over it 2 px
@@ -677,7 +684,7 @@ pub fn draw_panel(ctx: &egui::Context, ui_state: &mut AdjustUi, a: &mut Adjust, 
             }
             let (font, col) = if on { (semibold(NAME_SIZE), TEXT) } else { (FontId::proportional(NAME_SIZE), Color32::from_rgb(200, 200, 200)) };
             p.text(tr.center(), Align2::CENTER_CENTER, label, font, col);
-            if resp.clicked() {
+            if activated(&resp) {
                 ui_state.tab = tab;
             }
         }
@@ -736,7 +743,7 @@ pub fn draw_panel(ctx: &egui::Context, ui_state: &mut AdjustUi, a: &mut Adjust, 
                         }
                     }
                     Row::Switch(name, desc, on, key) => {
-                        let resp = ui.interact(r, ui.id().with((*name, "switch")), Sense::click());
+                        let resp = ui.interact(r, ui.id().with((*name, "switch")), Sense::click_and_drag());
                         if let Some(c) = state_fill(&resp) {
                             p.rect_filled(r, 4.0, c);
                         }
@@ -745,12 +752,12 @@ pub fn draw_panel(ctx: &egui::Context, ui_state: &mut AdjustUi, a: &mut Adjust, 
                         }
                         p.text(pos2(r.left() + 10.0, r.center().y), Align2::LEFT_CENTER, *name, FontId::proportional(NAME_SIZE), TEXT);
                         switch(&p, Rect::from_center_size(pos2(r.right() - 28.0, r.center().y), vec2(38.0, 19.0)), *on, accent);
-                        if resp.clicked() {
+                        if activated(&resp) {
                             flip(a, normalize, hq, *key);
                         }
                     }
                     Row::Equalizer(on) => {
-                        let resp = ui.interact(r, ui.id().with("eq_button"), Sense::click());
+                        let resp = ui.interact(r, ui.id().with("eq_button"), Sense::click_and_drag());
                         if let Some(c) = state_fill(&resp) {
                             p.rect_filled(r, 4.0, c);
                         }
@@ -765,7 +772,7 @@ pub fn draw_panel(ctx: &egui::Context, ui_state: &mut AdjustUi, a: &mut Adjust, 
                         let c = pos2(r.right() - 14.0, r.center().y);
                         p.line_segment([c + vec2(-2.5, -4.5), c + vec2(2.0, 0.0)], Stroke::new(1.3_f32, TEXT));
                         p.line_segment([c + vec2(2.0, 0.0), c + vec2(-2.5, 4.5)], Stroke::new(1.3_f32, TEXT));
-                        if resp.clicked() {
+                        if activated(&resp) {
                             open_eq = true;
                         }
                     }
@@ -842,13 +849,13 @@ pub fn draw_eq(ctx: &egui::Context, ui_state: &mut AdjustUi, a: &mut Adjust, acc
         // On / off switch and the preset picker (‹ name ›)
         let cy = rect.top() + HEAD_H + 20.0;
         let sw_row = Rect::from_min_size(pos2(rect.left() + 8.0, cy - 14.0), vec2(80.0, 28.0));
-        let sw = ui.interact(sw_row, ui.id().with("eq_on"), Sense::click());
+        let sw = ui.interact(sw_row, ui.id().with("eq_on"), Sense::click_and_drag());
         if let Some(c) = state_fill(&sw) {
             p.rect_filled(sw_row, 4.0, c);
         }
         switch(&p, Rect::from_min_size(pos2(sw_row.left() + 8.0, cy - 9.5), vec2(38.0, 19.0)), a.eq_on, accent);
         p.text(pos2(sw_row.left() + 54.0, cy), Align2::LEFT_CENTER, if a.eq_on { "On" } else { "Off" }, FontId::proportional(NAME_SIZE), TEXT);
-        if sw.clicked() {
+        if activated(&sw) {
             a.eq_on = !a.eq_on;
         }
         let next = Rect::from_center_size(pos2(rect.right() - PAD - 13.0, cy), vec2(26.0, 22.0));

@@ -23,7 +23,7 @@ static GL_OK: AtomicBool = AtomicBool::new(true);
 static EDGE: AtomicU32 = AtomicU32::new(0x5866_34FF);
 
 /// Dark tint over the blur: (grey level, strength)
-const TINT: (f32, f32) = (30.0 / 255.0, 0.70);
+const TINT: (f32, f32) = (32.0 / 255.0, 0.64);
 /// Captured area is shrunk by this before blurring (cheaper, and a wider blur)
 const DOWN: i32 = 4;
 /// Extra pixels captured around the panel so the blur has something at its edges
