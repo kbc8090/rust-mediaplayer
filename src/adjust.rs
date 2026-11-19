@@ -361,6 +361,28 @@ pub fn activated(resp: &egui::Response) -> bool {
         || (resp.drag_stopped() && resp.ctx.input(|i| i.pointer.latest_pos()).map_or(false, |p| resp.rect.contains(p)))
 }
 
+/// Number of points for a round curve of radius `r` points, so each straight piece
+/// is about 1.5 screen pixels long whatever the display scaling (egui's own circles
+/// choose from the size in points, and small ones look like polygons above 100 %)
+pub fn arc_points(r: f32, ppp: f32) -> usize {
+    ((std::f32::consts::TAU * r * ppp / 1.5).ceil() as usize).clamp(24, 160)
+}
+
+/// A filled circle that stays smooth at any display scaling
+pub fn disc(p: &egui::Painter, centre: Pos2, r: f32, color: Color32) {
+    if r <= 0.0 || color == Color32::TRANSPARENT {
+        return;
+    }
+    let n = arc_points(r, p.ctx().pixels_per_point());
+    let pts = (0..n)
+        .map(|i| {
+            let a = std::f32::consts::TAU * i as f32 / n as f32;
+            centre + r * egui::vec2(a.cos(), a.sin())
+        })
+        .collect();
+    p.add(egui::Shape::convex_polygon(pts, color, egui::Stroke::NONE));
+}
+
 pub fn state_fill(resp: &egui::Response) -> Option<Color32> {
     let inside = resp.ctx.input(|i| i.pointer.latest_pos()).map_or(false, |p| resp.rect.contains(p));
     if resp.is_pointer_button_down_on() && inside {
@@ -450,10 +472,10 @@ fn switch(p: &egui::Painter, rect: Rect, on: bool, accent: Color32) {
     let r = rect.height() / 2.0;
     if on {
         p.rect_filled(rect, r, accent);
-        p.circle_filled(pos2(rect.right() - r, rect.center().y), r - 4.5, Color32::from_rgb(26, 26, 26));
+        disc(p, pos2(rect.right() - r, rect.center().y), r - 4.5, Color32::from_rgb(26, 26, 26));
     } else {
         p.rect_stroke(rect.shrink(0.5), r, Stroke::new(1.0_f32, Color32::from_rgb(154, 154, 154)));
-        p.circle_filled(pos2(rect.left() + r, rect.center().y), r - 4.5, Color32::from_rgb(207, 207, 207));
+        disc(p, pos2(rect.left() + r, rect.center().y), r - 4.5, Color32::from_rgb(207, 207, 207));
     }
 }
 
@@ -894,9 +916,9 @@ pub fn draw_eq(ctx: &egui::Context, ui_state: &mut AdjustUi, a: &mut Adjust, acc
             }
             let hot = resp.hovered() || resp.dragged();
             let ky = snap(y_of(value));
-            p.circle_filled(pos2(tx, ky + 1.0), if hot { 7.3 } else { 6.6 }, Color32::from_black_alpha(80));
-            p.circle_filled(pos2(tx, ky), if hot { 7.0 } else { 6.2 }, Color32::from_rgb(186, 186, 188));
-            p.circle_filled(pos2(tx, ky), if hot { 4.2 } else { 3.6 }, accent.gamma_multiply(dim.max(0.7)));
+            disc(&p, pos2(tx, ky + 1.0), if hot { 7.3 } else { 6.6 }, Color32::from_black_alpha(80));
+            disc(&p, pos2(tx, ky), if hot { 7.0 } else { 6.2 }, Color32::from_rgb(186, 186, 188));
+            disc(&p, pos2(tx, ky), if hot { 4.2 } else { 3.6 }, accent.gamma_multiply(dim.max(0.7)));
 
             p.text(pos2(x, top + 8.0), Align2::CENTER_CENTER, signed(value), FontId::proportional(11.5), if value != 0 { TEXT } else { DIM });
             p.text(pos2(x, track_top + TRACK_H + 16.0), Align2::CENTER_CENTER, label, FontId::proportional(11.5), DIM);

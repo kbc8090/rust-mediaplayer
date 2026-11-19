@@ -2126,7 +2126,7 @@ fn icon_speed(p: &egui::Painter, c: Pos2, col: Color32) {
     kpoly(p, c, &dial, col, SW);
     let n = (-50.0_f32).to_radians();
     kpoly(p, c, &[(0.0, 0.0), (5.5 * n.cos(), 5.5 * n.sin())], col, SW + 0.15);
-    p.circle_filled(c, 1.7 * K, col);
+    adjust::disc(p, c, 1.7 * K, col);
 }
 
 /// Slider thumb: light ring with an accent dot, both circles share one centre that is
@@ -2139,20 +2139,20 @@ fn pill(p: &egui::Painter, rect: Rect, color: Color32) {
         return;
     }
     if rect.width() <= rect.height() {
-        p.circle_filled(rect.center(), rect.width().min(rect.height()) / 2.0, color);
+        adjust::disc(p, rect.center(), rect.width().min(rect.height()) / 2.0, color);
         return;
     }
-    const N: usize = 12;
+    let n = adjust::arc_points(r, p.ctx().pixels_per_point()) / 2;
     let y = rect.center().y;
     let (cl, cr) = (pos2(rect.left() + r, y), pos2(rect.right() - r, y));
-    let mut pts = Vec::with_capacity(2 * (N + 1));
+    let mut pts = Vec::with_capacity(2 * (n + 1));
     // Clockwise on screen: right end top → bottom, then left end bottom → top
-    for i in 0..=N {
-        let a = -std::f32::consts::FRAC_PI_2 + std::f32::consts::PI * i as f32 / N as f32;
+    for i in 0..=n {
+        let a = -std::f32::consts::FRAC_PI_2 + std::f32::consts::PI * i as f32 / n as f32;
         pts.push(cr + r * vec2(a.cos(), a.sin()));
     }
-    for i in 0..=N {
-        let a = std::f32::consts::FRAC_PI_2 + std::f32::consts::PI * i as f32 / N as f32;
+    for i in 0..=n {
+        let a = std::f32::consts::FRAC_PI_2 + std::f32::consts::PI * i as f32 / n as f32;
         pts.push(cl + r * vec2(a.cos(), a.sin()));
     }
     p.add(egui::Shape::convex_polygon(pts, color, Stroke::NONE));
@@ -2162,9 +2162,9 @@ fn draw_knob(p: &egui::Painter, ppp: f32, centre: Pos2, hot: bool, accent: Color
     let snap = |v: f32| (v * ppp).round() / ppp;
     let c = pos2(snap(centre.x), snap(centre.y));
     let (ring, dot) = if hot { (7.5, 4.6) } else { (6.5, 3.9) };
-    p.circle_filled(pos2(c.x, c.y + 1.0), ring + 0.8, Color32::from_black_alpha((80.0 * t) as u8));
-    p.circle_filled(c, ring, KNOB_RING.gamma_multiply(t));
-    p.circle_filled(c, dot, accent);
+    adjust::disc(p, pos2(c.x, c.y + 1.0), ring + 0.8, Color32::from_black_alpha((80.0 * t) as u8));
+    adjust::disc(p, c, ring, KNOB_RING.gamma_multiply(t));
+    adjust::disc(p, c, dot, accent);
 }
 
 // ── Title bar (overlaid on the video) ─────────────────────────────────────────
@@ -3108,7 +3108,7 @@ fn draw_menu_rows(
                         poly(&p, pos2(mark_x, cy), &[(-4.5, 0.0), (-1.5, 3.2), (4.5, -3.5)], text, 1.5);
                     }
                     Mark::Dot(true) => {
-                        p.circle_filled(pos2(mark_x, cy), if size.item_h < MENU_ITEM_H { 2.5 } else { 3.0 }, text);
+                        adjust::disc(&p, pos2(mark_x, cy), if size.item_h < MENU_ITEM_H { 2.5 } else { 3.0 }, text);
                     }
                     _ => {}
                 }
