@@ -385,15 +385,9 @@ struct FluentMediaPlayer {
     fs_settle: Option<std::time::Instant>,
     /// In fullscreen the overlays only appear once the mouse has left the screen edges
     fs_armed: bool,
-    /// Just entered fullscreen with the controls showing: they stay up (bottom bar
-    /// only) for the usual time, then hide. Started at this moment.
-    fs_grace: Option<std::time::Instant>,
     /// The top bar (filename, menu) is shown. Windowed it goes with the controls;
     /// in fullscreen only while the pointer is over the top of the screen.
     show_top: bool,
-    /// Whether the controls were showing before this frame's input (a key press
-    /// itself counts as activity, so Enter would otherwise always count as "showing")
-    shown_before_input: bool,
     /// Icon font used for the window buttons
     caption_font: CaptionFont,
     /// Window size last frame, and the end of the current live-resize (if any)
@@ -613,9 +607,7 @@ impl FluentMediaPlayer {
             start_time: std::time::Instant::now(),
             fs_settle: None,
             fs_armed: true,
-            fs_grace: None,
             show_top: true,
-            shown_before_input: true,
             caption_font,
             last_size: egui::Vec2::ZERO,
             resize_until: None,
@@ -1013,15 +1005,11 @@ impl FluentMediaPlayer {
     /// row) is what made the picture flicker and lag. Windows hides the taskbar by
     /// itself for a frameless window that covers its monitor.
     fn enter_fullscreen(&mut self, ctx: &egui::Context) {
-        // If the controls are up right now (mouse recently moved, paused, or the
-        // button was clicked), keep the bottom bar up for the usual time once the
-        // window has settled; if they're already hidden, they stay hidden
-        self.fs_grace = (self.shown_before_input && self.has_file).then(std::time::Instant::now);
-        // The window changes size now: the top bar goes at once; the bottom bar stays
-        // up (no flicker) if it was showing, otherwise stays hidden
+        // Everything hides at once (like most players); the controls come back when
+        // the pointer goes to the bottom of the screen, the filename / menu at the top
         self.fs_settle = Some(std::time::Instant::now());
         self.fs_armed = false;
-        self.show_controls = self.fs_grace.is_some();
+        self.show_controls = false;
         self.show_top = false;
         self.is_fullscreen = true;
         if self.hwnd != 0 {
@@ -1034,7 +1022,6 @@ impl FluentMediaPlayer {
     }
 
     fn exit_fullscreen(&mut self, ctx: &egui::Context) {
-        self.fs_grace = None;
         self.fs_settle = Some(std::time::Instant::now());
         self.show_controls = true;
         self.is_fullscreen = false;
@@ -1366,7 +1353,6 @@ impl eframe::App for FluentMediaPlayer {
         });
 
         // ── Controls visibility logic ─────────────────────────────────────────
-        self.shown_before_input = self.show_controls;
         if inp.moved || inp.active || inp.scroll_y != 0.0 {
             self.last_mouse_move = std::time::Instant::now();
         }
@@ -1390,15 +1376,7 @@ impl eframe::App for FluentMediaPlayer {
             let over_top = inp.pointer.map_or(false, |p| p.y < TOP_H);
             let over_bottom = inp.pointer.map_or(false, |p| p.y > screen.bottom() - BOTTOM_H);
             let speed_menu = ctx.memory(|m| m.is_popup_open(egui::Id::new(MORE_POPUP)));
-            // Entered fullscreen with the controls showing: they stay up, and hide the
-            // usual 2.5 s after the switch
-            let grace = self.fs_grace.map_or(false, |t0| t0.elapsed().as_secs_f32() < FS_SETTLE + HIDE_AFTER);
-            if !grace {
-                self.fs_grace = None;
-            } else {
-                ctx.request_repaint_after(std::time::Duration::from_millis(100));
-            }
-            self.show_controls = grace || speed_menu || (armed && over_bottom);
+            self.show_controls = speed_menu || (armed && over_bottom);
             self.show_top = self.main_menu || (armed && over_top);
         } else if settling {
             self.show_controls = true;
