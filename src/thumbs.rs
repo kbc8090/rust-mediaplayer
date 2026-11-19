@@ -5,8 +5,11 @@
 //! (to the nearest keyframe, which is quick), draws that frame small into an
 //! off-screen texture, and the texture is copied into the window above the seek bar.
 //!
-//! The thumbnail mpv is started the first time a file is opened, and like the main
-//! one it is only ever talked to through its own background thread (mpv_link.rs).
+//! The thumbnail mpv is started the first time the seek bar is hovered, and a file is
+//! only opened in it once the pointer is over the seek bar (not when the file starts
+//! playing, so it never competes with the main player then, nor holds memory for
+//! files whose seek bar is never hovered). Like the main mpv it is only ever talked
+//! to through its own background thread (mpv_link.rs).
 
 use crate::mpv_link::MpvLink;
 use eframe::egui;
@@ -43,38 +46,37 @@ pub struct Thumbs {
     mpv: Option<(Arc<Mutex<Mpv>>, MpvLink)>,
     gl_ready: bool,
     gl_failed: bool,
-    /// File waiting to be opened once the drawing side exists (mpv must have its
-    /// render context before a video starts, or it turns the video off)
+    /// The current file, not yet opened in the thumbnail player (that happens on
+    /// the first hover; mpv must have its render context first, or it turns the
+    /// video off)
     pending: Option<String>,
+    /// The seek bar has been hovered: start the thumbnail player
+    wanted: bool,
+    /// The opened file has finished loading and been sent the latest time
+    synced: bool,
     /// The time last asked for
     requested: Option<f64>,
 }
 
 impl Thumbs {
     pub fn new() -> Self {
-        Self { mpv: None, gl_ready: false, gl_failed: false, pending: None, requested: None }
+        Self { mpv: None, gl_ready: false, gl_failed: false, pending: None, wanted: false, synced: false, requested: None }
     }
 
-    /// Open `path` in the thumbnail player
+    /// A new file is playing: remember it for the thumbnail player (opened on the
+    /// first hover), and let go of the previous one
     pub fn load(&mut self, path: &str) {
         self.pending = Some(path.to_owned());
         self.requested = None;
-        self.flush();
-    }
-
-    fn flush(&mut self) {
-        if !self.gl_ready {
-            return;
-        }
-        if let (Some(path), Some((_, link))) = (self.pending.take(), &self.mpv) {
-            link.command("loadfile", &[&path]);
+        if let Some((_, link)) = &self.mpv {
+            link.command("stop", &[]);
         }
     }
 
     /// Start the thumbnail player and its drawing side once there is a file for it.
     /// Call from `update`, where the window's GL context is current.
     pub fn init_gl(&mut self, ctx: &egui::Context, get_proc_address: fn(&*mut c_void, &str) -> *mut c_void) {
-        if self.gl_ready || self.gl_failed || self.pending.is_none() {
+        if self.gl_ready || self.gl_failed || !self.wanted {
             return;
         }
         if self.mpv.is_none() {
@@ -104,7 +106,6 @@ impl Thumbs {
                 rc.set_update_callback(move || ctx.request_repaint());
                 GL.with(|g| *g.borrow_mut() = Some(Gl { rc, target: None }));
                 self.gl_ready = true;
-                self.flush();
             }
             Err(_) => self.gl_failed = true,
         }
@@ -132,13 +133,39 @@ impl Thumbs {
         (s.dwidth > 0 && s.dheight > 0).then(|| s.dwidth as f32 / s.dheight as f32)
     }
 
-    /// Ask for the frame at `secs`. Cheap to call every frame: mpv itself merges
-    /// seeks that arrive faster than it can carry them out.
-    pub fn request(&mut self, secs: f64) {
+    /// Ask for the frame at `secs` (the pointer is over the seek bar). Cheap to call
+    /// every frame: mpv itself merges seeks that arrive faster than it can carry
+    /// them out.
+    pub fn request(&mut self, ctx: &egui::Context, secs: f64) {
+        if !self.gl_ready {
+            // First hover: the player starts in the next frame (see init_gl)
+            if !self.gl_failed && !self.wanted {
+                self.wanted = true;
+                ctx.request_repaint();
+            }
+            return;
+        }
         let Some((_, link)) = &self.mpv else { return };
-        if self.requested.map_or(true, |r| (r - secs).abs() > 0.2) {
+        let at = format!("{secs:.2}");
+        if let Some(path) = self.pending.take() {
+            // Open the file right at the hovered time
+            link.set("start", &at);
+            link.command("loadfile", &[&path]);
             self.requested = Some(secs);
-            link.command("seek", &[&format!("{secs:.2}"), "absolute+keyframes"]);
+            self.synced = false;
+            return;
+        }
+        // Once it has loaded, catch up with wherever the pointer went meanwhile
+        let resend = !self.synced && {
+            let s = link.snapshot();
+            s.duration > 0.0 && s.dwidth > 0
+        };
+        if resend {
+            self.synced = true;
+        }
+        if resend || self.requested.map_or(true, |r| (r - secs).abs() > 0.2) {
+            self.requested = Some(secs);
+            link.command("seek", &[&at, "absolute+keyframes"]);
         }
     }
 

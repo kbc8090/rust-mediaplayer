@@ -132,6 +132,9 @@ struct Settings {
     multi: bool,
     /// Even out loud and quiet parts (menu). Off by default.
     normalize: bool,
+    /// Accent-colour window border even when Windows' own setting is off (menu).
+    /// Off by default.
+    border: bool,
 }
 
 /// Order of the files that previous / next step through, like Explorer's "Sort by"
@@ -171,9 +174,10 @@ fn save_settings(st: &Settings) {
     let _ = std::fs::write(
         path,
         format!(
-            "{} {} {} {} {} {} {} {} {} {} {}",
+            "{} {} {} {} {} {} {} {} {} {} {} {}",
             st.volume, st.muted as u8, st.repeat as u8, st.on_top as u8, st.hwdec, st.autoplay as u8,
-            st.sort_by.code(), st.sort_desc as u8, st.snap as u8, st.multi as u8, st.normalize as u8
+            st.sort_by.code(), st.sort_desc as u8, st.snap as u8, st.multi as u8, st.normalize as u8,
+            st.border as u8
         ),
     );
 }
@@ -194,6 +198,7 @@ fn load_settings() -> Settings {
     let snap = it.next().and_then(|t| t.parse::<u8>().ok()) != Some(0);
     let multi = it.next().and_then(|t| t.parse::<u8>().ok()) == Some(1);
     let normalize = it.next().and_then(|t| t.parse::<u8>().ok()) == Some(1);
+    let border = it.next().and_then(|t| t.parse::<u8>().ok()) == Some(1);
     Settings {
         volume: volume.map_or(80.0, |v| v.clamp(0.0, VOL_MAX)).round() as i32,
         muted,
@@ -206,6 +211,7 @@ fn load_settings() -> Settings {
         snap,
         multi,
         normalize,
+        border,
     }
 }
 
@@ -399,6 +405,10 @@ struct FluentMediaPlayer {
     menu_anchor: Rect,
     /// Previous frame, for moving the time display on smoothly
     last_tick: std::time::Instant,
+    /// Background folder scan: its number, and its result (number, files)
+    scan_gen: u64,
+    scan_result: Arc<Mutex<Option<(u64, Vec<PathBuf>)>>>,
+    egui_ctx: egui::Context,
     /// Order of previous / next in a folder
     sort_by: SortBy,
     sort_desc: bool,
@@ -414,6 +424,8 @@ struct FluentMediaPlayer {
     normalize: bool,
     /// Windows' "Show accent colour on title bars and window borders" setting
     accent_borders: bool,
+    /// Accent border from the menu (on top of Windows' setting)
+    border: bool,
     /// Windows 11: Windows draws our rounded corners and border; the colour last
     /// sent to it
     win11_frame: bool,
@@ -470,13 +482,10 @@ impl FluentMediaPlayer {
             // own. Older libmpv builds happened to pick this automatically; newer
             // ones default to their own video output (a separate "mpv" window).
             let _ = init.set_property("vo", "libmpv");
-            // mpv's own detailed log (overwritten every launch), for diagnosing
-            // differences between libmpv versions
+            // (No mpv log file any more: it wrote detailed debug output the whole
+            // time a video played. Remove the one older versions left behind.)
             if let Some(log) = settings_path().map(|p| p.with_file_name("mpv.log")) {
-                if let Some(dir) = log.parent() {
-                    let _ = std::fs::create_dir_all(dir);
-                }
-                let _ = init.set_property("log-file", log.to_string_lossy().as_ref());
+                let _ = std::fs::remove_file(log);
             }
             let _ = init.set_property("video-timing-offset", 0.0_f64);
             // Decoding: software by default (mpv's own default, and the newer mpv's
@@ -594,6 +603,9 @@ impl FluentMediaPlayer {
             show_keys: false,
             menu_anchor: Rect::NOTHING,
             last_tick: std::time::Instant::now(),
+            scan_gen: 0,
+            scan_result: Arc::new(Mutex::new(None)),
+            egui_ctx: cc.egui_ctx.clone(),
             sort_by: st.sort_by,
             sort_desc: st.sort_desc,
             rotation: 0,
@@ -602,6 +614,7 @@ impl FluentMediaPlayer {
             multi: st.multi,
             normalize: st.normalize,
             accent_borders: accent_borders_on(),
+            border: st.border,
             win11_frame: false,
             border_sent: None,
         }
@@ -618,12 +631,31 @@ impl FluentMediaPlayer {
             self.folder_files = entries;
             self.folder_index = Some(0);
             self.load_entry(&first);
+            self.scan_gen += 1; // a folder scan still running is no longer wanted
         } else {
             self.playlist = None;
-            self.folder_files = scan_folder(Path::new(path), self.sort_by, self.sort_desc);
-            self.folder_index = self.folder_files.iter().position(|p| p == Path::new(path));
+            // Previous / next become available once the folder has been read (in the
+            // background: a huge folder sorted by date would otherwise freeze the
+            // window for a moment)
+            self.folder_files = vec![PathBuf::from(path)];
+            self.folder_index = Some(0);
+            self.start_folder_scan(path);
             self.load_entry(path);
         }
+    }
+
+    /// Read and sort the file's folder on another thread; `update` picks up the result
+    fn start_folder_scan(&mut self, path: &str) {
+        self.scan_gen += 1;
+        let (gen, slot, ctx) = (self.scan_gen, self.scan_result.clone(), self.egui_ctx.clone());
+        let (path, by, desc) = (PathBuf::from(path), self.sort_by, self.sort_desc);
+        std::thread::spawn(move || {
+            let files = scan_folder(&path, by, desc);
+            if let Ok(mut s) = slot.lock() {
+                *s = Some((gen, files));
+            }
+            ctx.request_repaint();
+        });
     }
 
     /// Start playing `path` (keeps the current previous / next list)
@@ -666,9 +698,8 @@ impl FluentMediaPlayer {
         self.sort_by = by;
         self.sort_desc = desc;
         if self.playlist.is_none() && self.has_file {
-            let current = PathBuf::from(&self.current_file);
-            sort_files(&mut self.folder_files, by, desc);
-            self.folder_index = self.folder_files.iter().position(|p| *p == current);
+            let current = self.current_file.clone();
+            self.start_folder_scan(&current);
         }
     }
 
@@ -784,6 +815,7 @@ impl FluentMediaPlayer {
             snap: self.snap,
             multi: self.multi,
             normalize: self.normalize,
+            border: self.border,
         }
     }
 
@@ -971,6 +1003,16 @@ impl FluentMediaPlayer {
 
 impl eframe::App for FluentMediaPlayer {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        // ── Folder list from the background scan ──────────────────────────────
+        let scanned = self.scan_result.lock().ok().and_then(|mut s| s.take());
+        if let Some((gen, files)) = scanned {
+            if gen == self.scan_gen && self.playlist.is_none() {
+                let current = PathBuf::from(&self.current_file);
+                self.folder_index = files.iter().position(|p| *p == current);
+                self.folder_files = files;
+            }
+        }
+
         // ── Player state from the mpv thread (never waits for mpv) ────────────
         let snap = self.link.snapshot();
         let now = std::time::Instant::now();
@@ -1428,13 +1470,14 @@ impl eframe::App for FluentMediaPlayer {
         // Window border, following Windows' "Show accent colour on title bars and
         // window borders" setting.
         let focused = ctx.input(|i| i.viewport().focused.unwrap_or(true));
+        let accent_border = self.accent_borders || self.border;
         if self.win11_frame {
             // Windows 11 draws it (with the rounded corners): accent colour while
             // active if that setting is on, otherwise Windows' usual grey; none in
             // fullscreen
             let want = if self.is_fullscreen {
                 taskbar::BORDER_NONE
-            } else if self.accent_borders && focused {
+            } else if accent_border && focused {
                 let c = self.border_color;
                 c.r() as u32 | (c.g() as u32) << 8 | (c.b() as u32) << 16
             } else {
@@ -1444,7 +1487,7 @@ impl eframe::App for FluentMediaPlayer {
                 taskbar::set_border_color(self.hwnd, want);
                 self.border_sent = Some(want);
             }
-        } else if self.accent_borders && !self.is_fullscreen && !(self.hwnd != 0 && unsafe { IsZoomed(self.hwnd) != 0 }) {
+        } else if accent_border && !self.is_fullscreen && !(self.hwnd != 0 && unsafe { IsZoomed(self.hwnd) != 0 }) {
             // Windows 10: our own 1 px line (Windows doesn't draw one for a window
             // without a standard frame); grey while another window is active
             let col = if focused { self.border_color } else { Color32::from_rgb(70, 70, 72) };
@@ -2062,7 +2105,7 @@ fn draw_bottom_bar(app: &mut FluentMediaPlayer, ctx: &egui::Context, t: f32) {
                 p.text(r.center(), Align2::CENTER_CENTER, txt, font, white);
 
                 // Thumbnail of that moment, above the time
-                app.thumbs.request(secs);
+                app.thumbs.request(ctx, secs);
                 if let Some(aspect) = app.thumbs.aspect() {
                     let tw = (thumbs::THUMB_H * aspect).clamp(64.0, 200.0);
                     let th = (tw / aspect).clamp(40.0, 150.0);
@@ -2749,6 +2792,13 @@ fn draw_main_menu(app: &mut FluentMediaPlayer, ctx: &egui::Context) {
         MenuRow::Item { key: "normalize", label: "Normalize volume", hint: None, mark: Mark::Check(app.normalize) },
         MenuRow::Item { key: "snap", label: "Snap to screen edges", hint: None, mark: Mark::Check(app.snap) },
         MenuRow::Item { key: "multi", label: "Allow multiple windows", hint: None, mark: Mark::Check(app.multi) },
+        // (When Windows' own accent-border setting is on, it's on regardless)
+        MenuRow::Item {
+            key: "border",
+            label: "Accent color border",
+            hint: app.accent_borders.then_some("Windows"),
+            mark: Mark::Check(app.border || app.accent_borders),
+        },
         MenuRow::Sep,
         MenuRow::Header("Previous / next order"),
     ];
@@ -2860,6 +2910,7 @@ fn draw_main_menu(app: &mut FluentMediaPlayer, ctx: &egui::Context) {
         Some("autoplay") => app.autoplay = !app.autoplay,
         Some("normalize") => app.toggle_normalize(),
         Some("multi") => app.multi = !app.multi,
+        Some("border") if !app.accent_borders => app.border = !app.border,
         Some("snap") => {
             app.snap = !app.snap;
             taskbar::set_snap(app.snap);
