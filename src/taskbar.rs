@@ -183,6 +183,7 @@ unsafe extern "system" {
     fn MonitorFromRect(rect: *const RectI, flags: u32) -> isize;
     fn GetDpiForWindow(hwnd: isize) -> u32;
     fn GetCursorPos(point: *mut Point) -> i32;
+    fn EnumDisplaySettingsW(device: *const u16, mode: u32, devmode: *mut u32) -> i32;
     fn SendMessageW(hwnd: isize, msg: u32, wparam: usize, lparam: isize) -> isize;
 }
 
@@ -426,6 +427,31 @@ pub fn forward_to_running_instance(file: Option<&str>, forward: bool) -> bool {
         }
         SetForegroundWindow(hwnd);
         true
+    }
+}
+
+// ── Monitor refresh rate ──────────────────────────────────────────────────────
+/// The refresh rate (Hz) of the monitor the window is on, for smooth motion
+pub fn monitor_refresh_hz(hwnd: isize) -> Option<u32> {
+    #[repr(C)]
+    struct MonitorInfoEx {
+        info: MonitorInfo,
+        device: [u16; 32],
+    }
+    unsafe {
+        let mut mi: MonitorInfoEx = std::mem::zeroed();
+        mi.info.size = std::mem::size_of::<MonitorInfoEx>() as u32;
+        if GetMonitorInfoW(MonitorFromWindow(hwnd, 2), &mut mi as *mut MonitorInfoEx as *mut MonitorInfo) == 0 {
+            return None;
+        }
+        // DEVMODEW: 220 bytes; dmSize at byte 68, dmDisplayFrequency at byte 184
+        let mut dm = [0u32; 55];
+        dm[17] = 220; // dmSize (u16 at 68) + dmDriverExtra 0 (u16 at 70)
+        if EnumDisplaySettingsW(mi.device.as_ptr(), 0xFFFF_FFFF /* ENUM_CURRENT_SETTINGS */, dm.as_mut_ptr()) == 0 {
+            return None;
+        }
+        let hz = dm[46];
+        (hz > 1).then_some(hz)
     }
 }
 

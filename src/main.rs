@@ -2,6 +2,7 @@
 
 use eframe::egui::{self, pos2, vec2, Align2, Color32, FontFamily, FontId, Pos2, Rect, Sense, Stroke};
 use libmpv2::{Mpv, render::{RenderContext, OpenGLInitParams, RenderParam, RenderParamApiType}};
+mod adjust;
 mod mpv_link;
 mod splash;
 mod taskbar;
@@ -105,6 +106,14 @@ struct WinState {
 impl WinState {
     const DEFAULT: WinState = WinState { x: 0.0, y: 0.0, w: 960.0, h: 540.0, ppp: 1.0, maximized: false };
 }
+
+/// Picture & sound settings (one "name=value" per line)
+fn adjust_path() -> PathBuf {
+    settings_path().map_or_else(|| PathBuf::from("adjust.txt"), |p| p.with_file_name("adjust.txt"))
+}
+
+/// Smooth motion is on: the video drawing tells mpv when each frame was shown
+static SMOOTH_MOTION: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 fn settings_path() -> Option<PathBuf> {
     std::env::var_os("APPDATA").map(|d| PathBuf::from(d).join("rust-mediaplayer").join("settings.txt"))
@@ -305,10 +314,6 @@ const INFO_TOP: f32 = OSD_TOP + 42.0 + 10.0;
 /// is smaller than the window: a sharper, cleaner one that costs more GPU time.
 const HQ_SCALE: &str = "ewa_lanczossharp";
 const NORMAL_SCALE: &str = "lanczos";
-/// Volume normalizer: FFmpeg's "dynamic audio normalizer" (built into mpv). It looks
-/// ~1 s ahead and smoothly raises quiet passages / lowers loud ones, so dialogue and
-/// explosions (or songs from different albums) come out at a more even level.
-const NORMALIZER: &str = "lavfi=[dynaudnorm=f=150:g=15]";
 /// Decoding methods H cycles through: mpv's hwdec value, and its name on screen.
 /// "Copy" methods decode on the GPU and copy each frame back before drawing (most
 /// compatible); "direct" ones hand frames straight to OpenGL (fastest, but need
@@ -449,6 +454,14 @@ struct FluentMediaPlayer {
     accent_borders: bool,
     /// Accent-colour window border (menu)
     border: bool,
+    /// Picture & sound adjustments, the last saved copy, and when they last changed
+    adjust: adjust::Adjust,
+    adjust_saved: adjust::Adjust,
+    adjust_changed: std::time::Instant,
+    adjust_ui: adjust::AdjustUi,
+    /// Filter chains last sent to mpv
+    last_vf: Option<String>,
+    last_af: Option<String>,
     /// High-quality upscaling (menu)
     hq: bool,
     /// Windows 11: Windows draws our rounded corners and border; the colour last
@@ -540,9 +553,6 @@ impl FluentMediaPlayer {
         .expect("Failed to initialize libmpv!");
         let _ = mpv.set_property("osc", "no");
         let _ = mpv.set_property("keep-open", "yes");
-        if st.normalize {
-            let _ = mpv.set_property("af", NORMALIZER);
-        }
         if st.hq {
             let _ = mpv.set_property("scale", HQ_SCALE);
         }
@@ -568,7 +578,8 @@ impl FluentMediaPlayer {
             }
         });
 
-        Self {
+        let adjust = adjust::Adjust::load(&adjust_path());
+        let mut app = Self {
             mpv: mpv.clone(),
             link,
             hold_until: std::time::Instant::now(),
@@ -647,7 +658,15 @@ impl FluentMediaPlayer {
             hq: st.hq,
             win11_frame: false,
             border_sent: None,
-        }
+            adjust: adjust.clone(),
+            adjust_saved: adjust,
+            adjust_changed: std::time::Instant::now(),
+            adjust_ui: adjust::AdjustUi::new(),
+            last_vf: None,
+            last_af: None,
+        };
+        app.apply_adjust_all();
+        app
     }
 
     /// Open a file the user picked (drop, Open dialog, command line). For a playlist,
@@ -751,13 +770,126 @@ impl FluentMediaPlayer {
         self.link.set("scale", if self.hq { HQ_SCALE } else { NORMAL_SCALE });
     }
 
-    /// Volume normalizer on / off
-    fn toggle_normalize(&mut self) {
-        self.normalize = !self.normalize;
-        if self.normalize {
-            self.link.command("af", &["set", NORMALIZER]);
+    // ── Picture & sound adjustments ─────────────────────────────────────────
+    /// Send every adjustment to mpv (at startup)
+    fn apply_adjust_all(&mut self) {
+        let a = self.adjust.clone();
+        for (name, v) in [
+            ("brightness", a.brightness),
+            ("contrast", a.contrast),
+            ("saturation", a.saturation),
+            ("gamma", a.gamma),
+            ("hue", a.hue),
+        ] {
+            if v != 0 {
+                self.link.set(name, v);
+            }
+        }
+        if a.deband {
+            self.link.set("deband", "yes");
+        }
+        if a.deinterlace {
+            self.link.set("deinterlace", "yes");
+        }
+        if a.delay_ms != 0 {
+            self.link.set("audio-delay", a.delay_ms as f64 / 1000.0);
+        }
+        if !a.keep_pitch {
+            self.link.set("audio-pitch-correction", "no");
+        }
+        if a.smooth {
+            self.apply_smooth();
+        }
+        self.apply_vf();
+        self.apply_af(true);
+    }
+
+    /// Send what changed between `old` and the current adjustments to mpv
+    fn apply_adjust_changes(&mut self, old: &adjust::Adjust, old_normalize: bool) {
+        let a = self.adjust.clone();
+        for (name, before, now) in [
+            ("brightness", old.brightness, a.brightness),
+            ("contrast", old.contrast, a.contrast),
+            ("saturation", old.saturation, a.saturation),
+            ("gamma", old.gamma, a.gamma),
+            ("hue", old.hue, a.hue),
+        ] {
+            if before != now {
+                self.link.set(name, now);
+            }
+        }
+        if old.deband != a.deband {
+            self.link.set("deband", yn(a.deband));
+        }
+        if old.deinterlace != a.deinterlace {
+            self.link.set("deinterlace", yn(a.deinterlace));
+        }
+        if old.delay_ms != a.delay_ms {
+            self.link.set("audio-delay", a.delay_ms as f64 / 1000.0);
+        }
+        if old.keep_pitch != a.keep_pitch {
+            self.link.set("audio-pitch-correction", yn(a.keep_pitch));
+        }
+        if old.smooth != a.smooth {
+            self.apply_smooth();
+        }
+        self.apply_vf();
+        // Only the equalizer's gains changed: send them to the running filters
+        // (no rebuild, so dragging a slider doesn't make the sound drop out)
+        let same_shape = old.af_chain(old_normalize, false) == a.af_chain(self.normalize, false);
+        if same_shape && a.eq_on {
+            if old.eq != a.eq {
+                self.link.command("af-command", &["eq", "gain_entry", &a.eq_entries()]);
+            }
+            if old.preamp != a.preamp {
+                self.link.command("af-command", &["eqpre", "volume", &format!("{}dB", a.preamp)]);
+            }
+            // (kept in step so a later rebuild has the same values)
+            self.last_af = a.af_chain(self.normalize, true);
         } else {
-            self.link.command("af", &["clr", ""]);
+            self.apply_af(false);
+        }
+    }
+
+    /// Picture filters plus mirroring, as one filter chain
+    fn apply_vf(&mut self) {
+        let chain = self.adjust.vf_chain(self.mirror);
+        if chain != self.last_vf {
+            match &chain {
+                Some(c) => self.link.command("vf", &["set", c]),
+                None => self.link.command("vf", &["clr", ""]),
+            }
+            self.last_vf = chain;
+        }
+    }
+
+    /// Sound filters (equalizer, night mode, normalizer, …) as one filter chain
+    fn apply_af(&mut self, force: bool) {
+        let chain = self.adjust.af_chain(self.normalize, true);
+        if force || chain != self.last_af {
+            match &chain {
+                Some(c) => self.link.command("af", &["set", c]),
+                None => self.link.command("af", &["clr", ""]),
+            }
+            self.last_af = chain;
+        }
+    }
+
+    /// Smooth motion: show frames in step with the monitor's refresh, blending
+    /// between them where needed
+    fn apply_smooth(&mut self) {
+        SMOOTH_MOTION.store(self.adjust.smooth, std::sync::atomic::Ordering::Relaxed);
+        if self.adjust.smooth {
+            // An embedded player has to tell mpv the monitor's refresh rate
+            if let Some(hz) = taskbar::monitor_refresh_hz(self.hwnd) {
+                self.link.set("display-fps-override", hz);
+                self.link.set("display-fps", hz); // (older mpv's name)
+            }
+            self.link.set("video-sync", "display-resample");
+            self.link.set("interpolation", "yes");
+        } else {
+            self.link.set("interpolation", "no");
+            self.link.set("video-sync", "audio");
         }
     }
 
@@ -783,11 +915,7 @@ impl FluentMediaPlayer {
     fn apply_view(&mut self) {
         // video-rotate adds to any rotation the file itself asks for (phone videos)
         self.link.set("video-rotate", self.rotation);
-        if self.mirror {
-            self.link.command("vf", &["set", "lavfi=[hflip]"]);
-        } else {
-            self.link.command("vf", &["clr", ""]);
-        }
+        self.apply_vf();
         self.thumbs.set_view(self.rotation, self.mirror);
     }
 
@@ -866,6 +994,9 @@ impl FluentMediaPlayer {
         let cur = self.current_settings();
         if cur != self.settings_saved {
             save_settings(&cur);
+        }
+        if self.adjust != self.adjust_saved {
+            self.adjust.save(&adjust_path());
         }
         terminate_now()
     }
@@ -1123,6 +1254,10 @@ impl eframe::App for FluentMediaPlayer {
             taskbar::hook_window(self.hwnd);
             self.taskbar = taskbar::Taskbar::new(self.hwnd);
             self.win11_frame = taskbar::round_corners(self.hwnd);
+            // (smooth motion needs the window to find the monitor's refresh rate)
+            if self.adjust.smooth {
+                self.apply_smooth();
+            }
         }
         if taskbar::take_fullscreen_failed() {
             ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(true));
@@ -1227,6 +1362,16 @@ impl eframe::App for FluentMediaPlayer {
             if self.win_changed.elapsed() > std::time::Duration::from_secs(1) {
                 save_window_state(&self.win_state);
                 self.win_saved = self.win_state;
+            } else {
+                ctx.request_repaint_after(std::time::Duration::from_millis(1100));
+            }
+        }
+
+        // Picture & sound adjustments: saved a second after the last change
+        if self.adjust != self.adjust_saved {
+            if self.adjust_changed.elapsed() > std::time::Duration::from_secs(1) {
+                self.adjust.save(&adjust_path());
+                self.adjust_saved = self.adjust.clone();
             } else {
                 ctx.request_repaint_after(std::time::Duration::from_millis(1100));
             }
@@ -1344,6 +1489,7 @@ impl eframe::App for FluentMediaPlayer {
             esc:   i.key_pressed(egui::Key::Escape),
             open:  i.modifiers.ctrl && i.key_pressed(egui::Key::O),
             rotate: !i.modifiers.ctrl && i.key_pressed(egui::Key::R),
+            adjust: !i.modifiers.ctrl && i.key_pressed(egui::Key::E),
             scroll_y: i.raw_scroll_delta.y,
             pressed: i.pointer.primary_pressed(),
             moved: i.pointer.delta().length_sq() > 0.5,
@@ -1357,7 +1503,7 @@ impl eframe::App for FluentMediaPlayer {
             self.last_mouse_move = std::time::Instant::now();
         }
         let near_edge = inp.pointer
-            .map_or(false, |p| p.y < TOP_H || p.y > screen.bottom() - BOTTOM_H);
+            .map_or(false, |p| p.y < TOP_H || p.y > screen.bottom() - BOTTOM_H || self.adjust_ui.contains(p));
         let menu_open = self.main_menu || self.show_keys || ctx.memory(|m| m.is_popup_open(egui::Id::new(MORE_POPUP)));
         let idle = self.last_mouse_move.elapsed().as_secs_f32();
         let settling = self.fs_settle.map_or(false, |t0| t0.elapsed().as_secs_f32() < FS_SETTLE);
@@ -1406,11 +1552,16 @@ impl eframe::App for FluentMediaPlayer {
         if inp.hw    { self.toggle_hw_decode(); }
         if inp.open  { self.main_menu = false; self.show_open_dialog(); }
         if inp.rotate { self.rotate_90(); }
+        if inp.adjust { self.adjust_ui.open = !self.adjust_ui.open; }
 
 
         // Mouse wheel anywhere in the window = volume, 5 % per notch
-        // (egui reports one wheel notch as 50 points)
-        self.scroll_accum += inp.scroll_y;
+        // (egui reports one wheel notch as 50 points). Not over the Picture & sound
+        // panels (the wheel adjusts the setting there) or the shortcuts list.
+        let over_panels = inp.pointer.map_or(false, |p| self.adjust_ui.contains(p));
+        if !over_panels && !self.show_keys {
+            self.scroll_accum += inp.scroll_y;
+        }
         let steps = (self.scroll_accum / 50.0).trunc();
         if steps != 0.0 {
             self.scroll_accum -= steps * 50.0;
@@ -1473,6 +1624,11 @@ impl eframe::App for FluentMediaPlayer {
                                     // Acknowledge mpv's update first (its docs recommend calling
                                     // this after every update callback)
                                     let _ = rc.update();
+                                    // (smooth motion times frames by these reports: the
+                                    // previous frame has been shown by now)
+                                    if SMOOTH_MOTION.load(std::sync::atomic::Ordering::Relaxed) {
+                                        rc.report_swap();
+                                    }
                                     let _ = rc.render::<*mut std::os::raw::c_void>(
                                         0, vp.width_px, vp.height_px, true,
                                     );
@@ -1502,6 +1658,14 @@ impl eframe::App for FluentMediaPlayer {
         }
         if t > 0.0 {
             draw_bottom_bar(self, ctx, t);
+        }
+        // Picture & sound panel and the equalizer
+        let (before, before_norm) = (self.adjust.clone(), self.normalize);
+        adjust::draw_panel(ctx, &mut self.adjust_ui, &mut self.adjust, &mut self.normalize, self.accent);
+        adjust::draw_eq(ctx, &mut self.adjust_ui, &mut self.adjust, self.accent);
+        if self.adjust != before || self.normalize != before_norm {
+            self.adjust_changed = std::time::Instant::now();
+            self.apply_adjust_changes(&before, before_norm);
         }
         draw_shortcuts(self, ctx);
 
@@ -1589,7 +1753,7 @@ impl eframe::App for FluentMediaPlayer {
 struct InputSnapshot {
     dropped: Vec<String>,
     space: bool, right: bool, left: bool, up: bool, down: bool,
-    f: bool, d: bool, enter: bool, m: bool, n: bool, p: bool, info: bool, hw: bool, esc: bool, open: bool, rotate: bool,
+    f: bool, d: bool, enter: bool, m: bool, n: bool, p: bool, info: bool, hw: bool, esc: bool, open: bool, rotate: bool, adjust: bool,
     scroll_y: f32,
     pressed: bool,
     moved: bool, active: bool,
@@ -2701,6 +2865,7 @@ const SHORTCUTS: &[(&[&str], &str)] = &[
     (&["Esc"], "Leave full screen / close menu"),
     (&["R"], "Rotate 90\u{b0}"),
     (&["Ctrl+O"], "Open file"),
+    (&["E"], "Picture & sound"),
     (&["I"], "Video info"),
     (&["H"], "Next decoding method"),
     (&["Media keys"], "Play / pause, next, previous"),
@@ -2846,7 +3011,7 @@ fn draw_main_menu(app: &mut FluentMediaPlayer, ctx: &egui::Context) {
         MenuRow::Item { key: "open", label: "Open file\u{2026}", hint: Some("Ctrl+O"), mark: Mark::None },
         MenuRow::Sep,
         MenuRow::Item { key: "autoplay", label: "Auto-play next file in folder", hint: None, mark: Mark::Check(app.autoplay) },
-        MenuRow::Item { key: "normalize", label: "Normalize volume", hint: None, mark: Mark::Check(app.normalize) },
+        MenuRow::Item { key: "adjust", label: "Picture & sound", hint: Some("E"), mark: Mark::None },
         MenuRow::Item { key: "hq", label: "High-quality upscaling", hint: None, mark: Mark::Check(app.hq) },
         MenuRow::Item { key: "snap", label: "Snap to screen edges", hint: None, mark: Mark::Check(app.snap) },
         MenuRow::Item { key: "multi", label: "Allow multiple windows", hint: None, mark: Mark::Check(app.multi) },
@@ -2960,7 +3125,7 @@ fn draw_main_menu(app: &mut FluentMediaPlayer, ctx: &egui::Context) {
         Some("keys") => app.show_keys = true,
         Some("quit") => app.quit(),
         Some("autoplay") => app.autoplay = !app.autoplay,
-        Some("normalize") => app.toggle_normalize(),
+        Some("adjust") => app.adjust_ui.open = true,
         Some("hq") => app.toggle_hq(),
         Some("multi") => app.multi = !app.multi,
         Some("border") => app.border = !app.border,
