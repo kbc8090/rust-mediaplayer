@@ -132,8 +132,7 @@ struct Settings {
     multi: bool,
     /// Even out loud and quiet parts (menu). Off by default.
     normalize: bool,
-    /// Accent-colour window border even when Windows' own setting is off (menu).
-    /// Off by default.
+    /// Accent-colour window border (menu). Off by default.
     border: bool,
 }
 
@@ -424,7 +423,7 @@ struct FluentMediaPlayer {
     normalize: bool,
     /// Windows' "Show accent colour on title bars and window borders" setting
     accent_borders: bool,
-    /// Accent border from the menu (on top of Windows' setting)
+    /// Accent-colour window border (menu)
     border: bool,
     /// Windows 11: Windows draws our rounded corners and border; the colour last
     /// sent to it
@@ -1467,19 +1466,21 @@ impl eframe::App for FluentMediaPlayer {
             }
         }
 
-        // Window border, following Windows' "Show accent colour on title bars and
-        // window borders" setting.
+        // Window border: the menu's "Accent color border" decides
         let focused = ctx.input(|i| i.viewport().focused.unwrap_or(true));
-        let accent_border = self.accent_borders || self.border;
+        let accent_border = self.border;
         if self.win11_frame {
             // Windows 11 draws it (with the rounded corners): accent colour while
-            // active if that setting is on, otherwise Windows' usual grey; none in
-            // fullscreen
+            // active when the option is on; otherwise the usual grey, as on a window
+            // with Windows' accent-border setting off; none in fullscreen
             let want = if self.is_fullscreen {
                 taskbar::BORDER_NONE
             } else if accent_border && focused {
                 let c = self.border_color;
                 c.r() as u32 | (c.g() as u32) << 8 | (c.b() as u32) << 16
+            } else if self.accent_borders {
+                // Windows' own setting would colour it: ask for plain grey instead
+                taskbar::BORDER_GREY
             } else {
                 taskbar::BORDER_DEFAULT
             };
@@ -2792,13 +2793,7 @@ fn draw_main_menu(app: &mut FluentMediaPlayer, ctx: &egui::Context) {
         MenuRow::Item { key: "normalize", label: "Normalize volume", hint: None, mark: Mark::Check(app.normalize) },
         MenuRow::Item { key: "snap", label: "Snap to screen edges", hint: None, mark: Mark::Check(app.snap) },
         MenuRow::Item { key: "multi", label: "Allow multiple windows", hint: None, mark: Mark::Check(app.multi) },
-        // (When Windows' own accent-border setting is on, it's on regardless)
-        MenuRow::Item {
-            key: "border",
-            label: "Accent color border",
-            hint: app.accent_borders.then_some("Windows"),
-            mark: Mark::Check(app.border || app.accent_borders),
-        },
+        MenuRow::Item { key: "border", label: "Accent color border", hint: None, mark: Mark::Check(app.border) },
         MenuRow::Sep,
         MenuRow::Header("Previous / next order"),
     ];
@@ -2910,7 +2905,7 @@ fn draw_main_menu(app: &mut FluentMediaPlayer, ctx: &egui::Context) {
         Some("autoplay") => app.autoplay = !app.autoplay,
         Some("normalize") => app.toggle_normalize(),
         Some("multi") => app.multi = !app.multi,
-        Some("border") if !app.accent_borders => app.border = !app.border,
+        Some("border") => app.border = !app.border,
         Some("snap") => {
             app.snap = !app.snap;
             taskbar::set_snap(app.snap);

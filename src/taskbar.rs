@@ -323,6 +323,8 @@ fn set_corners(hwnd: isize, round: bool) -> bool {
 /// is on) or BORDER_NONE
 pub const BORDER_DEFAULT: u32 = 0xFFFF_FFFF;
 pub const BORDER_NONE: u32 = 0xFFFF_FFFE;
+/// The grey Windows 11 gives window borders in dark mode
+pub const BORDER_GREY: u32 = 0x0040_4040;
 
 pub fn set_border_color(hwnd: isize, color: u32) {
     // DWMWA_BORDER_COLOR
