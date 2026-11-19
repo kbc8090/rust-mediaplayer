@@ -12,15 +12,15 @@
 use eframe::egui::{self, Color32, Rect};
 use egui_glow::glow::{self, HasContext};
 use std::cell::RefCell;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 /// The menu setting
 static ENABLED: AtomicBool = AtomicBool::new(true);
 /// Set false if the shaders can't be built on this PC
 static GL_OK: AtomicBool = AtomicBool::new(true);
-/// Panel edge colour while the glass is on (the window-border accent), as RGBA
-static EDGE: AtomicU32 = AtomicU32::new(0x5866_34FF);
+/// Hairline around glass panels: Windows 11's own flyout outline (a 40 % grey)
+const EDGE: Color32 = Color32::from_rgba_premultiplied(47, 47, 47, 102);
 
 /// Dark tint over the blur: (grey level, strength)
 const TINT: (f32, f32) = (32.0 / 255.0, 0.64);
@@ -29,9 +29,8 @@ const DOWN: i32 = 4;
 /// Extra pixels captured around the panel so the blur has something at its edges
 const MARGIN: i32 = 40;
 
-pub fn set_style(enabled: bool, edge: Color32) {
+pub fn set_style(enabled: bool) {
     ENABLED.store(enabled, Ordering::Relaxed);
-    EDGE.store(u32::from_be_bytes([edge.r(), edge.g(), edge.b(), 255]), Ordering::Relaxed);
 }
 
 /// Glass is in use (on in the menu, and working on this PC)
@@ -39,11 +38,10 @@ pub fn active() -> bool {
     ENABLED.load(Ordering::Relaxed) && GL_OK.load(Ordering::Relaxed)
 }
 
-/// The panel edge colour: the accent with glass on, `solid` (the usual grey) without
+/// The panel edge colour: a light grey hairline with glass on, `solid` without
 pub fn edge(solid: Color32) -> Color32 {
     if active() {
-        let [r, g, b, _] = EDGE.load(Ordering::Relaxed).to_be_bytes();
-        Color32::from_rgb(r, g, b)
+        EDGE
     } else {
         solid
     }

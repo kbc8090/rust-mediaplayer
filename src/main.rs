@@ -268,8 +268,6 @@ fn load_window_state() -> Option<WinState> {
 }
 
 // ── Palette ───────────────────────────────────────────────────────────────────
-/// Used only if the Windows accent colour can't be read
-const DEFAULT_ACCENT: Color32 = Color32::from_rgb(0, 120, 212);
 const KNOB_RING:  Color32 = Color32::from_rgb(186, 186, 188); // muted light ring around the knob
 const TRACK:      Color32 = Color32::from_rgb(190, 184, 180); // unplayed seek track
 const VOL_TRACK:  Color32 = Color32::from_rgb(160, 158, 155); // unplayed volume track
@@ -1694,7 +1692,7 @@ impl eframe::App for FluentMediaPlayer {
         } else {
             self.speed_menu = false;
         }
-        glass::set_style(self.glass, self.border_color);
+        glass::set_style(self.glass);
 
         // A click on the video itself (not on the bars, menus or panels) closes the
         // menu and the Picture & Sound / equalizer panels
@@ -2729,52 +2727,25 @@ fn reg_dword(sub_key: &str, value: &str) -> Option<u32> {
     (rc == 0).then_some(data)
 }
 
-/// Reads a REG_BINARY value into `buf`, returning how many bytes were read
-fn reg_binary(sub_key: &str, value: &str, buf: &mut [u8]) -> Option<usize> {
-    let (key, val) = (wide(sub_key), wide(value));
-    let mut len = buf.len() as u32;
-    // RRF_RT_REG_BINARY = 0x08
-    let rc = unsafe {
-        RegGetValueW(
-            0x8000_0001_u32 as i32 as isize,
-            key.as_ptr(),
-            val.as_ptr(),
-            0x08,
-            std::ptr::null_mut(),
-            buf.as_mut_ptr() as *mut std::ffi::c_void,
-            &mut len,
-        )
-    };
-    (rc == 0).then_some(len as usize)
-}
-
-/// The accent colour from Windows Settings (static, or picked from the wallpaper)
+/// The accent colour the controls use (seek and volume bars, switches, selected
+/// items): Windows' title-bar accent, the same calm shade as the window border.
+/// Only an accent too dark to see on the dark control bar is brightened, just
+/// enough to stand out (at least 3:1 against black).
 fn system_accent() -> Color32 {
-    const ACCENT_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Explorer\Accent";
-
-    // AccentPalette holds 8 RGBA colours: Light3, Light2, Light1, *Accent*, Dark1, Dark2, Dark3, —.
-    // Entry 3 is the accent exactly as Settings shows it.
-    let mut palette = [0u8; 32];
-    let from_palette = reg_binary(ACCENT_KEY, "AccentPalette", &mut palette)
-        .filter(|&n| n >= 16)
-        .map(|_| (palette[12], palette[13], palette[14]));
-
-    // Fallbacks. AccentColorMenu / DWM\AccentColor are 0xAABBGGRR, ColorizationColor is 0xAARRGGBB.
-    let rgb = from_palette
-        .or_else(|| {
-            reg_dword(ACCENT_KEY, "AccentColorMenu")
-                .or_else(|| reg_dword(r"Software\Microsoft\Windows\DWM", "AccentColor"))
-                .map(|v| ((v & 0xFF) as u8, ((v >> 8) & 0xFF) as u8, ((v >> 16) & 0xFF) as u8))
-        })
-        .or_else(|| {
-            reg_dword(r"Software\Microsoft\Windows\DWM", "ColorizationColor")
-                .map(|v| (((v >> 16) & 0xFF) as u8, ((v >> 8) & 0xFF) as u8, (v & 0xFF) as u8))
-        });
-
-    match rgb {
-        Some((r, g, b)) => vivid_accent(r, g, b),
-        None => DEFAULT_ACCENT,
+    let c = border_accent();
+    let lin = |v: f32| {
+        let v = v / 255.0;
+        if v <= 0.04045 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) }
+    };
+    let lum = |c: [f32; 3]| 0.2126 * lin(c[0]) + 0.7152 * lin(c[1]) + 0.0722 * lin(c[2]);
+    let mut rgb = [c.r() as f32, c.g() as f32, c.b() as f32];
+    for _ in 0..60 {
+        if lum(rgb) >= 0.10 {
+            break;
+        }
+        rgb = rgb.map(|v| (v * 1.04 + 2.0).min(255.0));
     }
+    Color32::from_rgb(rgb[0].round() as u8, rgb[1].round() as u8, rgb[2].round() as u8)
 }
 
 /// Windows' "Show accent colour on title bars and window borders" (Settings →
@@ -2784,8 +2755,7 @@ fn accent_borders_on() -> bool {
 }
 
 /// The window border colour: Windows' title-bar accent (what Explorer's title bar
-/// shows), lifted slightly the way Windows draws its own 1 px borders. Much calmer
-/// than the boosted accent the controls use.
+/// shows), lifted slightly the way Windows draws its own 1 px borders.
 fn border_accent() -> Color32 {
     const ACCENT_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Explorer\Accent";
     let abgr = reg_dword(ACCENT_KEY, "AccentColorMenu")
@@ -2795,50 +2765,6 @@ fn border_accent() -> Color32 {
     Color32::from_rgb(ch(v), ch(v >> 8), ch(v >> 16))
 }
 
-/// Make the accent punchy on a dark video background: keep the hue, raise saturation
-/// and brightness (never mix with white — that washes the colour out).
-fn vivid_accent(r: u8, g: u8, b: u8) -> Color32 {
-    let (h, s, v) = rgb_to_hsv(r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0);
-    // Genuinely grey accents stay grey; anything with colour gets pushed
-    let s = if s < 0.12 { s } else { (s * 1.25).clamp(0.65, 1.0) };
-    let v = v.max(0.96);
-    let (r, g, b) = hsv_to_rgb(h, s, v);
-    Color32::from_rgb((r * 255.0).round() as u8, (g * 255.0).round() as u8, (b * 255.0).round() as u8)
-}
-
-/// h in 0..360, s and v in 0..1
-fn rgb_to_hsv(r: f32, g: f32, b: f32) -> (f32, f32, f32) {
-    let max = r.max(g).max(b);
-    let min = r.min(g).min(b);
-    let d = max - min;
-    let h = if d == 0.0 {
-        0.0
-    } else if max == r {
-        60.0 * (((g - b) / d).rem_euclid(6.0))
-    } else if max == g {
-        60.0 * ((b - r) / d + 2.0)
-    } else {
-        60.0 * ((r - g) / d + 4.0)
-    };
-    (h, if max == 0.0 { 0.0 } else { d / max }, max)
-}
-
-fn hsv_to_rgb(h: f32, s: f32, v: f32) -> (f32, f32, f32) {
-    let c = v * s;
-    let x = c * (1.0 - ((h / 60.0).rem_euclid(2.0) - 1.0).abs());
-    let m = v - c;
-    let (r, g, b) = match (h / 60.0) as u32 % 6 {
-        0 => (c, x, 0.0),
-        1 => (x, c, 0.0),
-        2 => (0.0, c, x),
-        3 => (0.0, x, c),
-        4 => (x, 0.0, c),
-        _ => (c, 0.0, x),
-    };
-    (r + m, g + m, b + m)
-}
-
-// ── Pop-ups ───────────────────────────────────────────────────────────────────
 /// Pill in the top left: icon, value, and a slim bar showing `frac`
 fn draw_osd(
     ctx: &egui::Context,
@@ -3394,7 +3320,7 @@ fn draw_speed_menu(app: &mut FluentMediaPlayer, ctx: &egui::Context) {
     }
     let id = egui::Id::new("speed_menu");
     let mut picked = None;
-    let selected = app.accent.gamma_multiply(0.38);
+    let selected = app.accent.gamma_multiply(0.5);
     egui::Area::new(id).order(egui::Order::Foreground).fixed_pos(rect.min).show(ctx, |ui| {
         picked = draw_menu_rows(ui, rect, &rows, None, Some(selected), MenuSize::COMPACT).0;
     });
