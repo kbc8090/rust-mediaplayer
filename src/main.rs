@@ -1884,12 +1884,16 @@ fn hit_at(ui: &mut egui::Ui, centre: Pos2, id: &str, tip: &str, t: f32, above: b
         // drags starting on a button must not move the window (see the window buttons)
         Sense::click_and_drag(),
     );
-    if r.hovered() {
+    let inside = ui.input(|i| i.pointer.latest_pos()).map_or(false, |p| r.rect.contains(p));
+    let pressed = r.is_pointer_button_down_on() && inside;
+    if r.hovered() || pressed {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        // hover, and a little brighter while the mouse button is held on it
+        let a = if pressed { 13.0 } else { 8.0 };
         ui.painter().rect_filled(
             Rect::from_center_size(centre, vec2(BTN_BOX, BTN_BOX)),
             8.0,
-            Color32::from_white_alpha((8.0 * t) as u8),
+            Color32::from_white_alpha((a * t) as u8),
         );
     }
     hover_tooltip(ui.ctx(), &r, Rect::from_center_size(centre, vec2(BTN_BOX, BTN_BOX)), tip, above);
@@ -2877,7 +2881,7 @@ const SHORTCUTS: &[(&[&str], &str)] = &[
     (&["Esc"], "Leave full screen / close menu"),
     (&["R"], "Rotate 90\u{b0}"),
     (&["Ctrl+O"], "Open file"),
-    (&["E"], "Picture & sound"),
+    (&["E"], "Picture & Sound"),
     (&["I"], "Video info"),
     (&["H"], "Next decoding method"),
     (&["Media keys"], "Play / pause, next, previous"),
@@ -2935,8 +2939,8 @@ fn draw_shortcuts(app: &mut FluentMediaPlayer, ctx: &egui::Context) {
             // Close button (top right)
             let xr = Rect::from_center_size(pos2(rect.right() - 24.0, rect.top() + HEAD_H / 2.0), vec2(30.0, 30.0));
             let xb = ui.interact(xr, ui.id().with("close"), Sense::click_and_drag());
-            if xb.hovered() {
-                p.rect_filled(xr, 4.0, Color32::from_rgba_premultiplied(14, 14, 14, 14));
+            if let Some(c) = adjust::state_fill(&xb) {
+                p.rect_filled(xr, 4.0, c);
             }
             let c = xr.center();
             for (a, b) in [((-5.0, -5.0), (5.0, 5.0)), ((-5.0, 5.0), (5.0, -5.0))] {
@@ -3020,7 +3024,7 @@ fn draw_main_menu(app: &mut FluentMediaPlayer, ctx: &egui::Context) {
     let mut rows = vec![
         MenuRow::Item { key: "open", label: "Open file\u{2026}", hint: Some("Ctrl+O"), mark: Mark::None },
         MenuRow::Sep,
-        MenuRow::Item { key: "adjust", label: "Picture & sound", hint: Some("E"), mark: Mark::None },
+        MenuRow::Item { key: "adjust", label: "Picture & Sound", hint: Some("E"), mark: Mark::None },
         MenuRow::Item { key: "snap", label: "Snap to screen edges", hint: None, mark: Mark::Check(app.snap) },
         MenuRow::Item { key: "multi", label: "Allow multiple windows", hint: None, mark: Mark::Check(app.multi) },
         MenuRow::Item { key: "border", label: "Accent color border", hint: None, mark: Mark::Check(app.border) },
@@ -3098,8 +3102,8 @@ fn draw_main_menu(app: &mut FluentMediaPlayer, ctx: &egui::Context) {
                     MenuRow::Item { key, label, hint, mark } => {
                         let ir = Rect::from_min_size(pos2(rect.left() + PAD, top), vec2(W - 2.0 * PAD, h));
                         let resp = ui.interact(ir, ui.id().with(*key), Sense::click_and_drag());
-                        if resp.hovered() {
-                            p.rect_filled(ir, 4.0, Color32::from_rgba_premultiplied(14, 14, 14, 14));
+                        if let Some(c) = adjust::state_fill(&resp) {
+                            p.rect_filled(ir, 4.0, c);
                         }
                         match mark {
                             Mark::Check(true) => {

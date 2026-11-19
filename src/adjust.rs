@@ -1,4 +1,4 @@
-//! "Picture & sound" panel and the equalizer panel.
+//! "Picture & Sound" panel and the equalizer panel.
 //!
 //! Everything here is plain settings plus drawing: the panels change an `Adjust`
 //! value, and main.rs compares it with the previous one and sends the differences
@@ -334,7 +334,22 @@ const TEXT: Color32 = Color32::from_rgb(240, 240, 240);
 const DIM: Color32 = Color32::from_rgb(160, 160, 160);
 const CAP: Color32 = Color32::from_rgb(64, 64, 66);
 const CAP_EDGE: Color32 = Color32::from_rgb(52, 52, 54);
-const HOVER: Color32 = Color32::from_rgba_premultiplied(14, 14, 14, 14);
+/// Highlight under the pointer, and while the mouse button is held on it
+pub const HOVER: Color32 = Color32::from_rgba_premultiplied(26, 26, 26, 26);
+pub const PRESS: Color32 = Color32::from_rgba_premultiplied(50, 50, 50, 50);
+
+/// The highlight for a clickable item: pressed (button held with the pointer still
+/// on it), hovered, or none
+pub fn state_fill(resp: &egui::Response) -> Option<Color32> {
+    let inside = resp.ctx.input(|i| i.pointer.latest_pos()).map_or(false, |p| resp.rect.contains(p));
+    if resp.is_pointer_button_down_on() && inside {
+        Some(PRESS)
+    } else if resp.hovered() {
+        Some(HOVER)
+    } else {
+        None
+    }
+}
 const LINE: Color32 = Color32::from_rgba_premultiplied(26, 26, 26, 26);
 const NAME_SIZE: f32 = 13.5;
 const VALUE_SIZE: f32 = 12.5;
@@ -359,8 +374,8 @@ fn header(ui: &mut egui::Ui, p: &egui::Painter, rect: Rect, title: &str, id: &st
 
     let xr = Rect::from_center_size(pos2(rect.right() - 22.0, cy), vec2(28.0, 28.0));
     let x = ui.interact(xr, ui.id().with((id, "close")), Sense::click());
-    if x.hovered() {
-        p.rect_filled(xr, 4.0, HOVER);
+    if let Some(c) = state_fill(&x) {
+        p.rect_filled(xr, 4.0, c);
     }
     let c = xr.center();
     for (a, b) in [((-5.0, -5.0), (5.0, 5.0)), ((-5.0, 5.0), (5.0, -5.0))] {
@@ -371,8 +386,8 @@ fn header(ui: &mut egui::Ui, p: &egui::Painter, rect: Rect, title: &str, id: &st
     let g = p.layout_no_wrap("Reset".to_owned(), font, DIM);
     let rr = Rect::from_center_size(pos2(xr.left() - 10.0 - g.size().x / 2.0, cy), g.size() + vec2(10.0, 8.0));
     let reset = ui.interact(rr, ui.id().with((id, "reset")), Sense::click());
-    if reset.hovered() {
-        p.rect_filled(rr, 4.0, HOVER);
+    if let Some(c) = state_fill(&reset) {
+        p.rect_filled(rr, 4.0, c);
     }
     let col = if reset.hovered() { TEXT } else { DIM };
     p.galley(rr.center() - g.size() / 2.0, g, col);
@@ -387,11 +402,12 @@ fn header(ui: &mut egui::Ui, p: &egui::Painter, rect: Rect, title: &str, id: &st
 /// A key cap button ("−" / "+") with its label at `size`; returns true when clicked
 fn cap_sized(ui: &mut egui::Ui, p: &egui::Painter, rect: Rect, label: &str, id: egui::Id, size: f32) -> bool {
     let resp = ui.interact(rect, id, Sense::click());
-    let pressed = resp.is_pointer_button_down_on();
+    let inside = resp.ctx.input(|i| i.pointer.latest_pos()).map_or(false, |p| rect.contains(p));
+    let pressed = resp.is_pointer_button_down_on() && inside;
     let fill = if pressed {
-        CAP_EDGE
+        Color32::from_rgb(98, 98, 100)
     } else if resp.hovered() {
-        Color32::from_rgb(76, 76, 78)
+        Color32::from_rgb(82, 82, 84)
     } else {
         CAP
     };
@@ -447,7 +463,7 @@ fn signed(v: i32) -> String {
     if v > 0 { format!("+{v}") } else { v.to_string() }
 }
 
-// ── The "Picture & sound" panel ───────────────────────────────────────────────
+// ── The "Picture & Sound" panel ───────────────────────────────────────────────
 
 enum Row {
     /// name, description, value text, value changed from normal, (−, +) actions
@@ -616,7 +632,7 @@ pub fn draw_panel(ctx: &egui::Context, ui_state: &mut AdjustUi, a: &mut Adjust, 
         ui.allocate_rect(rect, Sense::click_and_drag());
         let p = ui.painter().clone();
         panel_frame(&p, rect);
-        let (reset, close) = header(ui, &p, rect, "Picture & sound", "adjust");
+        let (reset, close) = header(ui, &p, rect, "Picture & Sound", "adjust");
         if close {
             ui_state.open = false;
         }
@@ -647,11 +663,7 @@ pub fn draw_panel(ctx: &egui::Context, ui_state: &mut AdjustUi, a: &mut Adjust, 
                 p.rect_filled(tr, 5.0, accent);
                 p.with_clip_rect(tr).rect_filled(tr.translate(vec2(0.0, -2.0)), 5.0, Color32::from_rgb(68, 68, 68));
             } else {
-                let fill = if resp.hovered() {
-                    Color32::from_rgba_premultiplied(16, 16, 16, 16)
-                } else {
-                    Color32::from_rgba_premultiplied(8, 8, 8, 8)
-                };
+                let fill = state_fill(&resp).unwrap_or(Color32::from_rgba_premultiplied(8, 8, 8, 8));
                 p.rect_filled(tr, 5.0, fill);
             }
             let (font, col) = if on { (semibold(NAME_SIZE), TEXT) } else { (FontId::proportional(NAME_SIZE), Color32::from_rgb(200, 200, 200)) };
@@ -716,8 +728,10 @@ pub fn draw_panel(ctx: &egui::Context, ui_state: &mut AdjustUi, a: &mut Adjust, 
                     }
                     Row::Switch(name, desc, on, key) => {
                         let resp = ui.interact(r, ui.id().with((*name, "switch")), Sense::click());
+                        if let Some(c) = state_fill(&resp) {
+                            p.rect_filled(r, 4.0, c);
+                        }
                         if resp.hovered() {
-                            p.rect_filled(r, 4.0, HOVER);
                             hovered_desc = Some((r, desc));
                         }
                         p.text(pos2(r.left() + 10.0, r.center().y), Align2::LEFT_CENTER, *name, FontId::proportional(NAME_SIZE), TEXT);
@@ -728,8 +742,10 @@ pub fn draw_panel(ctx: &egui::Context, ui_state: &mut AdjustUi, a: &mut Adjust, 
                     }
                     Row::Equalizer(on) => {
                         let resp = ui.interact(r, ui.id().with("eq_button"), Sense::click());
+                        if let Some(c) = state_fill(&resp) {
+                            p.rect_filled(r, 4.0, c);
+                        }
                         if resp.hovered() {
-                            p.rect_filled(r, 4.0, HOVER);
                             hovered_desc = Some((r, "Adjust bass, mids and treble with a 10-band equalizer."));
                         }
                         p.text(pos2(r.left() + 10.0, r.center().y), Align2::LEFT_CENTER, "Equalizer\u{2026}", FontId::proportional(NAME_SIZE), TEXT);
@@ -794,8 +810,8 @@ pub fn draw_eq(ctx: &egui::Context, ui_state: &mut AdjustUi, a: &mut Adjust, acc
         let cy = rect.top() + HEAD_H + 20.0;
         let sw_row = Rect::from_min_size(pos2(rect.left() + 8.0, cy - 14.0), vec2(80.0, 28.0));
         let sw = ui.interact(sw_row, ui.id().with("eq_on"), Sense::click());
-        if sw.hovered() {
-            p.rect_filled(sw_row, 4.0, HOVER);
+        if let Some(c) = state_fill(&sw) {
+            p.rect_filled(sw_row, 4.0, c);
         }
         switch(&p, Rect::from_min_size(pos2(sw_row.left() + 8.0, cy - 9.5), vec2(38.0, 19.0)), a.eq_on, accent);
         p.text(pos2(sw_row.left() + 54.0, cy), Align2::LEFT_CENTER, if a.eq_on { "On" } else { "Off" }, FontId::proportional(NAME_SIZE), TEXT);
