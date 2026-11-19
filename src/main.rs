@@ -388,8 +388,9 @@ struct FluentMediaPlayer {
     /// Just entered fullscreen with the controls showing: they stay up (bottom bar
     /// only) for the usual time, then hide. Started at this moment.
     fs_grace: Option<std::time::Instant>,
-    /// Draw only the bottom bar this frame (the fullscreen grace period)
-    hide_top: bool,
+    /// The top bar (filename, menu) is shown. Windowed it goes with the controls;
+    /// in fullscreen only while the pointer is over the top of the screen.
+    show_top: bool,
     /// Whether the controls were showing before this frame's input (a key press
     /// itself counts as activity, so Enter would otherwise always count as "showing")
     shown_before_input: bool,
@@ -613,7 +614,7 @@ impl FluentMediaPlayer {
             fs_settle: None,
             fs_armed: true,
             fs_grace: None,
-            hide_top: false,
+            show_top: true,
             shown_before_input: true,
             caption_font,
             last_size: egui::Vec2::ZERO,
@@ -1016,10 +1017,12 @@ impl FluentMediaPlayer {
         // button was clicked), keep the bottom bar up for the usual time once the
         // window has settled; if they're already hidden, they stay hidden
         self.fs_grace = (self.shown_before_input && self.has_file).then(std::time::Instant::now);
-        // Hold the overlays hidden, with no fade, while the window changes size
+        // The window changes size now: the top bar goes at once; the bottom bar stays
+        // up (no flicker) if it was showing, otherwise stays hidden
         self.fs_settle = Some(std::time::Instant::now());
         self.fs_armed = false;
-        self.show_controls = false;
+        self.show_controls = self.fs_grace.is_some();
+        self.show_top = false;
         self.is_fullscreen = true;
         if self.hwnd != 0 {
             // Posted, so the resize happens between two frames (see taskbar.rs)
@@ -1376,33 +1379,36 @@ impl eframe::App for FluentMediaPlayer {
             self.fs_settle = None;
         }
         if self.is_fullscreen && self.has_file {
-            // Fullscreen: everything stays hidden until the mouse has left the screen
-            // edges and then comes back to the top/bottom edge. (Right after switching,
-            // the pointer position is stale, so nothing may pop up during the transition.)
-            if !near_edge {
+            // Fullscreen: the controls show while the pointer is over the bottom of
+            // the screen, the filename / menu only while it's over the top. Right after
+            // switching the pointer position is stale, so neither reacts to it until
+            // the mouse has moved (or left the edges).
+            if !settling && (!near_edge || inp.moved) {
                 self.fs_armed = true;
             }
-            let edge_show = !settling && self.fs_armed && (near_edge || menu_open);
-            // Grace period after entering fullscreen: the settle time, then the usual
-            // 2.5 s the controls stay up after the mouse stops
+            let armed = !settling && self.fs_armed;
+            let over_top = inp.pointer.map_or(false, |p| p.y < TOP_H);
+            let over_bottom = inp.pointer.map_or(false, |p| p.y > screen.bottom() - BOTTOM_H);
+            let speed_menu = ctx.memory(|m| m.is_popup_open(egui::Id::new(MORE_POPUP)));
+            // Entered fullscreen with the controls showing: they stay up, and hide the
+            // usual 2.5 s after the switch
             let grace = self.fs_grace.map_or(false, |t0| t0.elapsed().as_secs_f32() < FS_SETTLE + HIDE_AFTER);
             if !grace {
                 self.fs_grace = None;
             } else {
                 ctx.request_repaint_after(std::time::Duration::from_millis(100));
             }
-            let grace_show = grace && !settling;
-            self.show_controls = edge_show || grace_show;
-            self.hide_top = grace_show && !edge_show;
+            self.show_controls = grace || speed_menu || (armed && over_bottom);
+            self.show_top = self.main_menu || (armed && over_top);
         } else if settling {
             self.show_controls = true;
-            self.hide_top = false;
+            self.show_top = true;
         } else {
             self.show_controls = !self.has_file || !self.is_playing || menu_open || near_edge || idle < HIDE_AFTER;
-            self.hide_top = false;
+            self.show_top = self.show_controls;
         }
         // Hide the mouse cursor too once it has been still for a moment
-        if !self.show_controls && self.has_file && idle > 2.0 {
+        if !self.show_controls && !self.show_top && self.has_file && idle > 2.0 {
             ctx.set_cursor_icon(egui::CursorIcon::None);
         }
 
@@ -1506,17 +1512,18 @@ impl eframe::App for FluentMediaPlayer {
         // (0 s fade while switching fullscreen on/off: the bars must not visibly fade out)
         let fade = if self.fs_settle.is_some() { 0.0 } else { 0.2 };
         let t = ctx.animate_bool_with_time(egui::Id::new("overlay_vis"), self.show_controls, fade);
+        let t_top = ctx.animate_bool_with_time(egui::Id::new("overlay_top"), self.show_top, fade);
         if self.fs_settle.is_some() {
             ctx.request_repaint_after(std::time::Duration::from_millis(16));
         }
-        if t > 0.0 {
-            if !self.hide_top {
-                draw_top_bar(self, ctx, t);
-            }
-            draw_bottom_bar(self, ctx, t);
+        if t_top > 0.0 {
+            draw_top_bar(self, ctx, t_top);
             draw_main_menu(self, ctx);
         } else {
             self.main_menu = false;
+        }
+        if t > 0.0 {
+            draw_bottom_bar(self, ctx, t);
         }
         draw_shortcuts(self, ctx);
 
