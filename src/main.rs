@@ -3,6 +3,7 @@
 use eframe::egui::{self, pos2, vec2, Align2, Color32, FontFamily, FontId, Pos2, Rect, Sense, Stroke};
 use libmpv2::{Mpv, render::{RenderContext, OpenGLInitParams, RenderParam, RenderParamApiType}};
 mod adjust;
+mod glass;
 mod mpv_link;
 mod splash;
 mod taskbar;
@@ -142,6 +143,8 @@ struct Settings {
     border: bool,
     /// Sharper upscaling, mpv's "high-quality" scaler (menu). Off by default.
     hq: bool,
+    /// Frosted-glass menus, panels and tooltips (menu). On by default.
+    glass: bool,
 }
 
 /// Order of the files that previous / next step through, like Explorer's "Sort by"
@@ -181,10 +184,10 @@ fn save_settings(st: &Settings) {
     let _ = std::fs::write(
         path,
         format!(
-            "{} {} {} {} {} {} {} {} {} {} {} {} {}",
+            "{} {} {} {} {} {} {} {} {} {} {} {} {} {}",
             st.volume, st.muted as u8, st.repeat as u8, st.on_top as u8, st.hwdec, st.autoplay as u8,
             st.sort_by.code(), st.sort_desc as u8, st.snap as u8, st.multi as u8, st.normalize as u8,
-            st.border as u8, st.hq as u8
+            st.border as u8, st.hq as u8, st.glass as u8
         ),
     );
 }
@@ -207,6 +210,7 @@ fn load_settings() -> Settings {
     let normalize = it.next().and_then(|t| t.parse::<u8>().ok()) == Some(1);
     let border = it.next().and_then(|t| t.parse::<u8>().ok()) == Some(1);
     let hq = it.next().and_then(|t| t.parse::<u8>().ok()) == Some(1);
+    let glass = it.next().and_then(|t| t.parse::<u8>().ok()) != Some(0);
     Settings {
         volume: volume.map_or(80.0, |v| v.clamp(0.0, VOL_MAX)).round() as i32,
         muted,
@@ -221,6 +225,7 @@ fn load_settings() -> Settings {
         normalize,
         border,
         hq,
+        glass,
     }
 }
 
@@ -461,6 +466,8 @@ struct FluentMediaPlayer {
     last_af: Option<String>,
     /// High-quality upscaling (menu)
     hq: bool,
+    /// Frosted-glass menus (menu)
+    glass: bool,
     /// Windows 11: Windows draws our rounded corners and border; the colour last
     /// sent to it
     win11_frame: bool,
@@ -653,6 +660,7 @@ impl FluentMediaPlayer {
             accent_borders: accent_borders_on(),
             border: st.border,
             hq: st.hq,
+            glass: st.glass,
             win11_frame: false,
             border_sent: None,
             adjust: adjust.clone(),
@@ -984,6 +992,7 @@ impl FluentMediaPlayer {
             normalize: self.normalize,
             border: self.border,
             hq: self.hq,
+            glass: self.glass,
         }
     }
 
@@ -1658,6 +1667,8 @@ impl eframe::App for FluentMediaPlayer {
         if t > 0.0 {
             draw_bottom_bar(self, ctx, t);
         }
+        glass::set_style(self.glass, self.border_color);
+
         // Picture & sound panel and the equalizer
         let (before, before_norm) = (self.adjust.clone(), self.normalize);
         let hq_before = self.hq;
@@ -1938,12 +1949,10 @@ fn draw_tooltip(ctx: &egui::Context, anchor: Rect, text: &str, above: bool, alph
     let rect = Rect::from_min_size(pos2(x, y), size);
     let r = 5.0;
 
-    // faint shadow
-    for (e, a) in [(1.0, 22.0), (2.5, 12.0), (4.0, 6.0)] {
-        p.rect_filled(rect.expand(e).translate(vec2(0.0, 1.5)), r + e, Color32::from_black_alpha((a * alpha) as u8));
-    }
-    p.rect_filled(rect, r, Color32::from_rgba_unmultiplied(43, 43, 43, (245.0 * alpha) as u8));
-    p.rect_stroke(rect.shrink(0.5), r, Stroke::new(1.0_f32, Color32::from_white_alpha((20.0 * alpha) as u8)));
+    glass::shadow(&p, rect, r, alpha * 0.6);
+    glass::fill(&p, rect, r, Color32::from_rgba_unmultiplied(43, 43, 43, 245), alpha);
+    let edge = glass::edge(Color32::from_white_alpha(20));
+    p.rect_stroke(rect.shrink(0.5), r, Stroke::new(1.0_f32, edge.gamma_multiply(alpha)));
     p.galley(rect.min + pad, galley, Color32::WHITE);
 }
 
@@ -2909,11 +2918,9 @@ fn draw_shortcuts(app: &mut FluentMediaPlayer, ctx: &egui::Context) {
             let p = ui.painter().clone();
             p.rect_filled(screen, 0.0, Color32::from_black_alpha(110));
             let r = 8.0;
-            for (e, a) in [(1.0, 40.0), (3.0, 22.0), (6.0, 10.0)] {
-                p.rect_filled(rect.expand(e).translate(vec2(0.0, 2.0)), r + e, Color32::from_black_alpha(a as u8));
-            }
-            p.rect_filled(rect, r, Color32::from_rgb(44, 44, 44));
-            p.rect_stroke(rect.shrink(0.5), r, Stroke::new(1.0_f32, Color32::from_rgba_premultiplied(30, 30, 30, 30)));
+            glass::shadow(&p, rect, r, 1.0);
+            glass::fill(&p, rect, r, Color32::from_rgb(44, 44, 44), 1.0);
+            p.rect_stroke(rect.shrink(0.5), r, Stroke::new(1.0_f32, glass::edge(Color32::from_rgba_premultiplied(30, 30, 30, 30))));
             ui.interact(rect, ui.id().with("panel"), Sense::click_and_drag());
 
             let text = Color32::from_rgb(240, 240, 240);
@@ -3017,6 +3024,7 @@ fn draw_main_menu(app: &mut FluentMediaPlayer, ctx: &egui::Context) {
         MenuRow::Item { key: "snap", label: "Snap to screen edges", hint: None, mark: Mark::Check(app.snap) },
         MenuRow::Item { key: "multi", label: "Allow multiple windows", hint: None, mark: Mark::Check(app.multi) },
         MenuRow::Item { key: "border", label: "Accent color border", hint: None, mark: Mark::Check(app.border) },
+        MenuRow::Item { key: "glass", label: "Frosted glass menus", hint: None, mark: Mark::Check(app.glass) },
         MenuRow::Item { key: "autoplay", label: "Auto-play next file in folder", hint: None, mark: Mark::Check(app.autoplay) },
         MenuRow::Sep,
         MenuRow::Header("Previous / next order"),
@@ -3063,11 +3071,9 @@ fn draw_main_menu(app: &mut FluentMediaPlayer, ctx: &egui::Context) {
             ui.allocate_rect(rect, Sense::click_and_drag());
             let p = ui.painter().clone();
             let r = 8.0;
-            for (e, a) in [(1.0, 40.0), (3.0, 22.0), (6.0, 10.0)] {
-                p.rect_filled(rect.expand(e).translate(vec2(0.0, 2.0)), r + e, Color32::from_black_alpha(a as u8));
-            }
-            p.rect_filled(rect, r, Color32::from_rgb(44, 44, 44));
-            p.rect_stroke(rect.shrink(0.5), r, Stroke::new(1.0_f32, Color32::from_rgba_premultiplied(30, 30, 30, 30)));
+            glass::shadow(&p, rect, r, 1.0);
+            glass::fill(&p, rect, r, Color32::from_rgb(44, 44, 44), 1.0);
+            p.rect_stroke(rect.shrink(0.5), r, Stroke::new(1.0_f32, glass::edge(Color32::from_rgba_premultiplied(30, 30, 30, 30))));
 
             let text = Color32::from_rgb(240, 240, 240);
             let dim = Color32::from_rgb(160, 160, 160);
@@ -3130,6 +3136,7 @@ fn draw_main_menu(app: &mut FluentMediaPlayer, ctx: &egui::Context) {
         Some("adjust") => app.adjust_ui.open = true,
         Some("multi") => app.multi = !app.multi,
         Some("border") => app.border = !app.border,
+        Some("glass") => app.glass = !app.glass,
         Some("snap") => {
             app.snap = !app.snap;
             taskbar::set_snap(app.snap);

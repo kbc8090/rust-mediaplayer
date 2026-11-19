@@ -5,6 +5,7 @@
 //! to mpv (properties for brightness etc., FFmpeg filter chains for the rest).
 
 use eframe::egui::{self, pos2, vec2, Align2, Color32, FontFamily, FontId, Pos2, Rect, Sense, Stroke};
+use crate::glass;
 use std::path::Path;
 
 // ── Settings ──────────────────────────────────────────────────────────────────
@@ -40,9 +41,9 @@ pub struct Adjust {
     pub gamma: i32,
     pub hue: i32,
     // Picture: FFmpeg filters
-    /// −5 (cool) … +5 (warm)
+    /// −20 (cool) … +20 (warm), 150 K per step
     pub temperature: i32,
-    /// −5 … +5
+    /// −20 … +20, 0.05 of FFmpeg's vibrance strength per step
     pub vibrance: i32,
     /// 0 (off) … 5
     pub sharpen: i32,
@@ -111,8 +112,11 @@ impl Adjust {
                 "saturation" => a.saturation = n.clamp(-100, 100),
                 "gamma" => a.gamma = n.clamp(-100, 100),
                 "hue" => a.hue = n.clamp(-100, 100),
-                "temperature" => a.temperature = n.clamp(-5, 5),
-                "vibrance" => a.vibrance = n.clamp(-5, 5),
+                // (older files: −5…+5 in steps four times as big)
+                "temperature" => a.temperature = (n * 4).clamp(-20, 20),
+                "temperature_fine" => a.temperature = n.clamp(-20, 20),
+                "vibrance" => a.vibrance = (n * 4).clamp(-20, 20),
+                "vibrance_fine" => a.vibrance = n.clamp(-20, 20),
                 "sharpen" => a.sharpen = n.clamp(0, 5),
                 "denoise" => a.denoise = n.clamp(0, 3),
                 "deband" => a.deband = b,
@@ -142,7 +146,7 @@ impl Adjust {
         let b = |v: bool| if v { 1 } else { 0 };
         let eq: Vec<String> = self.eq.iter().map(|g| g.to_string()).collect();
         let text = format!(
-            "brightness={}\ncontrast={}\nsaturation={}\ngamma={}\nhue={}\ntemperature={}\nvibrance={}\n\
+            "brightness={}\ncontrast={}\nsaturation={}\ngamma={}\nhue={}\ntemperature_fine={}\nvibrance_fine={}\n\
              sharpen={}\ndenoise={}\ndeband={}\ndeinterlace={}\nsmooth={}\nnight={}\ndialogue={}\n\
              delay_ms={}\nmono={}\ncrossfeed={}\nwiden={}\nkeep_pitch={}\neq_on={}\npreamp={}\neq={}\n",
             self.brightness, self.contrast, self.saturation, self.gamma, self.hue, self.temperature,
@@ -226,10 +230,10 @@ impl Adjust {
         }
         if self.temperature != 0 {
             // 6500 K is neutral; lower is warmer
-            f.push(format!("colortemperature=temperature={}", 6500 - self.temperature * 600));
+            f.push(format!("colortemperature=temperature={}", 6500 - self.temperature * 150));
         }
         if self.vibrance != 0 {
-            f.push(format!("vibrance=intensity={:.2}", self.vibrance as f32 * 0.2));
+            f.push(format!("vibrance=intensity={:.3}", self.vibrance as f32 * 0.05));
         }
         if self.sharpen > 0 {
             f.push(format!("cas=strength={:.2}", self.sharpen as f32 * 0.2));
@@ -342,11 +346,9 @@ fn semibold(size: f32) -> FontId {
 
 fn panel_frame(p: &egui::Painter, rect: Rect) {
     let r = 8.0;
-    for (e, a) in [(1.0, 40.0), (3.0, 22.0), (6.0, 10.0)] {
-        p.rect_filled(rect.expand(e).translate(vec2(0.0, 2.0)), r + e, Color32::from_black_alpha(a as u8));
-    }
-    p.rect_filled(rect, r, BG);
-    p.rect_stroke(rect.shrink(0.5), r, Stroke::new(1.0_f32, Color32::from_rgba_premultiplied(30, 30, 30, 30)));
+    glass::shadow(p, rect, r, 1.0);
+    glass::fill(p, rect, r, BG, 1.0);
+    p.rect_stroke(rect.shrink(0.5), r, Stroke::new(1.0_f32, glass::edge(Color32::from_rgba_premultiplied(30, 30, 30, 30))));
 }
 
 /// Title, optional "Reset" link and an X. Returns (reset clicked, close clicked).
@@ -381,11 +383,7 @@ fn header(ui: &mut egui::Ui, p: &egui::Painter, rect: Rect, title: &str, id: &st
     (reset.clicked(), x.clicked())
 }
 
-/// A key cap button ("−" / "+"); returns true when clicked
-fn cap(ui: &mut egui::Ui, p: &egui::Painter, rect: Rect, label: &str, id: egui::Id) -> bool {
-    cap_sized(ui, p, rect, label, id, VALUE_SIZE)
-}
-
+/// A key cap button ("−" / "+") with its label at `size`; returns true when clicked
 fn cap_sized(ui: &mut egui::Ui, p: &egui::Painter, rect: Rect, label: &str, id: egui::Id, size: f32) -> bool {
     let resp = ui.interact(rect, id, Sense::click());
     let pressed = resp.is_pointer_button_down_on();
@@ -438,9 +436,9 @@ fn description(ctx: &egui::Context, row: Rect, panel: Rect, text: &str) {
     }
     let y = (row.center().y - size.y / 2.0).clamp(screen.top() + 4.0, (screen.bottom() - 4.0 - size.y).max(screen.top() + 4.0));
     let r = Rect::from_min_size(pos2(x, y), size);
-    p.rect_filled(r.translate(vec2(0.0, 2.0)).expand(1.0), 7.0, Color32::from_black_alpha(70));
-    p.rect_filled(r, 6.0, Color32::from_rgb(43, 43, 43));
-    p.rect_stroke(r.shrink(0.5), 6.0, Stroke::new(1.0_f32, Color32::from_rgba_premultiplied(26, 26, 26, 26)));
+    glass::shadow(&p, r, 6.0, 0.8);
+    glass::fill(&p, r, 6.0, Color32::from_rgb(43, 43, 43), 1.0);
+    p.rect_stroke(r.shrink(0.5), 6.0, Stroke::new(1.0_f32, glass::edge(Color32::from_rgba_premultiplied(26, 26, 26, 26))));
     p.galley(r.min + vec2(10.0, 8.0), g, Color32::from_rgb(232, 232, 232));
 }
 
@@ -489,12 +487,15 @@ enum SwitchKey {
     Hq,
 }
 
-/// The controls that go −100…100 (they get both ±5 and small ±1 buttons)
+/// The controls with both ±5 and small ±1 buttons
 fn has_fine(key: StepKey) -> bool {
-    matches!(key, StepKey::Brightness | StepKey::Contrast | StepKey::Saturation | StepKey::Gamma | StepKey::Hue)
+    matches!(
+        key,
+        StepKey::Brightness | StepKey::Contrast | StepKey::Saturation | StepKey::Gamma | StepKey::Hue | StepKey::Vibrance | StepKey::Temperature
+    )
 }
 
-/// One step up (dir 1) or down (−1); `fine` = ±1 instead of ±5 for the −100…100 ones
+/// One step up (dir 1) or down (−1); `fine` = ±1 instead of ±5 for the has_fine ones
 fn step(a: &mut Adjust, key: StepKey, dir: i32, fine: bool) {
     let s = |v: &mut i32, by: i32, lo: i32, hi: i32| *v = (*v + by * dir).clamp(lo, hi);
     let big = if fine { 1 } else { 5 };
@@ -504,8 +505,8 @@ fn step(a: &mut Adjust, key: StepKey, dir: i32, fine: bool) {
         StepKey::Saturation => s(&mut a.saturation, big, -100, 100),
         StepKey::Gamma => s(&mut a.gamma, big, -100, 100),
         StepKey::Hue => s(&mut a.hue, big, -100, 100),
-        StepKey::Temperature => s(&mut a.temperature, 1, -5, 5),
-        StepKey::Vibrance => s(&mut a.vibrance, 1, -5, 5),
+        StepKey::Temperature => s(&mut a.temperature, big, -20, 20),
+        StepKey::Vibrance => s(&mut a.vibrance, big, -20, 20),
         StepKey::Sharpen => s(&mut a.sharpen, 1, 0, 5),
         StepKey::Denoise => s(&mut a.denoise, 1, 0, 3),
         StepKey::Delay => s(&mut a.delay_ms, 50, -5000, 5000),
@@ -552,8 +553,8 @@ fn rows(a: &Adjust, normalize: bool, hq: bool, tab: Tab) -> Vec<Row> {
                 Row::Step("Saturation", "Colour strength. At \u{2212}100 the picture is black and white.", s, sc, StepKey::Saturation),
                 Row::Step("Gamma", "Brightens or darkens the mid-tones without crushing blacks or whites. Often better than Brightness for dark videos.", g, gc, StepKey::Gamma),
                 Row::Step("Hue", "Turns all colours around the colour wheel. Mostly for fixing a colour cast.", h, hc, StepKey::Hue),
-                Row::Step("Color temperature", "Warmer (more orange) or cooler (more blue) white balance.", temp, a.temperature != 0, StepKey::Temperature),
                 Row::Step("Vibrance", "Boosts dull colours more than already-vivid ones, so skin tones stay natural.", v, vc, StepKey::Vibrance),
+                Row::Step("Color temperature", "Warmer (more orange) or cooler (more blue) white balance.", temp, a.temperature != 0, StepKey::Temperature),
                 Row::Step("Sharpen", "Crisper edges (AMD's contrast-adaptive sharpening). High levels can look harsh on grainy video.", sharpen, a.sharpen != 0, StepKey::Sharpen),
                 Row::Step("Denoise", "Smooths grain and compression noise. Uses a lot of processor time and may stutter on 4K video.", denoise, a.denoise != 0, StepKey::Denoise),
                 Row::Sep,
@@ -683,7 +684,9 @@ pub fn draw_panel(ctx: &egui::Context, ui_state: &mut AdjustUi, a: &mut Adjust, 
                         let plus = Rect::from_center_size(pos2(r.right() - 19.0, r.center().y), vec2(26.0, 22.0));
                         let minus = plus.translate(vec2(-112.0, 0.0));
                         let col = if *changed { accent } else { Color32::from_rgb(189, 189, 189) };
-                        p.text(pos2((minus.right() + plus.left()) / 2.0, r.center().y), Align2::CENTER_CENTER, value, FontId::proportional(VALUE_SIZE), col);
+                        // (long values like "Cool 20" get a smaller size to fit between the small buttons)
+                        let size = if value.chars().count() > 6 { 11.0 } else { VALUE_SIZE };
+                        p.text(pos2((minus.right() + plus.left()) / 2.0, r.center().y), Align2::CENTER_CENTER, value, FontId::proportional(size), col);
                         if cap_sized(ui, &p, minus, "\u{2212}", ui.id().with((*name, "minus")), 14.5) {
                             step(a, *key, -1, false);
                         }
@@ -798,15 +801,15 @@ pub fn draw_eq(ctx: &egui::Context, ui_state: &mut AdjustUi, a: &mut Adjust, acc
         if sw.clicked() {
             a.eq_on = !a.eq_on;
         }
-        let next = Rect::from_center_size(pos2(rect.right() - PAD - 12.0, cy), vec2(24.0, 21.0));
-        let prev = next.translate(vec2(-130.0, 0.0));
+        let next = Rect::from_center_size(pos2(rect.right() - PAD - 13.0, cy), vec2(26.0, 22.0));
+        let prev = next.translate(vec2(-132.0, 0.0));
         p.text(pos2((prev.right() + next.left()) / 2.0, cy), Align2::CENTER_CENTER, a.preset_name(), FontId::proportional(VALUE_SIZE), TEXT);
         let cur = EQ_PRESETS.iter().position(|(_, g)| *g == a.eq);
         let n = EQ_PRESETS.len();
-        if cap(ui, &p, prev, "\u{2039}", ui.id().with("eq_prev")) {
+        if cap_sized(ui, &p, prev, "\u{2039}", ui.id().with("eq_prev"), 15.5) {
             a.eq = EQ_PRESETS[cur.map_or(0, |i| (i + n - 1) % n)].1;
         }
-        if cap(ui, &p, next, "\u{203a}", ui.id().with("eq_next")) {
+        if cap_sized(ui, &p, next, "\u{203a}", ui.id().with("eq_next"), 15.5) {
             a.eq = EQ_PRESETS[cur.map_or(0, |i| (i + 1) % n)].1;
         }
 
