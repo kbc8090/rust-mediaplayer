@@ -8,15 +8,31 @@ pub(crate) fn black(alpha: u8, t: f32) -> Color32 {
     Color32::from_black_alpha((alpha as f32 * t) as u8)
 }
 
-/// Vertical two-colour gradient rectangle
-pub(crate) fn gradient(p: &egui::Painter, rect: Rect, top: Color32, bottom: Color32) {
+/// Darkest shade (fraction of black) behind the top bar, at the top edge
+const TOP_SHADE: f32 = 0.30;
+/// Darkest shade behind the bottom bar, at the bottom edge
+const BOTTOM_SHADE: f32 = 175.0 / 255.0;
+
+/// A shade over the video that fades out along a smooth curve rather than a
+/// straight line: `alpha` of black at one edge (the top if `dark_at_top`, else the
+/// bottom), easing to nothing at the other. A straight fade stops abruptly, and on
+/// bright video the eye sees that stop as the edge of a grey band.
+pub(crate) fn eased_shade(p: &egui::Painter, rect: Rect, alpha: f32, dark_at_top: bool) {
+    const STEPS: u32 = 16;
     let mut m = egui::Mesh::default();
-    m.colored_vertex(rect.left_top(), top);
-    m.colored_vertex(rect.right_top(), top);
-    m.colored_vertex(rect.right_bottom(), bottom);
-    m.colored_vertex(rect.left_bottom(), bottom);
-    m.add_triangle(0, 1, 2);
-    m.add_triangle(0, 2, 3);
+    for i in 0..=STEPS {
+        let s = i as f32 / STEPS as f32; // 0 at the dark edge
+        let fade = 1.0 - s * s * (3.0 - 2.0 * s); // smoothstep, reversed
+        let c = Color32::from_black_alpha((alpha * fade * 255.0).round() as u8);
+        let y = if dark_at_top { rect.top() + s * rect.height() } else { rect.bottom() - s * rect.height() };
+        m.colored_vertex(pos2(rect.left(), y), c);
+        m.colored_vertex(pos2(rect.right(), y), c);
+        if i > 0 {
+            let k = i * 2;
+            m.add_triangle(k - 2, k - 1, k + 1);
+            m.add_triangle(k - 2, k + 1, k);
+        }
+    }
     p.add(egui::Shape::mesh(m));
 }
 
@@ -311,7 +327,7 @@ pub(crate) fn draw_top_bar(app: &mut FluentMediaPlayer, ctx: &egui::Context, t: 
         .show(ctx, |ui| {
             ui.allocate_rect(bar, Sense::hover());
             let p = ui.painter().clone();
-            gradient(&p, bar, black(150, t), Color32::TRANSPARENT);
+            eased_shade(&p, bar, TOP_SHADE * t, true);
 
             // Fullscreen: the bar covers the top edge of the screen, so it must
             // handle the double-click itself (the video underneath can't see it)
@@ -455,7 +471,7 @@ pub(crate) fn draw_bottom_bar(app: &mut FluentMediaPlayer, ctx: &egui::Context, 
         .show(ctx, |ui| {
             ui.allocate_rect(bar, Sense::hover());
             let p = ui.painter().clone();
-            gradient(&p, bar, Color32::TRANSPARENT, black(175, t));
+            eased_shade(&p, bar, BOTTOM_SHADE * t, false);
 
             // Empty parts of the bar behave like the video underneath: double-click
             // toggles fullscreen (so the bottom edge of the screen works too), drag
