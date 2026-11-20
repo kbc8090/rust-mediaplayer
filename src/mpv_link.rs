@@ -35,6 +35,8 @@ pub struct Snapshot {
     /// Displayed video size (0 for audio-only / nothing loaded)
     pub dwidth: i64,
     pub dheight: i64,
+    /// The video's frame rate (0 if unknown / no video)
+    pub fps: f64,
     /// Chapters (start time in seconds, title), empty if the file has none
     pub chapters: Arc<Vec<(f64, String)>>,
     /// Decoder / video details, only filled while the info overlay is open
@@ -190,6 +192,12 @@ fn run(mpv: Arc<Mutex<Mpv>>, rx: mpsc::Receiver<Job>, state: Arc<Mutex<Snapshot>
             eof: m.get_property::<bool>("eof-reached").unwrap_or(false),
             dwidth: m.get_property::<i64>("dwidth").unwrap_or(0),
             dheight: m.get_property::<i64>("dheight").unwrap_or(0),
+            fps: m
+                .get_property::<f64>("container-fps")
+                .ok()
+                .filter(|f| *f > 0.0)
+                .or_else(|| m.get_property::<f64>("estimated-vf-fps").ok())
+                .unwrap_or(0.0),
             chapters: chapters.clone(),
             info: Vec::new(),
         };
@@ -248,9 +256,29 @@ fn run(mpv: Arc<Mutex<Mpv>>, rx: mpsc::Receiver<Job>, state: Arc<Mutex<Snapshot>
             let h = m.get_property::<i64>("height").unwrap_or(0);
             let fps = m.get_property::<f64>("estimated-vf-fps").unwrap_or(0.0);
             s.info.push(format!("Video: {fmt} {w}x{h} @ {fps:.1} fps"));
+            let threads = m.get_property::<i64>("vd-lavc-threads").unwrap_or(-1);
+            s.info.push(format!(
+                "Decoder threads: {}",
+                if threads == 0 { "automatic".to_owned() } else { threads.to_string() }
+            ));
             let dropped = m.get_property::<i64>("frame-drop-count").unwrap_or(0);
             let dec_dropped = m.get_property::<i64>("decoder-frame-drop-count").unwrap_or(0);
-            s.info.push(format!("Dropped frames: {dropped} (decoder: {dec_dropped})"));
+            let delayed = m.get_property::<i64>("vo-delayed-frame-count").unwrap_or(0);
+            let mistimed = m.get_property::<i64>("mistimed-frame-count").unwrap_or(0);
+            s.info.push(format!(
+                "Dropped frames: {dropped} (decoder: {dec_dropped}), late: {delayed}, mistimed: {mistimed}"
+            ));
+            let avsync = m.get_property::<f64>("avsync").unwrap_or(0.0) * 1000.0;
+            let display = m.get_property::<f64>("display-fps").unwrap_or(0.0);
+            let sync = m.get_property::<String>("video-sync").unwrap_or_default();
+            let interp = m.get_property::<bool>("interpolation").unwrap_or(false);
+            s.info.push(format!(
+                "Display: {display:.0} Hz, sync: {sync}{}, A/V offset {avsync:+.0} ms",
+                if interp { " + interpolation" } else { "" }
+            ));
+            let scale = m.get_property::<String>("scale").unwrap_or_default();
+            let dscale = m.get_property::<String>("dscale").unwrap_or_default();
+            s.info.push(format!("Scaling: up {scale}, down {dscale}"));
             let ahead = m.get_property::<f64>("demuxer-cache-duration").unwrap_or(0.0);
             s.info.push(format!("Buffered ahead: {ahead:.1} s"));
             let version = m.get_property::<String>("mpv-version").unwrap_or_default();

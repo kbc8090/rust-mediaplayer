@@ -174,78 +174,92 @@ impl Adjust {
         (self.mono, self.crossfeed, self.widen, self.keep_pitch) = (d.mono, d.crossfeed, d.widen, d.keep_pitch);
     }
 
-    /// Colour temperature and vibrance work on RGB frames, so with either on the
-    /// video reaches mpv as RGB, and mpv's own colour controls then don't work
-    /// properly on it (Contrast had no effect; Saturation and Hue only work on
-    /// normal YUV video). In that case Brightness, Contrast, Saturation, Gamma and
-    /// Hue are done by FFmpeg filters instead, first in the chain while the video
-    /// is still YUV.
-    pub fn cpu_colour(&self) -> bool {
-        self.temperature != 0 || self.vibrance != 0
-    }
-
-    /// Values for mpv's own colour controls: zero while FFmpeg does them
+    /// Values for mpv's own colour controls (done on the GPU, as the video is
+    /// turned into RGB)
     pub fn gpu_colour(&self) -> [(&'static str, i32); 5] {
-        let k = if self.cpu_colour() { 0 } else { 1 };
         [
-            ("brightness", self.brightness * k),
-            ("contrast", self.contrast * k),
-            ("saturation", self.saturation * k),
-            ("gamma", self.gamma * k),
-            ("hue", self.hue * k),
+            ("brightness", self.brightness),
+            ("contrast", self.contrast),
+            ("saturation", self.saturation),
+            ("gamma", self.gamma),
+            ("hue", self.hue),
         ]
     }
 
-    /// FFmpeg `eq` settings matching mpv's controls: (name, value)
-    pub fn eq_values(&self) -> [(&'static str, String); 4] {
-        [
-            ("contrast", format!("{:.3}", 1.0 + self.contrast as f32 / 100.0)),
-            ("brightness", format!("{:.3}", self.brightness as f32 / 100.0)),
-            ("saturation", format!("{:.3}", 1.0 + self.saturation as f32 / 100.0)),
-            ("gamma", format!("{:.3}", 8f32.powf(self.gamma as f32 / 100.0))),
-        ]
-    }
-
-    /// Hue in degrees for FFmpeg's `hue` filter (mpv's ±100 is ±180°)
-    pub fn hue_degrees(&self) -> String {
-        format!("{:.1}", self.hue as f32 * 1.8)
-    }
-
-    /// mpv's `vf` list for the picture filters (plus mirroring), or None for no
-    /// filters. With `with_values` false the colour values are left out: comparing
-    /// those tells whether only colour values changed (then they're sent live).
-    pub fn vf_chain(&self, mirror: bool, with_values: bool) -> Option<String> {
-        let mut chain: Vec<String> = Vec::new();
-        if self.cpu_colour() {
-            let eq: Vec<String> = self
-                .eq_values()
-                .iter()
-                .map(|(k, v)| format!("{k}={}", if with_values { v.as_str() } else { "_" }))
-                .collect();
-            chain.push(format!("@adjeq:lavfi=[eq={}]", eq.join(":")));
-            chain.push(format!("@adjhue:lavfi=[hue=h={}]", if with_values { self.hue_degrees() } else { "_".to_owned() }));
-        }
+    /// mpv's `vf` list (FFmpeg filters, run on the CPU), or None for no filters.
+    /// Only Denoise and mirroring are left here: Color temperature, Vibrance and
+    /// Sharpen run on the GPU (see `shader`). Done in FFmpeg they had every frame
+    /// converted to RGB and processed on the CPU at full size, which a 4K 60 fps
+    /// video couldn't keep up with.
+    pub fn vf_chain(&self, mirror: bool) -> Option<String> {
         let mut f: Vec<String> = Vec::new();
         if self.denoise > 0 {
             f.push(format!("hqdn3d={}", [0, 2, 4, 7][self.denoise as usize]));
         }
-        if self.temperature != 0 {
-            // 6500 K is neutral; lower is warmer
-            f.push(format!("colortemperature=temperature={}", 6500 - self.temperature * 600));
-        }
-        if self.vibrance != 0 {
-            f.push(format!("vibrance=intensity={:.3}", self.vibrance as f32 * 0.05));
-        }
-        if self.sharpen > 0 {
-            f.push(format!("cas=strength={:.2}", self.sharpen as f32 * 0.2));
-        }
         if mirror {
             f.push("hflip".to_owned());
         }
-        if !f.is_empty() {
-            chain.push(format!("lavfi=[{}]", f.join(",")));
+        (!f.is_empty()).then(|| format!("lavfi=[{}]", f.join(",")))
+    }
+
+    /// Short name for the current GPU picture shader's settings (used in its file
+    /// name), or None when it isn't needed
+    pub fn shader_key(&self) -> Option<String> {
+        (self.temperature != 0 || self.vibrance != 0 || self.sharpen != 0)
+            .then(|| format!("t{}-v{}-s{}", self.temperature, self.vibrance, self.sharpen))
+    }
+
+    /// An mpv user shader doing Color temperature, Vibrance and Sharpen on the GPU,
+    /// with the settings written in as constants. It runs on the picture right
+    /// after mpv's own colour conversion (where Brightness, Contrast, ... are
+    /// applied), at the video's own size. The maths follows FFmpeg's
+    /// colortemperature, vibrance and cas filters, which these used to be.
+    pub fn shader(&self) -> Option<String> {
+        self.shader_key()?;
+        let mut body = String::new();
+        if self.sharpen > 0 {
+            // AMD's contrast-adaptive sharpening, as FFmpeg's cas filter does it
+            let strength = self.sharpen as f32 * 0.2;
+            let k = -(16.0 + (4.01 - 16.0) * strength);
+            body += &format!(
+                "    vec3 a = HOOKED_texOff(vec2(-1.0, -1.0)).rgb;\n\
+                 \x20   vec3 b = HOOKED_texOff(vec2( 0.0, -1.0)).rgb;\n\
+                 \x20   vec3 c = HOOKED_texOff(vec2( 1.0, -1.0)).rgb;\n\
+                 \x20   vec3 d = HOOKED_texOff(vec2(-1.0,  0.0)).rgb;\n\
+                 \x20   vec3 e = rgb;\n\
+                 \x20   vec3 f = HOOKED_texOff(vec2( 1.0,  0.0)).rgb;\n\
+                 \x20   vec3 g = HOOKED_texOff(vec2(-1.0,  1.0)).rgb;\n\
+                 \x20   vec3 h = HOOKED_texOff(vec2( 0.0,  1.0)).rgb;\n\
+                 \x20   vec3 i = HOOKED_texOff(vec2( 1.0,  1.0)).rgb;\n\
+                 \x20   vec3 mn = min(min(min(d, e), min(f, b)), h);\n\
+                 \x20   mn += min(min(min(mn, a), min(c, g)), i);\n\
+                 \x20   vec3 mx = max(max(max(d, e), max(f, b)), h);\n\
+                 \x20   mx += max(max(max(mx, a), max(c, g)), i);\n\
+                 \x20   vec3 amp = sqrt(clamp(min(mn, 2.0 - mx) / max(mx, vec3(1e-5)), 0.0, 1.0));\n\
+                 \x20   vec3 w = amp / {k:.6};\n\
+                 \x20   rgb = clamp(((b + d + f + h) * w + e) / (1.0 + 4.0 * w), 0.0, 1.0);\n"
+            );
         }
-        (!chain.is_empty()).then(|| chain.join(","))
+        if self.temperature != 0 {
+            // 6500 K is "off"; lower is warmer
+            let [r, g, b] = kelvin_rgb((6500 - self.temperature * 600) as f32);
+            body += &format!("    rgb *= vec3({r:.6}, {g:.6}, {b:.6});\n");
+        }
+        if self.vibrance != 0 {
+            // FFmpeg's vibrance (its default mode): a saturation boost that grows
+            // with how colourful the pixel already is
+            let v = self.vibrance as f32 * 0.05;
+            let sign = if v >= 0.0 { 1.0 } else { -1.0 };
+            body += &format!(
+                "    float sat = max(rgb.r, max(rgb.g, rgb.b)) - min(rgb.r, min(rgb.g, rgb.b));\n\
+                 \x20   float luma = dot(rgb, vec3(0.072186, 0.715158, 0.212656));\n\
+                 \x20   rgb = mix(vec3(luma), rgb, 1.0 + {v:.6} * (1.0 + {sign:.1} * sat));\n"
+            );
+        }
+        Some(format!(
+            "//!HOOK MAIN\n//!BIND HOOKED\n//!DESC Rust Media Player picture\n\n\
+             vec4 hook() {{\n    vec4 px = HOOKED_texOff(vec2(0.0));\n    vec3 rgb = px.rgb;\n{body}    return vec4(rgb, px.a);\n}}\n"
+        ))
     }
 
     /// The equalizer's band gains as FFmpeg firequalizer wants them
@@ -608,14 +622,14 @@ fn rows(a: &Adjust, normalize: bool, hq: bool, tab: Tab) -> Vec<Row> {
                 Row::Step("Saturation", "Colour strength. At \u{2212}100 the picture is black and white.", s, sc, StepKey::Saturation),
                 Row::Step("Gamma", "Brightens or darkens the mid-tones without crushing blacks or whites. Often better than Brightness for dark videos.", g, gc, StepKey::Gamma),
                 Row::Step("Hue", "Turns all colours around the colour wheel. Mostly for fixing a colour cast.", h, hc, StepKey::Hue),
-                Row::Step("Vibrance", "Boosts dull colours more than already-vivid ones, so skin tones stay natural.", v, vc, StepKey::Vibrance),
+                Row::Step("Vibrance", "A stronger colour boost than Saturation, strongest where colours are already rich.", v, vc, StepKey::Vibrance),
                 Row::Step("Color temperature", "Warmer (more orange) or cooler (more blue) white balance.", temp, a.temperature != 0, StepKey::Temperature),
                 Row::Step("Sharpen", "Crisper edges (AMD's contrast-adaptive sharpening). High levels can look harsh on grainy video.", sharpen, a.sharpen != 0, StepKey::Sharpen),
                 Row::Step("Denoise", "Smooths grain and compression noise. Uses a lot of processor time and may stutter on 4K video.", denoise, a.denoise != 0, StepKey::Denoise),
                 Row::Sep,
                 Row::Switch("Deband", "Smooths visible steps in gradients such as skies and dark scenes.", a.deband, SwitchKey::Deband),
                 Row::Switch("Deinterlace", "Removes comb-like lines from old TV recordings and DVDs.", a.deinterlace, SwitchKey::Deinterlace),
-                Row::Switch("Smooth motion", "Matches the video to your monitor's refresh rate, so panning shots in films judder less.", a.smooth, SwitchKey::Smooth),
+                Row::Switch("Smooth motion", "Matches films and other videos under 40 fps to your monitor's refresh rate, so panning shots judder less. (50 and 60 fps video doesn't need it, so it's left alone.)", a.smooth, SwitchKey::Smooth),
                 Row::Switch("High-quality upscaling", "A sharper, cleaner scaler when the video is smaller than the window (e.g. 1080p on a 4K screen). Uses more graphics card time.", hq, SwitchKey::Hq),
             ]
         }
@@ -956,4 +970,24 @@ pub fn draw_eq(ctx: &egui::Context, ui_state: &mut AdjustUi, a: &mut Adjust, acc
         p.line_segment([pos2(dx, track_top - 4.0), pos2(dx, track_top + TRACK_H + 4.0)], Stroke::new(1.0_f32, LINE));
     });
     ctx.move_to_top(egui::LayerId::new(egui::Order::Foreground, id));
+}
+
+/// White balance multipliers for a colour temperature in kelvin, as FFmpeg's
+/// colortemperature filter computes them (Tanner Helland's approximation)
+fn kelvin_rgb(k: f32) -> [f32; 3] {
+    let kelvin = k / 100.0;
+    let (r, g) = if kelvin <= 66.0 {
+        (1.0, 0.390_081_58 * kelvin.ln() - 0.631_841_44)
+    } else {
+        let t = (kelvin - 60.0).max(0.0);
+        (1.292_936_2 * t.powf(-0.133_204_76), 1.129_890_9 * t.powf(-0.075_514_85))
+    };
+    let b = if kelvin >= 66.0 {
+        1.0
+    } else if kelvin <= 19.0 {
+        0.0
+    } else {
+        0.543_206_8 * (kelvin - 10.0).ln() - 1.196_254_1
+    };
+    [r.clamp(0.0, 1.0), g.clamp(0.0, 1.0), b.clamp(0.0, 1.0)]
 }

@@ -42,6 +42,7 @@ unsafe extern "system" {
     fn GetCurrentProcess() -> isize;
     fn TerminateProcess(process: isize, exit_code: u32) -> i32;
     fn K32GetProcessMemoryInfo(process: isize, counters: *mut MemCounters, size: u32) -> i32;
+    fn GetProcessTimes(process: isize, created: *mut u64, exited: *mut u64, kernel: *mut u64, user: *mut u64) -> i32;
     fn MultiByteToWideChar(code_page: u32, flags: u32, src: *const u8, src_len: i32, dst: *mut u16, dst_len: i32) -> i32;
 }
 
@@ -176,6 +177,13 @@ fn process_memory_mb() -> Option<(f64, f64)> {
     ok.then(|| (c.working_set as f64 / 1048576.0, c.private_usage as f64 / 1048576.0))
 }
 
+/// This process's CPU time so far (kernel + user), in 100 ns units
+fn process_cpu_time() -> Option<u64> {
+    let (mut c, mut e, mut k, mut u) = (0u64, 0u64, 0u64, 0u64);
+    let ok = unsafe { GetProcessTimes(GetCurrentProcess(), &mut c, &mut e, &mut k, &mut u) } != 0;
+    ok.then_some(k + u)
+}
+
 // ── Remembered window position / size ─────────────────────────────────────────
 #[derive(Clone, Copy, PartialEq)]
 struct WinState {
@@ -195,6 +203,11 @@ impl WinState {
 /// Picture & sound settings (one "name=value" per line)
 fn adjust_path() -> PathBuf {
     settings_path().map_or_else(|| PathBuf::from("adjust.txt"), |p| p.with_file_name("adjust.txt"))
+}
+
+/// Where the picture shader files go (see `apply_shader`)
+fn shader_dir() -> Option<PathBuf> {
+    settings_path().and_then(|p| p.parent().map(|d| d.join("shaders")))
 }
 
 fn settings_path() -> Option<PathBuf> {
@@ -500,6 +513,12 @@ struct FluentMediaPlayer {
     resize_mode: bool,
     /// Live-resize statistics: frames, summed / worst frame interval, worst mpv render (ms)
     last_frame: std::time::Instant,
+    /// Window redraws per second (smoothed), for the info overlay
+    ui_fps: f32,
+    /// CPU time and clock at the last CPU reading, and the result (percent of the
+    /// whole CPU), for the info overlay
+    cpu_mark: Option<(u64, std::time::Instant)>,
+    cpu_pct: f32,
     rs_stats: (u32, f32, f32, f32),
     /// Native window handle and the taskbar integration built on it
     hwnd: isize,
@@ -566,6 +585,11 @@ struct FluentMediaPlayer {
     adjust_ui: adjust::AdjustUi,
     /// Filter chains last sent to mpv
     last_vf: Option<String>,
+    /// Settings of the GPU picture shader in use (see `apply_shader`)
+    last_shader: Option<String>,
+    /// The current video's frame rate, and whether smooth motion is active for it
+    video_fps: f64,
+    smooth_on: bool,
     last_af: Option<String>,
     /// High-quality upscaling (menu)
     hq: bool,
@@ -735,6 +759,9 @@ impl FluentMediaPlayer {
             resize_until: None,
             resize_mode: false,
             last_frame: std::time::Instant::now(),
+            ui_fps: 0.0,
+            cpu_mark: None,
+            cpu_pct: 0.0,
             rs_stats: (0, 0.0, 0.0, 0.0),
             hwnd: 0,
             taskbar: None,
@@ -780,6 +807,9 @@ impl FluentMediaPlayer {
             adjust_changed: std::time::Instant::now(),
             adjust_ui: adjust::AdjustUi::new(),
             last_vf: None,
+            last_shader: None,
+            video_fps: 0.0,
+            smooth_on: false,
             last_af: None,
         };
         app.apply_adjust_all();
@@ -902,9 +932,12 @@ impl FluentMediaPlayer {
         if !a.keep_pitch {
             self.link.set("audio-pitch-correction", "no");
         }
-        if a.smooth {
-            self.apply_smooth();
+        // (Smooth motion is switched on per video, see `update_smooth`.)
+        // Shader files from earlier runs aren't needed any more
+        if let Some(dir) = shader_dir() {
+            let _ = std::fs::remove_dir_all(dir);
         }
+        self.apply_shader();
         self.apply_vf();
         self.apply_af(true);
     }
@@ -912,7 +945,7 @@ impl FluentMediaPlayer {
     /// Send what changed between `old` and the current adjustments to mpv
     fn apply_adjust_changes(&mut self, old: &adjust::Adjust, old_normalize: bool) {
         let a = self.adjust.clone();
-        // mpv's own colour controls (zero while FFmpeg does them, see cpu_colour)
+        // mpv's own colour controls
         for ((name, before), (_, now)) in old.gpu_colour().into_iter().zip(a.gpu_colour()) {
             if before != now {
                 self.link.set(name, now);
@@ -930,25 +963,9 @@ impl FluentMediaPlayer {
         if old.keep_pitch != a.keep_pitch {
             self.link.set("audio-pitch-correction", yn(a.keep_pitch));
         }
-        if old.smooth != a.smooth {
-            self.apply_smooth();
-        }
-        // While FFmpeg does the colour controls and only their values changed: send
-        // the new values to the running filters (no rebuild, no hitch)
-        let same_shape = old.vf_chain(self.mirror, false) == a.vf_chain(self.mirror, false);
-        if same_shape && a.cpu_colour() {
-            for ((name, before), (_, now)) in old.eq_values().into_iter().zip(a.eq_values()) {
-                if before != now {
-                    self.link.command("vf-command", &["adjeq", name, &now]);
-                }
-            }
-            if old.hue != a.hue {
-                self.link.command("vf-command", &["adjhue", "h", &a.hue_degrees()]);
-            }
-            self.last_vf = a.vf_chain(self.mirror, true);
-        } else {
-            self.apply_vf();
-        }
+        // (Smooth motion follows on the next frame, see `update_smooth`)
+        self.apply_shader();
+        self.apply_vf();
         // Only the equalizer's gains changed: send them to the running filters
         // (no rebuild, so dragging a slider doesn't make the sound drop out)
         let same_shape = old.af_chain(old_normalize, false) == a.af_chain(self.normalize, false);
@@ -968,13 +985,46 @@ impl FluentMediaPlayer {
 
     /// Picture filters plus mirroring, as one filter chain
     fn apply_vf(&mut self) {
-        let chain = self.adjust.vf_chain(self.mirror, true);
+        let chain = self.adjust.vf_chain(self.mirror);
         if chain != self.last_vf {
             match &chain {
                 Some(c) => self.link.command("vf", &["set", c]),
                 None => self.link.command("vf", &["clr", ""]),
             }
             self.last_vf = chain;
+        }
+    }
+
+    /// Color temperature, Vibrance and Sharpen: an mpv user shader on the GPU.
+    /// Each combination of settings gets its own file (mpv keeps a shader file it
+    /// has read for as long as it runs, so a changed file under the same name
+    /// wouldn't be read again); they're deleted at the next start.
+    fn apply_shader(&mut self) {
+        let key = self.adjust.shader_key();
+        if key == self.last_shader {
+            return;
+        }
+        self.last_shader = key.clone();
+        self.link.command("change-list", &["glsl-shaders", "clr", ""]);
+        if let (Some(key), Some(src), Some(dir)) = (key, self.adjust.shader(), shader_dir()) {
+            let path = dir.join(format!("picture-{key}.glsl"));
+            let _ = std::fs::create_dir_all(&dir);
+            if path.exists() || std::fs::write(&path, src).is_ok() {
+                self.link.command("change-list", &["glsl-shaders", "append", &path.to_string_lossy()]);
+            }
+        }
+    }
+
+    /// Smooth motion on or off for the current video: only for videos under 40 fps
+    /// (films, TV), where the uneven frame timing is visible. 50 / 60 fps video
+    /// doesn't need it, and there it costs a lot: every frame then has to be
+    /// finished within one refresh of the monitor (7 ms at 144 Hz) rather than one
+    /// frame of the video, which 4K video can't always manage.
+    fn update_smooth(&mut self) {
+        let want = self.adjust.smooth && self.video_fps > 0.0 && self.video_fps < 40.0;
+        if want != self.smooth_on {
+            self.smooth_on = want;
+            self.apply_smooth();
         }
     }
 
@@ -997,7 +1047,7 @@ impl FluentMediaPlayer {
     /// gets those reports it relies on them for good, so turning smooth motion off
     /// again left playback juddering and slow.)
     fn apply_smooth(&mut self) {
-        if self.adjust.smooth {
+        if self.smooth_on {
             // An embedded player has to tell mpv the monitor's refresh rate
             if let Some(hz) = taskbar::monitor_refresh_hz(self.hwnd) {
                 self.link.set("display-fps-override", hz);
@@ -1152,9 +1202,25 @@ impl FluentMediaPlayer {
         ));
         let render_ms = RENDER_MS.with(|r| r.get());
         lines.push(format!(
-            "Render: {render_ms:.1} ms per frame{}",
+            "Render: {render_ms:.1} ms per video frame, window redraws {:.0}/s{}",
+            self.ui_fps,
             if self.resize_mode { " (resize settings active)" } else { "" }
         ));
+        // CPU use of the whole player, as a share of all cores (100 % = every core busy)
+        if let Some(cpu) = process_cpu_time() {
+            let now = std::time::Instant::now();
+            if let Some((c0, t0)) = self.cpu_mark {
+                let secs = now.duration_since(t0).as_secs_f64();
+                if secs >= 0.5 {
+                    let cores = std::thread::available_parallelism().map_or(1, |n| n.get()) as f64;
+                    self.cpu_pct = ((cpu.saturating_sub(c0)) as f64 / 1e7 / secs / cores * 100.0) as f32;
+                    self.cpu_mark = Some((cpu, now));
+                }
+            } else {
+                self.cpu_mark = Some((cpu, now));
+            }
+            lines.push(format!("CPU: {:.0} % of all cores", self.cpu_pct));
+        }
         let (n, sum, worst, worst_render) = self.rs_stats;
         if n > 0 {
             lines.push(format!(
@@ -1328,6 +1394,8 @@ impl eframe::App for FluentMediaPlayer {
         self.last_tick = now;
         if snap.valid {
             self.duration = snap.duration;
+            self.video_fps = snap.fps;
+            self.update_smooth();
             if now >= self.hold_until {
                 // The mpv thread reads the time only ~10x a second. While playing,
                 // move on by the elapsed time every frame and ease toward mpv's value,
@@ -1566,6 +1634,9 @@ impl eframe::App for FluentMediaPlayer {
         let now = std::time::Instant::now();
         let frame_ms = now.duration_since(self.last_frame).as_secs_f32() * 1000.0;
         self.last_frame = now;
+        if frame_ms > 0.0 {
+            self.ui_fps = self.ui_fps * 0.95 + (1000.0 / frame_ms) * 0.05;
+        }
         if self.resize_until.is_some() {
             let render_ms = RENDER_LAST_MS.with(|r| r.get());
             let st = &mut self.rs_stats;
