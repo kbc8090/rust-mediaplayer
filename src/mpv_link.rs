@@ -107,6 +107,8 @@ fn run(mpv: Arc<Mutex<Mpv>>, rx: mpsc::Receiver<Job>, state: Arc<Mutex<Snapshot>
     // Just after a file is opened, the snapshot is refreshed more often, so its
     // length, chapters and picture size reach the UI without waiting a full tick
     let mut quick_until: Option<Instant> = None;
+    // Software fallback check (see below): which file, since when, and whether done
+    let mut fallback_check: (String, Instant, bool) = (String::new(), Instant::now(), false);
     loop {
         // Wait for work, or refresh the snapshot every 100 ms (25 ms just after a
         // file was opened)
@@ -137,10 +139,19 @@ fn run(mpv: Arc<Mutex<Mpv>>, rx: mpsc::Receiver<Job>, state: Arc<Mutex<Snapshot>
                     if last_set.get(&name) == Some(&i) {
                         let _ = m.set_property(&name, value.as_str());
                     }
+                    if name == "hwdec" {
+                        // New decoding method: check the fallback again
+                        fallback_check = (String::new(), Instant::now(), false);
+                    }
                 }
                 Job::Command(name, args) => {
                     if name == "loadfile" {
                         quick_until = Some(Instant::now() + Duration::from_millis(1500));
+                        // A previous file may have needed software threads (see below);
+                        // a hardware decoder gets its single thread back
+                        if m.get_property::<String>("hwdec").map_or(false, |h| h != "no") {
+                            let _ = m.set_property("vd-lavc-threads", 1_i64);
+                        }
                     }
                     let args: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
                     let _ = m.command(&name, &args);
@@ -186,6 +197,7 @@ fn run(mpv: Arc<Mutex<Mpv>>, rx: mpsc::Receiver<Job>, state: Arc<Mutex<Snapshot>
             m.get_property::<String>("path").unwrap_or_default(),
             m.get_property::<i64>("chapter-list/count").unwrap_or(0),
         );
+        let path = key.0.clone();
         if key != chapter_key {
             let mut list = Vec::new();
             for i in 0..key.1 {
@@ -200,6 +212,29 @@ fn run(mpv: Arc<Mutex<Mpv>>, rx: mpsc::Receiver<Job>, state: Arc<Mutex<Snapshot>
             chapters = Arc::new(list);
             s.chapters = chapters.clone();
             chapter_key = key;
+        }
+        // Hardware decoding was asked for, but this file's format can't be decoded
+        // by the GPU (AV1 on older cards, say): mpv quietly decodes it in software,
+        // still held to the single thread meant for the hardware decoder, and 1440p
+        // or 4K at 60 fps can't keep up on one core. Give it all threads back and
+        // reload the video track. (Checked for the first seconds of each file: mpv
+        // can also give up on the GPU a moment into decoding.)
+        if fallback_check.0 != path {
+            fallback_check = (path, Instant::now(), false);
+        }
+        if !fallback_check.2 && fallback_check.1.elapsed() < Duration::from_secs(4) {
+            let wanted = m.get_property::<String>("hwdec").unwrap_or_default();
+            let current = m.get_property::<String>("hwdec-current");
+            let image = m.get_property::<bool>("current-tracks/video/image").unwrap_or(false);
+            if wanted != "no"
+                && current.as_deref() == Ok("no")
+                && !image
+                && m.get_property::<i64>("vd-lavc-threads").unwrap_or(0) == 1
+            {
+                let _ = m.set_property("vd-lavc-threads", 0_i64);
+                let _ = m.command("video-reload", &[]);
+                fallback_check.2 = true;
+            }
         }
         if want_info.load(Ordering::Relaxed) {
             let hw = m.get_property::<String>("hwdec-current").unwrap_or_default();

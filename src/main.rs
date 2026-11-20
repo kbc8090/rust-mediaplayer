@@ -410,16 +410,18 @@ const INFO_TOP: f32 = OSD_TOP + 42.0 + 10.0;
 const HQ_SCALE: &str = "ewa_lanczossharp";
 const NORMAL_SCALE: &str = "lanczos";
 /// Decoding methods H cycles through: mpv's hwdec value, and its name on screen.
-/// "Copy" methods decode on the GPU and copy each frame back before drawing (most
-/// compatible); "direct" ones hand frames straight to OpenGL (fastest, but need
-/// driver support; when that's missing mpv quietly decodes in software, which the
-/// info overlay's "Decoder:" line shows).
+/// "Copy" methods decode on the GPU and copy each frame back before drawing. The
+/// D3D11 / DXVA2 "direct" methods can't work in this app: libmpv only hands Windows
+/// GPU-decoded frames straight to OpenGL through ANGLE, which eframe doesn't use (in
+/// the logs they all failed to load and mpv decoded in software). NVIDIA's own
+/// decoder does work directly with OpenGL. (Settings files store the index: the
+/// old direct entries 3 and 4 never worked, so their slots were reused.)
 const HW_MODES: [(&str, &str); 5] = [
     ("no", "Software (CPU)"),
     ("d3d11va-copy", "D3D11 (copy)"),
     ("dxva2-copy", "DXVA2 (copy)"),
-    ("d3d11va", "D3D11 (direct)"),
-    ("dxva2", "DXVA2 (direct)"),
+    ("nvdec", "NVIDIA (direct)"),
+    ("nvdec-copy", "NVIDIA (copy)"),
 ];
 /// Highest volume (percent). mpv allows up to 130 by default.
 const VOL_MAX: f64 = 130.0;
@@ -643,6 +645,10 @@ impl FluentMediaPlayer {
             // garbled blocks with copy-back decoding on AMD. (Software decoding gets
             // automatic threads again, see toggle_hw_decode.)
             let _ = init.set_property("vd-lavc-threads", if st.hwdec > 0 { "1" } else { "0" });
+            // Upload decoded frames to the GPU without stalling the drawing thread
+            // (mpv's docs: faster with some drivers, especially for 4K video; every
+            // frame is uploaded here, see HW_MODES)
+            let _ = init.set_property("gl-pbo", "yes");
             // Subtitles start off; the captions button turns them on
             let _ = init.set_property("sid", "no");
             let _ = init.set_property("volume-max", VOL_MAX);
