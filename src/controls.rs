@@ -338,7 +338,7 @@ pub(crate) fn draw_top_bar(app: &mut FluentMediaPlayer, ctx: &egui::Context, t: 
                 }
             }
 
-            // Drag region: move the window, double-click to maximise
+            // Drag region: move the window; double-click goes fullscreen
             // (The whole strip, not just its top part: the strip covers the video,
             // so any part of it that doesn't drag is a dead spot.)
             if !fullscreen {
@@ -349,8 +349,10 @@ pub(crate) fn draw_top_bar(app: &mut FluentMediaPlayer, ctx: &egui::Context, t: 
                 if drag.drag_started() && !pressed_on_edge {
                     ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
                 }
+                // (fullscreen, like double-clicking the video; the maximise button
+                // and dragging to the top of the screen still maximise)
                 if drag.double_clicked() {
-                    app.toggle_maximize(ctx);
+                    app.toggle_fullscreen(ctx);
                 }
             }
 
