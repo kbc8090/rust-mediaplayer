@@ -205,7 +205,7 @@ impl Thumbs {
         if resend {
             self.synced = true;
         }
-        if resend || self.requested.map_or(true, |r| (r - secs).abs() > 0.2) {
+        if resend || self.requested.is_none_or(|r| (r - secs).abs() > 0.2) {
             self.requested = Some(secs);
             link.command("seek", &[&at, "absolute+keyframes"]);
         }
@@ -235,7 +235,7 @@ unsafe fn draw(gl: &glow::Context, g: &mut Gl, x: i32, y: i32, w: i32, h: i32, r
     }
     // (Re)create the off-screen texture at exactly the on-screen pixel size
     let mut fresh = false;
-    if g.target.as_ref().map_or(true, |t| t.w != w || t.h != h) {
+    if g.target.as_ref().is_none_or(|t| t.w != w || t.h != h) {
         if let Some(old) = g.target.take() {
             gl.delete_framebuffer(old.fbo);
             gl.delete_texture(old.tex);

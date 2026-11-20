@@ -528,8 +528,8 @@ unsafe fn snap_rect(hwnd: isize, r: &mut RectI, sizing: Option<usize>) {
                 // WMSZ_LEFT 1, RIGHT 2, TOP 3, TOPLEFT 4, TOPRIGHT 5, BOTTOM 6, BOTTOMLEFT 7, BOTTOMRIGHT 8
                 if matches!(edge, 1 | 4 | 7) { want.left += dx; }
                 if matches!(edge, 2 | 5 | 8) { want.right += dx; }
-                if matches!(edge, 3 | 4 | 5) { want.top += dy; }
-                if matches!(edge, 6 | 7 | 8) { want.bottom += dy; }
+                if matches!(edge, 3..=5) { want.top += dy; }
+                if matches!(edge, 6..=8) { want.bottom += dy; }
             }
         }
 
@@ -575,8 +575,8 @@ unsafe fn snap_rect(hwnd: isize, r: &mut RectI, sizing: Option<usize>) {
                     Some(edge) => {
                         if matches!(edge, 1 | 4 | 7) { want.left += pull(l, w.left, &mut st.snapped[0]); }
                         if matches!(edge, 2 | 5 | 8) { want.right += pull(rt, w.right, &mut st.snapped[1]); }
-                        if matches!(edge, 3 | 4 | 5) { want.top += pull(t, w.top, &mut st.snapped[2]); }
-                        if matches!(edge, 6 | 7 | 8) { want.bottom += pull(b, w.bottom, &mut st.snapped[3]); }
+                        if matches!(edge, 3..=5) { want.top += pull(t, w.top, &mut st.snapped[2]); }
+                        if matches!(edge, 6..=8) { want.bottom += pull(b, w.bottom, &mut st.snapped[3]); }
                     }
                 }
             }
@@ -588,7 +588,7 @@ unsafe fn snap_rect(hwnd: isize, r: &mut RectI, sizing: Option<usize>) {
                 if matches!(edge, 1 | 4 | 7) { want.left = want.right - st.min.x; } else { want.right = want.left + st.min.x; }
             }
             if want.bottom - want.top < st.min.y {
-                if matches!(edge, 3 | 4 | 5) { want.top = want.bottom - st.min.y; } else { want.bottom = want.top + st.min.y; }
+                if matches!(edge, 3..=5) { want.top = want.bottom - st.min.y; } else { want.bottom = want.top + st.min.y; }
             }
         }
         *r = want;

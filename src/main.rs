@@ -9,6 +9,14 @@ mod mpv_link;
 mod splash;
 mod taskbar;
 mod thumbs;
+mod settings;
+mod files;
+mod controls;
+mod menus;
+use settings::*;
+use files::*;
+use controls::*;
+use menus::*;
 
 use mpv_link::{yn, InfoRow, MpvLink};
 
@@ -57,8 +65,6 @@ unsafe extern "system" {
 thread_local! {
     /// How long mpv's last render calls took (smoothed), shown in the info overlay
     static RENDER_MS: std::cell::Cell<f32> = const { std::cell::Cell::new(0.0) };
-    /// The most recent single render call, unsmoothed (for resize statistics)
-    static RENDER_LAST_MS: std::cell::Cell<f32> = const { std::cell::Cell::new(0.0) };
     static TLS_RENDER_CTX: RefCell<Option<RenderContext<'static>>> = const { RefCell::new(None) };
     /// The last video frame mpv drew, kept so it can be shown again without asking
     /// mpv to redraw it (see `paint_video`)
@@ -92,7 +98,7 @@ unsafe fn paint_video(gl: &glow::Context, rc: &mut RenderContext<'static>, x: i3
     VIDEO_TARGET.with(|t| {
         let mut t = t.borrow_mut();
         let mut fresh = false;
-        let fits = t.as_ref().map_or(false, |v| v.w >= w && v.h >= h && v.w <= w + 512 && v.h <= h + 512);
+        let fits = t.as_ref().is_some_and(|v| v.w >= w && v.h >= h && v.w <= w + 512 && v.h <= h + 512);
         if !fits {
             if let Some(old) = t.take() {
                 gl.delete_framebuffer(old.fbo);
@@ -184,186 +190,6 @@ fn process_cpu_time() -> Option<u64> {
     ok.then_some(k + u)
 }
 
-// ── Remembered window position / size ─────────────────────────────────────────
-#[derive(Clone, Copy, PartialEq)]
-struct WinState {
-    x: f32,
-    y: f32,
-    w: f32,
-    h: f32,
-    /// pixels_per_point (display scaling) when it was saved
-    ppp: f32,
-    maximized: bool,
-}
-
-impl WinState {
-    const DEFAULT: WinState = WinState { x: 0.0, y: 0.0, w: 960.0, h: 540.0, ppp: 1.0, maximized: false };
-}
-
-/// Picture & sound settings (one "name=value" per line)
-fn adjust_path() -> PathBuf {
-    settings_path().map_or_else(|| PathBuf::from("adjust.txt"), |p| p.with_file_name("adjust.txt"))
-}
-
-/// Where the picture shader files go (see `apply_shader`)
-fn shader_dir() -> Option<PathBuf> {
-    settings_path().and_then(|p| p.parent().map(|d| d.join("shaders")))
-}
-
-fn settings_path() -> Option<PathBuf> {
-    std::env::var_os("APPDATA").map(|d| PathBuf::from(d).join("rust-mediaplayer").join("settings.txt"))
-}
-
-/// What's remembered between runs (besides window position)
-#[derive(Clone, Copy, PartialEq)]
-struct Settings {
-    volume: i32,
-    muted: bool,
-    repeat: bool,
-    on_top: bool,
-    /// Hardware decoding mode, an index into HW_MODES (H). 0 = off (software), the
-    /// default like mpv itself.
-    hwdec: usize,
-    /// Play the next video in the folder when one ends (menu). Off by default.
-    autoplay: bool,
-    /// Order of previous / next in a folder (menu)
-    sort_by: SortBy,
-    sort_desc: bool,
-    /// Window edges snap to the screen edges (menu). On by default.
-    snap: bool,
-    /// Opening a file starts another player window instead of reusing this one
-    /// (menu). Off by default.
-    multi: bool,
-    /// Even out loud and quiet parts (menu). Off by default.
-    normalize: bool,
-    /// Accent-colour window border (menu). Off by default.
-    border: bool,
-    /// Sharper upscaling, mpv's "high-quality" scaler (menu). Off by default.
-    hq: bool,
-    /// Frosted-glass menus, panels and tooltips (menu). On by default.
-    glass: bool,
-}
-
-/// Order of the files that previous / next step through, like Explorer's "Sort by"
-#[derive(Clone, Copy, PartialEq, Debug)]
-enum SortBy {
-    Name,
-    Modified,
-    Created,
-    Size,
-}
-
-impl SortBy {
-    fn code(self) -> u8 {
-        match self {
-            SortBy::Name => 0,
-            SortBy::Modified => 1,
-            SortBy::Created => 2,
-            SortBy::Size => 3,
-        }
-    }
-
-    fn from_code(c: u8) -> Self {
-        match c {
-            1 => SortBy::Modified,
-            2 => SortBy::Created,
-            3 => SortBy::Size,
-            _ => SortBy::Name,
-        }
-    }
-}
-
-fn save_settings(st: &Settings) {
-    let Some(path) = settings_path() else { return };
-    if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
-    let _ = std::fs::write(
-        path,
-        format!(
-            "{} {} {} {} {} {} {} {} {} {} {} {} {} {}",
-            st.volume, st.muted as u8, st.repeat as u8, st.on_top as u8, st.hwdec, st.autoplay as u8,
-            st.sort_by.code(), st.sort_desc as u8, st.snap as u8, st.multi as u8, st.normalize as u8,
-            st.border as u8, st.hq as u8, st.glass as u8
-        ),
-    );
-}
-
-/// Settings from last time (older files with fewer fields still load);
-/// 80 % volume and everything off on first run
-fn load_settings() -> Settings {
-    let text = settings_path().and_then(|p| std::fs::read_to_string(p).ok()).unwrap_or_default();
-    let mut it = text.split_whitespace();
-    let volume = it.next().and_then(|t| t.parse::<f64>().ok());
-    let mut num = || it.next().and_then(|t| t.parse::<usize>().ok());
-    let (muted, repeat, on_top) = (num() == Some(1), num() == Some(1), num() == Some(1));
-    // (older settings files saved 1 for "on", which was copy-back decoding: mode 1)
-    let hwdec = num().unwrap_or(0).min(HW_MODES.len() - 1);
-    let autoplay = num() == Some(1);
-    let sort_by = SortBy::from_code(it.next().and_then(|t| t.parse::<u8>().ok()).unwrap_or(0));
-    let sort_desc = it.next().and_then(|t| t.parse::<u8>().ok()) == Some(1);
-    let snap = it.next().and_then(|t| t.parse::<u8>().ok()) != Some(0);
-    let multi = it.next().and_then(|t| t.parse::<u8>().ok()) == Some(1);
-    let normalize = it.next().and_then(|t| t.parse::<u8>().ok()) == Some(1);
-    let border = it.next().and_then(|t| t.parse::<u8>().ok()) == Some(1);
-    let hq = it.next().and_then(|t| t.parse::<u8>().ok()) == Some(1);
-    let glass = it.next().and_then(|t| t.parse::<u8>().ok()) != Some(0);
-    Settings {
-        volume: volume.map_or(80.0, |v| v.clamp(0.0, VOL_MAX)).round() as i32,
-        muted,
-        repeat,
-        on_top,
-        hwdec,
-        autoplay,
-        sort_by,
-        sort_desc,
-        snap,
-        multi,
-        normalize,
-        border,
-        hq,
-        glass,
-    }
-}
-
-fn state_path() -> Option<PathBuf> {
-    std::env::var_os("APPDATA").map(|d| PathBuf::from(d).join("rust-mediaplayer").join("window.txt"))
-}
-
-fn save_window_state(s: &WinState) {
-    let Some(path) = state_path() else { return };
-    if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
-    let _ = std::fs::write(
-        path,
-        format!("{} {} {} {} {} {}", s.x, s.y, s.w, s.h, s.ppp, s.maximized as u8),
-    );
-}
-
-/// The saved state, if it exists and the window would still be on a connected monitor
-fn load_window_state() -> Option<WinState> {
-    let text = std::fs::read_to_string(state_path()?).ok()?;
-    let v: Vec<f32> = text.split_whitespace().filter_map(|t| t.parse().ok()).collect();
-    if v.len() < 6 { return None; }
-    let s = WinState { x: v[0], y: v[1], w: v[2], h: v[3], ppp: v[4], maximized: v[5] != 0.0 };
-    if !(s.w >= 200.0 && s.h >= 150.0 && s.w <= 20000.0 && s.h <= 20000.0 && s.ppp > 0.0) {
-        return None;
-    }
-
-    // Is (most of) the title area inside the virtual desktop? (monitor unplugged → no)
-    let (vx, vy, vw, vh) = unsafe {
-        (GetSystemMetrics(76), GetSystemMetrics(77), GetSystemMetrics(78), GetSystemMetrics(79))
-    };
-    if vw > 0 && vh > 0 {
-        let (px, py, pw) = (s.x * s.ppp, s.y * s.ppp, s.w * s.ppp);
-        let (vx, vy, vw, vh) = (vx as f32, vy as f32, vw as f32, vh as f32);
-        let visible = px + pw > vx + 100.0 && px < vx + vw - 100.0 && py > vy - 20.0 && py < vy + vh - 80.0;
-        if !visible { return None; }
-    }
-    Some(s)
-}
-
 // ── Palette ───────────────────────────────────────────────────────────────────
 const KNOB_RING:  Color32 = Color32::from_rgb(186, 186, 188); // muted light ring around the knob
 const TRACK:      Color32 = Color32::from_rgb(190, 184, 180); // unplayed seek track
@@ -384,6 +210,13 @@ const VOL_W: f32 = 90.0;
 const VOL_GAP: f32 = 7.0;
 const WIN_BTN_W: f32 = 46.0;
 const WIN_BTN_H: f32 = 34.0;
+/// What the Deinterlace switch sets: mpv's "auto" deinterlaces only frames the file
+/// marks as interlaced. "yes" ran a CPU deinterlacer on every frame of every video,
+/// progressive ones included, doubling the frame count. (mpv doesn't make "auto" its
+/// own default because a few files mark progressive frames as interlaced; with the
+/// switch on, those get deinterlaced as before.)
+const DEINTERLACE_ON: &str = "auto";
+
 /// Playback speeds in the speed menu
 const SPEEDS: [(f64, &str); 7] = [
     (0.25, "0.25\u{d7}"),
@@ -423,21 +256,24 @@ const INFO_TOP: f32 = OSD_TOP + 42.0 + 10.0;
 const HQ_SCALE: &str = "ewa_lanczossharp";
 const NORMAL_SCALE: &str = "lanczos";
 /// Decoding methods H cycles through: mpv's hwdec value, and its name on screen.
-/// "Copy" methods decode on the GPU and copy each frame back before drawing. The
-/// D3D11 / DXVA2 "direct" methods can't work in this app: libmpv only hands Windows
-/// GPU-decoded frames straight to OpenGL through ANGLE, which eframe doesn't use (in
-/// the logs they all failed to load and mpv decoded in software). NVIDIA's own
-/// decoder does work directly with OpenGL. (Settings files store the index: the
-/// old direct entries 3 and 4 never worked, so their slots were reused.)
-const HW_MODES: [(&str, &str); 5] = [
+/// - Hardware: mpv picks the best "copy" method for the GPU (decoded on the GPU,
+///   each frame copied back before drawing). The "direct" D3D11 / DXVA2 methods
+///   can't work in this app: libmpv only hands Windows GPU-decoded frames straight
+///   to OpenGL through ANGLE, which eframe doesn't use.
+/// - NVIDIA direct: NVIDIA's own decoder can hand frames to OpenGL directly (on
+///   other GPUs mpv falls back to software).
+///
+/// Settings store the mpv value, so the order here can change freely.
+const HW_MODES: [(&str, &str); 3] = [
     ("no", "Software (CPU)"),
-    ("d3d11va-copy", "D3D11 (copy)"),
-    ("dxva2-copy", "DXVA2 (copy)"),
-    ("nvdec", "NVIDIA (direct)"),
-    ("nvdec-copy", "NVIDIA (copy)"),
+    ("auto-copy", "Hardware (GPU)"),
+    ("nvdec", "NVIDIA direct (GPU)"),
 ];
 /// Highest volume (percent). mpv allows up to 130 by default.
 const VOL_MAX: f64 = 130.0;
+
+/// A background folder scan's result, shared with its thread: (scan number, files)
+type ScanResult = Arc<Mutex<Option<(u64, Vec<PathBuf>)>>>;
 
 struct FluentMediaPlayer {
     /// Only used (briefly, at startup) to create the render context; everything
@@ -519,7 +355,6 @@ struct FluentMediaPlayer {
     /// whole CPU), for the info overlay
     cpu_mark: Option<(u64, std::time::Instant)>,
     cpu_pct: f32,
-    rs_stats: (u32, f32, f32, f32),
     /// Native window handle and the taskbar integration built on it
     hwnd: isize,
     taskbar: Option<taskbar::Taskbar>,
@@ -559,7 +394,7 @@ struct FluentMediaPlayer {
     last_tick: std::time::Instant,
     /// Background folder scan: its number, and its result (number, files)
     scan_gen: u64,
-    scan_result: Arc<Mutex<Option<(u64, Vec<PathBuf>)>>>,
+    scan_result: ScanResult,
     egui_ctx: egui::Context,
     /// Order of previous / next in a folder
     sort_by: SortBy,
@@ -614,7 +449,7 @@ impl Activated for egui::Response {
     fn activated(&self) -> bool {
         self.clicked()
             || (self.drag_stopped()
-                && self.ctx.input(|i| i.pointer.latest_pos()).map_or(false, |p| self.rect.contains(p)))
+                && self.ctx.input(|i| i.pointer.latest_pos()).is_some_and(|p| self.rect.contains(p)))
     }
 }
 
@@ -626,7 +461,7 @@ fn gl_proc_address(_ctx: &*mut std::ffi::c_void, name: &str) -> *mut std::ffi::c
         if !addr.is_null() && (addr as usize) > 3 && (addr as usize) != usize::MAX {
             return addr;
         }
-        let h_mod = GetModuleHandleA(b"opengl32.dll\0".as_ptr() as *const _);
+        let h_mod = GetModuleHandleA(c"opengl32.dll".as_ptr());
         GetProcAddress(h_mod, c_name.as_ptr())
     }
 }
@@ -654,11 +489,6 @@ impl FluentMediaPlayer {
             // own. Older libmpv builds happened to pick this automatically; newer
             // ones default to their own video output (a separate "mpv" window).
             let _ = init.set_property("vo", "libmpv");
-            // (No mpv log file any more: it wrote detailed debug output the whole
-            // time a video played. Remove the one older versions left behind.)
-            if let Some(log) = settings_path().map(|p| p.with_file_name("mpv.log")) {
-                let _ = std::fs::remove_file(log);
-            }
             let _ = init.set_property("video-timing-offset", 0.0_f64);
             // Decoding: software by default (mpv's own default, and the newer mpv's
             // hardware decoder garbled frames on one AMD setup). H cycles through the
@@ -672,10 +502,6 @@ impl FluentMediaPlayer {
             // garbled blocks with copy-back decoding on AMD. (Software decoding gets
             // automatic threads again, see toggle_hw_decode.)
             let _ = init.set_property("vd-lavc-threads", if st.hwdec > 0 { "1" } else { "0" });
-            // Upload decoded frames to the GPU without stalling the drawing thread
-            // (mpv's docs: faster with some drivers, especially for 4K video; every
-            // frame is uploaded here, see HW_MODES)
-            let _ = init.set_property("gl-pbo", "yes");
             // Subtitles start off; the captions button turns them on
             let _ = init.set_property("sid", "no");
             let _ = init.set_property("volume-max", VOL_MAX);
@@ -699,8 +525,8 @@ impl FluentMediaPlayer {
         if st.repeat {
             let _ = mpv.set_property("loop-file", "inf");
         }
-        // Frame pacing: mpv's default (sync video to audio). "display-resample" needs
-        // per-frame vsync reports that this embedding doesn't provide.
+        // Frame pacing: mpv's default (video timed to the audio), or timed to the
+        // display when Smooth motion is on for a film (see `update_smooth`).
         // Repaints: mpv signals us through a channel when a new frame is ready.
 
         let mpv = Arc::new(Mutex::new(mpv));
@@ -765,7 +591,6 @@ impl FluentMediaPlayer {
             ui_fps: 0.0,
             cpu_mark: None,
             cpu_pct: 0.0,
-            rs_stats: (0, 0.0, 0.0, 0.0),
             hwnd: 0,
             taskbar: None,
             taskbar_tried: false,
@@ -933,7 +758,7 @@ impl FluentMediaPlayer {
             self.link.set("deband", "yes");
         }
         if a.deinterlace {
-            self.link.set("deinterlace", "yes");
+            self.link.set("deinterlace", DEINTERLACE_ON);
         }
         if a.delay_ms != 0 {
             self.link.set("audio-delay", a.delay_ms as f64 / 1000.0);
@@ -964,7 +789,7 @@ impl FluentMediaPlayer {
             self.link.set("deband", yn(a.deband));
         }
         if old.deinterlace != a.deinterlace {
-            self.link.set("deinterlace", yn(a.deinterlace));
+            self.link.set("deinterlace", if a.deinterlace { DEINTERLACE_ON } else { "no" });
         }
         if old.delay_ms != a.delay_ms {
             self.link.set("audio-delay", a.delay_ms as f64 / 1000.0);
@@ -1240,13 +1065,6 @@ impl FluentMediaPlayer {
         if let Some((ws, private)) = process_memory_mb() {
             rows.push(InfoRow::Item("Memory", format!("{ws:.0} MB  \u{b7}  {private:.0} MB private")));
         }
-        let (n, sum, worst, worst_render) = self.rs_stats;
-        if n > 0 {
-            rows.push(InfoRow::Item(
-                "Last resize",
-                format!("{n} frames  \u{b7}  avg {:.0} ms  \u{b7}  worst {worst:.0} ms (render {worst_render:.0} ms)", sum / n as f32),
-            ));
-        }
         self.info_rows = rows;
     }
 
@@ -1276,11 +1094,11 @@ impl FluentMediaPlayer {
     }
 
     fn has_prev(&self) -> bool {
-        self.folder_index.map_or(false, |i| i > 0)
+        self.folder_index.is_some_and(|i| i > 0)
     }
 
     fn has_next(&self) -> bool {
-        self.folder_index.map_or(false, |i| i + 1 < self.folder_files.len())
+        self.folder_index.is_some_and(|i| i + 1 < self.folder_files.len())
     }
 
     /// Open the previous (-1) or next (+1) video in the current file's folder
@@ -1672,16 +1490,8 @@ impl eframe::App for FluentMediaPlayer {
         if frame_ms > 0.0 {
             self.ui_fps = self.ui_fps * 0.95 + (1000.0 / frame_ms) * 0.05;
         }
-        if self.resize_until.is_some() {
-            let render_ms = RENDER_LAST_MS.with(|r| r.get());
-            let st = &mut self.rs_stats;
-            *st = (st.0 + 1, st.1 + frame_ms, st.2.max(frame_ms), st.3.max(render_ms));
-        }
         let size = sc.size();
         if size != self.last_size {
-            if self.resize_until.is_none() {
-                self.rs_stats = (0, 0.0, 0.0, 0.0); // a new resize begins
-            }
             let first = self.last_size == egui::Vec2::ZERO;
             self.last_size = size;
             if !first && self.has_file && self.fs_settle.is_none() {
@@ -1735,10 +1545,10 @@ impl eframe::App for FluentMediaPlayer {
             self.last_mouse_move = std::time::Instant::now();
         }
         let near_edge = inp.pointer
-            .map_or(false, |p| p.y < TOP_H || p.y > screen.bottom() - BOTTOM_H || self.adjust_ui.contains(p));
+            .is_some_and(|p| p.y < TOP_H || p.y > screen.bottom() - BOTTOM_H || self.adjust_ui.contains(p));
         let menu_open = self.main_menu || self.show_keys || self.speed_menu;
         let idle = self.last_mouse_move.elapsed().as_secs_f32();
-        let settling = self.fs_settle.map_or(false, |t0| t0.elapsed().as_secs_f32() < FS_SETTLE);
+        let settling = self.fs_settle.is_some_and(|t0| t0.elapsed().as_secs_f32() < FS_SETTLE);
         if !settling {
             self.fs_settle = None;
         }
@@ -1751,8 +1561,8 @@ impl eframe::App for FluentMediaPlayer {
                 self.fs_armed = true;
             }
             let armed = !settling && self.fs_armed;
-            let over_top = inp.pointer.map_or(false, |p| p.y < TOP_H);
-            let over_bottom = inp.pointer.map_or(false, |p| p.y > screen.bottom() - BOTTOM_H);
+            let over_top = inp.pointer.is_some_and(|p| p.y < TOP_H);
+            let over_bottom = inp.pointer.is_some_and(|p| p.y > screen.bottom() - BOTTOM_H);
             let speed_menu = self.speed_menu;
             self.show_controls = speed_menu || (armed && over_bottom);
             self.show_top = self.main_menu || (armed && over_top);
@@ -1786,11 +1596,10 @@ impl eframe::App for FluentMediaPlayer {
         if inp.rotate { self.rotate_90(); }
         if inp.adjust { self.adjust_ui.open = !self.adjust_ui.open; }
 
-
         // Mouse wheel anywhere in the window = volume, 5 % per notch
         // (egui reports one wheel notch as 50 points). Not over the Picture & sound
         // panels (the wheel adjusts the setting there) or the shortcuts list.
-        let over_panels = inp.pointer.map_or(false, |p| self.adjust_ui.contains(p));
+        let over_panels = inp.pointer.is_some_and(|p| self.adjust_ui.contains(p));
         if !over_panels && !self.show_keys {
             self.scroll_accum += inp.scroll_y;
         }
@@ -1868,7 +1677,6 @@ impl eframe::App for FluentMediaPlayer {
                             if drew {
                                 let ms = started.elapsed().as_secs_f32() * 1000.0;
                                 RENDER_MS.with(|r| r.set(r.get() * 0.8 + ms * 0.2));
-                                RENDER_LAST_MS.with(|r| r.set(ms));
                             }
                         })),
                     });
@@ -1901,7 +1709,7 @@ impl eframe::App for FluentMediaPlayer {
         // menu and the Picture & Sound / equalizer panels
         let on_video = ctx.input(|i| i.pointer.any_pressed().then(|| i.pointer.press_origin()).flatten())
             .and_then(|p| ctx.layer_id_at(p))
-            .map_or(false, |l| l.order == egui::Order::Background);
+            .is_some_and(|l| l.order == egui::Order::Background);
         if on_video {
             self.main_menu = false;
             self.speed_menu = false;
@@ -2094,799 +1902,6 @@ fn install_fonts(ctx: &egui::Context) -> CaptionFont {
     caption
 }
 
-// ── Small drawing helpers ─────────────────────────────────────────────────────
-fn black(alpha: u8, t: f32) -> Color32 {
-    Color32::from_black_alpha((alpha as f32 * t) as u8)
-}
-
-/// Vertical two-colour gradient rectangle
-fn gradient(p: &egui::Painter, rect: Rect, top: Color32, bottom: Color32) {
-    let mut m = egui::Mesh::default();
-    m.colored_vertex(rect.left_top(), top);
-    m.colored_vertex(rect.right_top(), top);
-    m.colored_vertex(rect.right_bottom(), bottom);
-    m.colored_vertex(rect.left_bottom(), bottom);
-    m.add_triangle(0, 1, 2);
-    m.add_triangle(0, 2, 3);
-    p.add(egui::Shape::mesh(m));
-}
-
-/// Polyline given as offsets from a centre point
-fn poly(p: &egui::Painter, c: Pos2, pts: &[(f32, f32)], col: Color32, w: f32) {
-    let v: Vec<Pos2> = pts.iter().map(|&(x, y)| pos2(c.x + x, c.y + y)).collect();
-    p.add(egui::Shape::line(v, Stroke::new(w, col)));
-}
-
-/// Click target (one full step wide, so neighbours never overlap) with a faint
-/// rounded hover highlight (8 px radius). Draw the icon afterwards.
-fn hit(ui: &mut egui::Ui, centre: Pos2, id: &str, tip: &str, t: f32) -> egui::Response {
-    hit_at(ui, centre, id, tip, t, true)
-}
-
-/// `hit` with the tooltip above (`above`) or below the button
-fn hit_at(ui: &mut egui::Ui, centre: Pos2, id: &str, tip: &str, t: f32, above: bool) -> egui::Response {
-    let r = ui.interact(
-        Rect::from_center_size(centre, vec2(BTN_STEP, 34.0)),
-        ui.id().with(id),
-        // drags starting on a button must not move the window (see the window buttons)
-        Sense::click_and_drag(),
-    );
-    let inside = ui.input(|i| i.pointer.latest_pos()).map_or(false, |p| r.rect.contains(p));
-    let pressed = r.is_pointer_button_down_on() && inside;
-    if r.hovered() || pressed {
-        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-        // hover, and a little brighter while the mouse button is held on it
-        let a = if pressed { 13.0 } else { 6.0 };
-        ui.painter().rect_filled(
-            Rect::from_center_size(centre, vec2(BTN_BOX, BTN_BOX)),
-            8.0,
-            Color32::from_white_alpha((a * t) as u8),
-        );
-    }
-    hover_tooltip(ui.ctx(), &r, Rect::from_center_size(centre, vec2(BTN_BOX, BTN_BOX)), tip, above);
-    r
-}
-
-// ── Tooltips ──────────────────────────────────────────────────────────────────
-/// Show `text` near `anchor` once the pointer has rested on `resp` for a moment.
-/// Placed above (bottom controls) or below (window buttons) from the start, instead
-/// of egui's default of trying below the pointer and flipping when it doesn't fit.
-fn hover_tooltip(ctx: &egui::Context, resp: &egui::Response, anchor: Rect, text: &str, above: bool) {
-    const DELAY: f64 = 0.5;
-    let key = resp.id.with("tip_since");
-    if !resp.hovered() {
-        ctx.data_mut(|d| d.remove::<f64>(key));
-        return;
-    }
-    if resp.is_pointer_button_down_on() {
-        // Clicked: no tooltip until the pointer leaves and comes back (like Windows)
-        ctx.data_mut(|d| d.insert_temp(key, f64::INFINITY));
-        return;
-    }
-    let now = ctx.input(|i| i.time);
-    let since = ctx.data_mut(|d| *d.get_temp_mut_or_insert_with(key, || now));
-    if !since.is_finite() {
-        return;
-    }
-    let age = now - since;
-    if age < DELAY {
-        ctx.request_repaint_after(std::time::Duration::from_secs_f64(DELAY - age));
-        return;
-    }
-    let alpha = ((age - DELAY) / 0.12).min(1.0) as f32; // quick fade-in
-    if alpha < 1.0 {
-        ctx.request_repaint();
-    }
-    draw_tooltip(ctx, anchor, text, above, alpha);
-}
-
-/// Windows 11-style dark tooltip: near-opaque dark grey, hairline border,
-/// small corner radius and a faint shadow.
-fn draw_tooltip(ctx: &egui::Context, anchor: Rect, text: &str, above: bool, alpha: f32) {
-    let p = ctx.layer_painter(egui::LayerId::new(egui::Order::Tooltip, egui::Id::new("rmp_tooltip")));
-    let galley = p.layout_no_wrap(
-        text.to_owned(),
-        FontId::proportional(12.5),
-        Color32::from_rgb(235, 235, 235).gamma_multiply(alpha),
-    );
-    let pad = vec2(9.0, 5.0);
-    let size = galley.size() + pad * 2.0;
-    let screen = ctx.screen_rect();
-    let x = (anchor.center().x - size.x / 2.0)
-        .min(screen.right() - 6.0 - size.x)
-        .max(screen.left() + 6.0)
-        .round();
-    let y = if above { anchor.top() - 6.0 - size.y } else { anchor.bottom() + 6.0 }.round();
-    let rect = Rect::from_min_size(pos2(x, y), size);
-    let r = 5.0;
-
-    glass::shadow(&p, rect, r, alpha * 0.6);
-    glass::fill(&p, rect, r, Color32::from_rgba_unmultiplied(43, 43, 43, 245), alpha);
-    let edge = glass::edge(Color32::from_white_alpha(20));
-    p.rect_stroke(rect.shrink(0.5), r, Stroke::new(1.0_f32, edge.gamma_multiply(alpha)));
-    p.galley(rect.min + pad, galley, Color32::WHITE);
-}
-
-// ── Icons (drawn with shapes so they never depend on font coverage) ───────────
-const SW: f32 = 1.35;
-/// Overall scale of the control-row icons
-const K: f32 = 0.92;
-
-/// Like `poly`, with the offsets scaled by the icon scale `K`
-fn kpoly(p: &egui::Painter, c: Pos2, pts: &[(f32, f32)], col: Color32, w: f32) {
-    let v: Vec<Pos2> = pts.iter().map(|&(x, y)| pos2(c.x + x * K, c.y + y * K)).collect();
-    p.add(egui::Shape::line(v, Stroke::new(w, col)));
-}
-
-fn kclosed(p: &egui::Painter, c: Pos2, pts: &[(f32, f32)], col: Color32, w: f32) {
-    let v: Vec<Pos2> = pts.iter().map(|&(x, y)| pos2(c.x + x * K, c.y + y * K)).collect();
-    p.add(egui::Shape::closed_line(v, Stroke::new(w, col)));
-}
-
-fn icon_pause(p: &egui::Painter, c: Pos2, col: Color32) {
-    p.rect_filled(Rect::from_center_size(pos2(c.x - 3.5 * K, c.y), vec2(2.6 * K, 13.0 * K)), 0.5, col);
-    p.rect_filled(Rect::from_center_size(pos2(c.x + 3.5 * K, c.y), vec2(2.6 * K, 13.0 * K)), 0.5, col);
-}
-fn icon_play(p: &egui::Painter, c: Pos2, col: Color32) {
-    p.add(egui::Shape::convex_polygon(
-        vec![
-            pos2(c.x - 4.5 * K, c.y - 7.5 * K),
-            pos2(c.x - 4.5 * K, c.y + 7.5 * K),
-            pos2(c.x + 7.5 * K, c.y),
-        ],
-        col, Stroke::NONE,
-    ));
-}
-fn icon_prev(p: &egui::Painter, c: Pos2, col: Color32) {
-    p.line_segment([pos2(c.x - 6.5 * K, c.y - 6.0 * K), pos2(c.x - 6.5 * K, c.y + 6.0 * K)], Stroke::new(SW, col));
-    kclosed(p, c, &[(6.5, -6.0), (6.5, 6.0), (-3.0, 0.0)], col, SW);
-}
-fn icon_next(p: &egui::Painter, c: Pos2, col: Color32) {
-    p.line_segment([pos2(c.x + 6.5 * K, c.y - 6.0 * K), pos2(c.x + 6.5 * K, c.y + 6.0 * K)], Stroke::new(SW, col));
-    kclosed(p, c, &[(-6.5, -6.0), (-6.5, 6.0), (3.0, 0.0)], col, SW);
-}
-fn icon_volume(p: &egui::Painter, c: Pos2, col: Color32, level: f64, muted: bool) {
-    let c = pos2(c.x - 3.0 * K, c.y);
-    kclosed(p, c, &[(-6.0, -3.0), (-3.0, -3.0), (1.5, -7.0), (1.5, 7.0), (-3.0, 3.0), (-6.0, 3.0)], col, SW);
-    if muted || level <= 0.0 {
-        kpoly(p, c, &[(5.0, -3.5), (10.5, 3.5)], col, SW);
-        kpoly(p, c, &[(5.0, 3.5), (10.5, -3.5)], col, SW);
-    } else {
-        let arc = |r: f32| -> Vec<(f32, f32)> {
-            (-4..=4).map(|k| {
-                let a = (k as f32) * 11.0_f32.to_radians();
-                (1.5 + r * a.cos(), r * a.sin())
-            }).collect()
-        };
-        kpoly(p, c, &arc(5.0), col, SW);
-        if level >= 40.0 { kpoly(p, c, &arc(9.0), col, SW); }
-    }
-}
-fn icon_repeat(p: &egui::Painter, c: Pos2, col: Color32) {
-    kpoly(p, c, &[(-8.0, 2.0), (-8.0, -2.0), (-5.0, -5.0), (6.0, -5.0)], col, SW);
-    kpoly(p, c, &[(3.5, -7.5), (6.0, -5.0), (3.5, -2.5)], col, SW);
-    kpoly(p, c, &[(8.0, -2.0), (8.0, 2.0), (5.0, 5.0), (-6.0, 5.0)], col, SW);
-    kpoly(p, c, &[(-3.5, 2.5), (-6.0, 5.0), (-3.5, 7.5)], col, SW);
-}
-fn icon_captions(p: &egui::Painter, c: Pos2, col: Color32) {
-    p.rect_stroke(Rect::from_center_size(c, vec2(18.0 * K, 13.0 * K)), 2.0, Stroke::new(SW, col));
-    kpoly(p, c, &[(-5.0, -1.0), (-1.5, -1.0)], col, SW);
-    kpoly(p, c, &[(1.5, -1.0), (5.0, -1.0)], col, SW);
-    kpoly(p, c, &[(-5.0, 2.5), (2.0, 2.5)], col, SW);
-}
-fn icon_compact(p: &egui::Painter, c: Pos2, col: Color32) {
-    p.rect_stroke(Rect::from_center_size(c, vec2(17.0 * K, 13.0 * K)), 1.5, Stroke::new(SW, col));
-    p.rect_filled(Rect::from_min_size(pos2(c.x + 0.5 * K, c.y - 0.5 * K), vec2(6.0 * K, 4.5 * K)), 0.5, col);
-}
-fn icon_fullscreen(p: &egui::Painter, c: Pos2, col: Color32) {
-    kpoly(p, c, &[(-6.5, 6.5), (6.5, -6.5)], col, SW);
-    kpoly(p, c, &[(6.5, -1.5), (6.5, -6.5), (1.5, -6.5)], col, SW);
-    kpoly(p, c, &[(-6.5, 1.5), (-6.5, 6.5), (-1.5, 6.5)], col, SW);
-}
-/// Rotate: a curved arrow turning clockwise over a small rectangle
-fn icon_rotate(p: &egui::Painter, c: Pos2, col: Color32) {
-    let c = pos2(c.x, c.y - 1.5 * K);
-    p.rect_stroke(
-        Rect::from_min_max(pos2(c.x - 7.5 * K, c.y), pos2(c.x - 0.5 * K, c.y + 8.0 * K)),
-        1.5,
-        Stroke::new(SW, col),
-    );
-    let (ox, oy, r) = (0.5_f32, 1.5_f32, 6.5_f32);
-    let arc: Vec<(f32, f32)> = (0..=16)
-        .map(|i| {
-            let a = (225.0 + 130.0 * i as f32 / 16.0_f32).to_radians();
-            (ox + r * a.cos(), oy + r * a.sin())
-        })
-        .collect();
-    kpoly(p, c, &arc, col, SW);
-    // arrowhead at the end, pointing down (the way the arc turns)
-    let (ex, ey) = *arc.last().unwrap();
-    kpoly(p, c, &[(ex - 2.8, ey - 2.2), (ex, ey + 0.6), (ex + 2.6, ey - 2.4)], col, SW);
-}
-
-/// Mirror: two triangles facing each other across a dashed line
-fn icon_mirror(p: &egui::Painter, c: Pos2, col: Color32) {
-    for i in 0..4 {
-        let y0 = -8.0 + i as f32 * 4.5;
-        kpoly(p, c, &[(0.0, y0), (0.0, y0 + 2.2)], col, SW);
-    }
-    p.add(egui::Shape::convex_polygon(
-        vec![
-            pos2(c.x - 2.5 * K, c.y - 6.0 * K),
-            pos2(c.x - 2.5 * K, c.y + 6.0 * K),
-            pos2(c.x - 8.5 * K, c.y + 6.0 * K),
-        ],
-        col,
-        Stroke::NONE,
-    ));
-    kclosed(p, c, &[(2.5, -6.0), (2.5, 6.0), (8.5, 6.0)], col, SW);
-}
-
-/// Playback speed: a speedometer, an open dial with a needle pointing up-right
-fn icon_speed(p: &egui::Painter, c: Pos2, col: Color32) {
-    let c = pos2(c.x, c.y + 1.5 * K); // the dial is open at the bottom: sit it a little lower
-    let r = 8.0;
-    // 270° arc from bottom-left over the top to bottom-right (screen y points down)
-    let dial: Vec<(f32, f32)> = (0..=24)
-        .map(|i| {
-            let a = (135.0 + 270.0 * i as f32 / 24.0_f32).to_radians();
-            (r * a.cos(), r * a.sin())
-        })
-        .collect();
-    kpoly(p, c, &dial, col, SW);
-    let n = (-50.0_f32).to_radians();
-    kpoly(p, c, &[(0.0, 0.0), (5.5 * n.cos(), 5.5 * n.sin())], col, SW + 0.15);
-    adjust::disc(p, c, 1.7 * K, col);
-}
-
-/// Slider thumb: light ring with an accent dot, both circles share one centre that is
-/// snapped to the physical pixel grid so the dot can never look off-centre.
-/// A bar with fully round ends (a pill), drawn with smooth half circles (egui's own
-/// rounded corners are only a few points at this size, and look square)
-fn pill(p: &egui::Painter, rect: Rect, color: Color32) {
-    let r = rect.height() / 2.0;
-    if rect.width() <= 0.0 || r <= 0.0 {
-        return;
-    }
-    if rect.width() <= rect.height() {
-        adjust::disc(p, rect.center(), rect.width().min(rect.height()) / 2.0, color);
-        return;
-    }
-    let n = adjust::arc_points(r, p.ctx().pixels_per_point()) / 2;
-    let y = rect.center().y;
-    let (cl, cr) = (pos2(rect.left() + r, y), pos2(rect.right() - r, y));
-    let mut pts = Vec::with_capacity(2 * (n + 1));
-    // Clockwise on screen: right end top → bottom, then left end bottom → top
-    for i in 0..=n {
-        let a = -std::f32::consts::FRAC_PI_2 + std::f32::consts::PI * i as f32 / n as f32;
-        pts.push(cr + r * vec2(a.cos(), a.sin()));
-    }
-    for i in 0..=n {
-        let a = std::f32::consts::FRAC_PI_2 + std::f32::consts::PI * i as f32 / n as f32;
-        pts.push(cl + r * vec2(a.cos(), a.sin()));
-    }
-    p.add(egui::Shape::convex_polygon(pts, color, Stroke::NONE));
-}
-
-fn draw_knob(p: &egui::Painter, ppp: f32, centre: Pos2, hot: bool, accent: Color32, t: f32) {
-    let snap = |v: f32| (v * ppp).round() / ppp;
-    let c = pos2(snap(centre.x), snap(centre.y));
-    let (ring, dot) = if hot { (7.5, 4.6) } else { (6.5, 3.9) };
-    adjust::disc(p, pos2(c.x, c.y + 1.0), ring + 0.8, Color32::from_black_alpha((80.0 * t) as u8));
-    adjust::disc(p, c, ring, KNOB_RING.gamma_multiply(t));
-    adjust::disc(p, c, dot, accent);
-}
-
-// ── Title bar (overlaid on the video) ─────────────────────────────────────────
-fn draw_top_bar(app: &mut FluentMediaPlayer, ctx: &egui::Context, t: f32) {
-    let screen = ctx.screen_rect();
-    let bar = Rect::from_min_size(screen.min, vec2(screen.width(), TOP_H));
-    let maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
-    let fullscreen = app.is_fullscreen;
-    let title = if app.has_file { app.file_name() } else { "Rust Media Player".to_owned() };
-    let white = Color32::WHITE.gamma_multiply(t);
-
-    egui::Area::new(egui::Id::new("top_bar"))
-        .order(egui::Order::Foreground)
-        .fixed_pos(bar.min)
-        .show(ctx, |ui| {
-            ui.allocate_rect(bar, Sense::hover());
-            let p = ui.painter().clone();
-            gradient(&p, bar, black(150, t), Color32::TRANSPARENT);
-
-            // Fullscreen: the bar covers the top edge of the screen, so it must
-            // handle the double-click itself (the video underneath can't see it)
-            if fullscreen {
-                let bg = ui.interact(bar, ui.id().with("fs_bg"), Sense::click());
-                if bg.double_clicked() {
-                    app.toggle_fullscreen(ctx);
-                }
-            }
-
-            // Drag region: move the window, double-click to maximise
-            // (The whole strip, not just its top part: the strip covers the video,
-            // so any part of it that doesn't drag is a dead spot.)
-            if !fullscreen {
-                let drag = ui.interact(bar, ui.id().with("drag"), Sense::click_and_drag());
-                let pressed_on_edge = ctx
-                    .input(|i| i.pointer.press_origin())
-                    .map_or(false, |o| hit_edge(o, screen).is_some());
-                if drag.drag_started() && !pressed_on_edge {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
-                }
-                if drag.double_clicked() {
-                    app.toggle_maximize(ctx);
-                }
-            }
-
-            // Left: menu button, then the file name level with it
-            let mc = pos2(MENU_X, MENU_Y);
-            let menu = hit_at(ui, mc, "menu", "Menu", t, false);
-            app.menu_anchor = menu.rect;
-            if app.main_menu && !menu.hovered() {
-                // keep it highlighted while its menu is open
-                p.rect_filled(Rect::from_center_size(mc, vec2(BTN_BOX, BTN_BOX)), 8.0, Color32::from_white_alpha((8.0 * t) as u8));
-            }
-            for dy in [-4.5, 0.0, 4.5] {
-                p.line_segment([pos2(mc.x - 7.0, mc.y + dy), pos2(mc.x + 7.0, mc.y + dy)], Stroke::new(SW, white));
-            }
-            if menu.activated() {
-                app.main_menu = !app.main_menu;
-            }
-
-            // (text centred on its line box sits a little low next to the icon)
-            let y = MENU_Y - 1.0;
-            let right_limit = if fullscreen { screen.right() - 20.0 } else { screen.right() - WIN_BTN_W * 3.0 - 10.0 };
-            let tx = TITLE_X;
-            let clip = p.with_clip_rect(Rect::from_min_max(pos2(tx, 0.0), pos2(right_limit, TOP_H)));
-            let font = FontId::new(14.5, FontFamily::Name("semibold".into()));
-            clip.text(pos2(tx + 1.0, y + 1.0), Align2::LEFT_CENTER, &title, font.clone(), black(170, t));
-            clip.text(pos2(tx, y), Align2::LEFT_CENTER, &title, font, white);
-
-            // Right: window buttons (not shown in fullscreen)
-            if !fullscreen {
-                for k in 0..3 {
-                    let r = Rect::from_min_size(
-                        pos2(screen.right() - WIN_BTN_W * (3 - k) as f32, screen.top()),
-                        vec2(WIN_BTN_W, WIN_BTN_H),
-                    );
-                    // click_and_drag: a button must also "own" drags that start on it,
-                    // otherwise egui hands the drag to the draggable title strip behind
-                    // it and the window moves
-                    let resp = ui.interact(r, ui.id().with(("winbtn", k)), Sense::click_and_drag());
-                    let label = match k {
-                        0 => "Minimize",
-                        1 if maximized => "Restore Down",
-                        1 => "Maximize",
-                        _ => "Close",
-                    };
-                    hover_tooltip(ctx, &resp, r, label, false);
-                    // Like Windows: lighter while held down (darker for close), and no
-                    // highlight while held with the pointer moved off the button
-                    let held = resp.is_pointer_button_down_on();
-                    let inside = ctx.input(|i| i.pointer.latest_pos()).map_or(false, |pp| r.contains(pp));
-                    let pressed = held && inside;
-                    if pressed || (resp.hovered() && !held) {
-                        // Windows' own colours (the close red differs on 10 and 11)
-                        let fill = if k == 2 {
-                            let red = if app.caption_font == CaptionFont::Mdl2 {
-                                Color32::from_rgb(232, 17, 35)
-                            } else {
-                                Color32::from_rgb(196, 43, 28)
-                            };
-                            red.gamma_multiply(if pressed { 0.72 } else { 1.0 } * t)
-                        } else {
-                            Color32::from_white_alpha((if pressed { 38.0 } else { 22.0 } * t) as u8)
-                        };
-                        p.rect_filled(r, 0.0, fill);
-                    }
-                    let c = r.center();
-                    let s = Stroke::new(1.1_f32, white);
-                    if app.caption_font != CaptionFont::None {
-                        // ChromeMinimize / ChromeMaximize / ChromeRestore / ChromeClose
-                        let glyph = match k {
-                            0 => "\u{E921}",
-                            1 if maximized => "\u{E923}",
-                            1 => "\u{E922}",
-                            _ => "\u{E8BB}",
-                        };
-                        p.text(c, Align2::CENTER_CENTER, glyph, FontId::new(10.0, FontFamily::Name("caption".into())), white);
-                    } else {
-                    match k {
-                        0 => { p.line_segment([pos2(c.x - 5.0, c.y), pos2(c.x + 5.0, c.y)], s); }
-                        1 => {
-                            if maximized {
-                                p.rect_stroke(Rect::from_min_size(pos2(c.x - 5.0, c.y - 2.0), vec2(7.0, 7.0)), 0.0, s);
-                                poly(&p, c, &[(-2.0, -2.0), (-2.0, -5.0), (5.0, -5.0), (5.0, 2.0), (2.0, 2.0)], white, 1.1);
-                            } else {
-                                p.rect_stroke(Rect::from_center_size(c, vec2(10.0, 10.0)), 0.0, s);
-                            }
-                        }
-                        _ => {
-                            p.line_segment([pos2(c.x - 5.0, c.y - 5.0), pos2(c.x + 5.0, c.y + 5.0)], s);
-                            p.line_segment([pos2(c.x - 5.0, c.y + 5.0), pos2(c.x + 5.0, c.y - 5.0)], s);
-                        }
-                    }
-                    }
-                    if resp.activated() {
-                        match k {
-                            0 => ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true)),
-                            1 => app.toggle_maximize(ctx),
-                            // End the process right here (see `quit`). Hiding the window
-                            // and asking egui to close it later doesn't work: a hidden
-                            // window gets no more redraws, so the close was never handled.
-                            _ => app.quit(),
-                        }
-                    }
-                }
-            }
-        });
-}
-
-// ── Seek bar + control row (overlaid on the video) ────────────────────────────
-fn draw_bottom_bar(app: &mut FluentMediaPlayer, ctx: &egui::Context, t: f32) {
-    let screen = ctx.screen_rect();
-    let bar = Rect::from_min_max(pos2(screen.left(), screen.bottom() - BOTTOM_H), screen.right_bottom());
-    let white = Color32::WHITE.gamma_multiply(t);
-    let accent = app.accent.gamma_multiply(t);
-
-    egui::Area::new(egui::Id::new("bottom_bar"))
-        .order(egui::Order::Foreground)
-        .fixed_pos(bar.min)
-        .show(ctx, |ui| {
-            ui.allocate_rect(bar, Sense::hover());
-            let p = ui.painter().clone();
-            gradient(&p, bar, Color32::TRANSPARENT, black(175, t));
-
-            // Empty parts of the bar behave like the video underneath: double-click
-            // toggles fullscreen (so the bottom edge of the screen works too), drag
-            // moves the window. Registered first, so the seek bar and buttons added
-            // after it take precedence.
-            let bg = ui.interact(bar, ui.id().with("bar_bg"), Sense::click_and_drag());
-            if bg.double_clicked() {
-                app.toggle_fullscreen(ctx);
-            }
-            let pressed_on_edge = ctx
-                .input(|i| i.pointer.press_origin())
-                .map_or(false, |o| hit_edge(o, screen).is_some());
-            if bg.drag_started() && !app.is_fullscreen && !pressed_on_edge {
-                ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
-            }
-
-            // ── Seek bar ──────────────────────────────────────────────────────
-            let seek_y = screen.bottom() - SEEK_FROM_BOTTOM;
-            let sr = Rect::from_min_max(
-                pos2(screen.left() + SIDE, seek_y - 10.0),
-                pos2(screen.right() - SIDE, seek_y + 10.0),
-            );
-            let seek = ui.interact(sr, ui.id().with("seek"), Sense::click_and_drag());
-            // The knob travels inset by its radius, so at 0 % / 100 % it sits inside
-            // the bar's ends (flush with the play / "more" buttons) instead of poking out.
-            const KNOB_INSET: f32 = 7.5;
-            let (k0, kw) = (sr.left() + KNOB_INSET, sr.width() - 2.0 * KNOB_INSET);
-            let frac_at = |x: f32| ((x - k0) / kw).clamp(0.0, 1.0);
-            let dragging = seek.is_pointer_button_down_on() || seek.dragged();
-            if dragging {
-                if let Some(pos) = seek.interact_pointer_pos() {
-                    let f = frac_at(pos.x);
-                    app.drag_frac = Some(f);
-                    if app.duration > 0.0 { app.seek_to(f as f64 * app.duration); }
-                }
-            } else {
-                app.drag_frac = None;
-            }
-            let frac = app.drag_frac.unwrap_or(if app.duration > 0.0 {
-                (app.time_pos / app.duration).clamp(0.0, 1.0) as f32
-            } else { 0.0 });
-            let hot = seek.hovered() || dragging;
-
-            let track_h = if hot { 4.0 } else { 3.0 };
-            let (y0, y1) = (seek_y - track_h / 2.0, seek_y + track_h / 2.0);
-            pill(&p, Rect::from_min_max(pos2(sr.left(), y0), pos2(sr.right(), y1)), TRACK.gamma_multiply(t));
-            let fill_x = k0 + kw * frac;
-            pill(&p, Rect::from_min_max(pos2(sr.left(), y0), pos2(fill_x, y1)), accent);
-            // Chapter marks: small gaps in the bar
-            if app.duration > 0.0 {
-                let ppp = ctx.pixels_per_point();
-                for &(start, _) in app.chapters.iter() {
-                    if start > 0.5 && start < app.duration - 0.5 {
-                        let x = ((k0 + kw * (start / app.duration) as f32) * ppp).round() / ppp;
-                        p.rect_filled(
-                            Rect::from_center_size(pos2(x, seek_y), vec2(2.0, track_h)),
-                            0.0, Color32::from_black_alpha((200.0 * t) as u8),
-                        );
-                    }
-                }
-            }
-            draw_knob(&p, ctx.pixels_per_point(), pos2(fill_x, seek_y), hot, accent, t);
-
-            // Hover / drag time preview
-            let preview = if dragging { app.drag_frac }
-                else if seek.hovered() { seek.hover_pos().map(|pp| frac_at(pp.x)) }
-                else { None };
-            if let (Some(f), true) = (preview, app.duration > 0.0) {
-                let secs = f as f64 * app.duration;
-                let txt = fmt_time(secs);
-                let font = FontId::proportional(13.0);
-                let w = p.layout_no_wrap(txt.clone(), font.clone(), Color32::WHITE).size().x + 16.0;
-                let cx = (k0 + kw * f).clamp(sr.left() + w / 2.0, sr.right() - w / 2.0);
-                let r = Rect::from_center_size(pos2(cx, seek_y - 28.0), vec2(w, 23.0));
-                p.rect_filled(r, 4.0, Color32::from_rgba_unmultiplied(32, 32, 32, (235.0 * t) as u8));
-                p.text(r.center(), Align2::CENTER_CENTER, txt, font, white);
-
-                // Thumbnail of that moment, above the time
-                app.thumbs.request(ctx, secs);
-                if let Some(aspect) = app.thumbs.aspect() {
-                    let tw = (thumbs::THUMB_H * aspect).clamp(64.0, 200.0);
-                    let th = (tw / aspect).clamp(40.0, 150.0);
-                    let ppp = ctx.pixels_per_point();
-                    let snap = |v: f32| (v * ppp).round() / ppp;
-                    let tx = (k0 + kw * f - tw / 2.0).clamp(screen.left() + 8.0, screen.right() - 8.0 - tw);
-                    let tr = Rect::from_min_size(pos2(snap(tx), snap(r.top() - 6.0 - th)), vec2(snap(tw), snap(th)));
-                    let tp = ctx.layer_painter(egui::LayerId::new(egui::Order::Tooltip, egui::Id::new("thumb")));
-                    for (e, a) in [(1.0, 60.0), (2.5, 30.0), (4.0, 14.0)] {
-                        tp.rect_filled(tr.expand(e), 4.0 + e, Color32::from_black_alpha((a * t) as u8));
-                    }
-                    app.thumbs.paint(&tp, tr, 2.0);
-                    tp.rect_stroke(tr.expand(0.5), 2.5, Stroke::new(1.0_f32, { let a = (70.0 * t) as u8; Color32::from_rgba_premultiplied(a, a, a, a) }));
-                }
-            }
-
-            // ── Button row ────────────────────────────────────────────────────
-            let row_y = screen.bottom() - ROW_FROM_BOTTOM;
-            let left = screen.left();
-            let right = screen.right();
-
-            let time_text = format!("{} / {}", fmt_time(app.time_pos), fmt_time(app.duration));
-            let time_font = FontId::new(14.5, FontFamily::Name("semibold".into()));
-            let time_w = p.layout_no_wrap(time_text.clone(), time_font.clone(), white).size().x;
-            let lay = row_layout(left, right, time_w);
-
-            // Play / pause
-            let c = pos2(lay.play, row_y);
-            if hit(ui, c, "play", if app.is_playing { "Pause (Space)" } else { "Play (Space)" }, t).activated() {
-                app.toggle_play_pause();
-            }
-            if app.is_playing { icon_pause(&p, c, white) } else { icon_play(&p, c, white) }
-
-            // Previous / next file in the same folder (dimmed when there isn't one)
-            let dim = white.gamma_multiply(0.4);
-            let c = pos2(lay.prev, row_y);
-            if app.has_prev() && hit(ui, c, "prev", "Previous file (P)", t).activated() { app.play_adjacent(-1); }
-            icon_prev(&p, c, if app.has_prev() { white } else { dim });
-
-            let c = pos2(lay.next, row_y);
-            if app.has_next() && hit(ui, c, "next", "Next file (N)", t).activated() { app.play_adjacent(1); }
-            icon_next(&p, c, if app.has_next() { white } else { dim });
-
-            // Time
-            p.text(pos2(lay.time_x, row_y - 1.0), Align2::LEFT_CENTER, time_text, time_font, white);
-
-            // Volume icon (click = mute) + slider (the slider is left out when the
-            // window is too narrow for it; the wheel and arrow keys still work)
-            let c = pos2(lay.mute, row_y);
-            if hit(ui, c, "mute", if app.muted { "Unmute (M)" } else { "Mute (M)" }, t).activated() {
-                let m = !app.muted;
-                app.set_mute(m);
-            }
-            icon_volume(&p, c, white, app.volume, app.muted);
-
-            if let Some(vl) = lay.vol_x {
-            let vw = VOL_W;
-            // (its grab area stops where the volume button's starts)
-            let vr = Rect::from_min_max(pos2(vl - VOL_GAP, row_y - 12.0), pos2(vl + vw + 8.0, row_y + 12.0));
-            let vresp = ui.interact(vr, ui.id().with("vol"), Sense::click_and_drag());
-            if vresp.is_pointer_button_down_on() || vresp.dragged() {
-                if let Some(pos) = vresp.interact_pointer_pos() {
-                    let mut v = ((pos.x - vl) / vw).clamp(0.0, 1.0) as f64 * VOL_MAX;
-                    // Gentle snap to 100 % so it's easy to land exactly on it
-                    if (v - 100.0).abs() < 2.5 { v = 100.0; }
-                    app.set_volume(v.round());
-                    if app.muted { app.set_mute(false); }
-                    app.volume_osd = Some(std::time::Instant::now());
-                }
-            }
-            let vf = (app.volume / VOL_MAX).clamp(0.0, 1.0) as f32;
-            let vhot = vresp.hovered() || vresp.dragged();
-            pill(&p, Rect::from_min_max(pos2(vl, row_y - 1.5), pos2(vl + vw, row_y + 1.5)), VOL_TRACK.gamma_multiply(t));
-            // Small tick marking 100 % (everything right of it is boost)
-            let x100 = vl + vw * (100.0 / VOL_MAX) as f32;
-            p.line_segment(
-                [pos2(x100, row_y - 4.0), pos2(x100, row_y + 4.0)],
-                Stroke::new(1.0_f32, VOL_TRACK.gamma_multiply(t * 0.8)),
-            );
-            pill(&p, Rect::from_min_max(pos2(vl, row_y - 1.5), pos2(vl + vw * vf, row_y + 1.5)), accent);
-            draw_knob(&p, ctx.pixels_per_point(), pos2(vl + vw * vf, row_y), vhot, accent, t);
-            }
-
-            // Right-hand buttons
-            let tint = |on: bool| if on { accent } else { white };
-
-            // Rotate / mirror (left out when the window is too narrow)
-            if let (Some(rx), Some(mx)) = (lay.rotate, lay.mirror) {
-                let c = pos2(rx, row_y);
-                if hit(ui, c, "rotate", "Rotate 90\u{b0} (R)", t).activated() { app.rotate_90(); }
-                icon_rotate(&p, c, tint(app.rotation != 0));
-
-                let c = pos2(mx, row_y);
-                if hit(ui, c, "mirror", "Mirror", t).activated() { app.toggle_mirror(); }
-                icon_mirror(&p, c, tint(app.mirror));
-            }
-
-            let c = pos2(lay.repeat, row_y);
-            if hit(ui, c, "repeat", "Repeat this video", t).activated() { app.toggle_repeat(); }
-            icon_repeat(&p, c, tint(app.repeat));
-
-            let c = pos2(lay.captions, row_y);
-            if hit(ui, c, "captions", "Cycle subtitles", t).activated() { app.cycle_captions(); }
-            icon_captions(&p, c, white);
-
-            let c = pos2(lay.ontop, row_y);
-            if hit(ui, c, "ontop", "Always on top", t).activated() { app.toggle_on_top(ctx); }
-            icon_compact(&p, c, tint(app.on_top));
-
-            let c = pos2(lay.fullscreen, row_y);
-            if hit(ui, c, "fs", "Full screen (Enter)", t).activated() { app.toggle_fullscreen(ctx); }
-            icon_fullscreen(&p, c, white);
-
-            // "More" → playback speed menu
-            let c = pos2(lay.speed, row_y);
-            let more = hit(ui, c, "more", "Playback speed", t);
-            icon_speed(&p, c, white);
-            app.speed_anchor = more.rect;
-            if more.activated() {
-                app.speed_menu = !app.speed_menu;
-            }
-        });
-}
-
-// ── Control-row layout ────────────────────────────────────────────────────────
-/// Horizontal centres of the control-row items for a window spanning left..right.
-/// The first button's highlight starts exactly where the seek bar starts and the last
-/// one ends where the seek bar ends.
-#[derive(Debug, Clone, Copy, PartialEq)]
-struct RowLayout {
-    play: f32,
-    prev: f32,
-    next: f32,
-    time_x: f32,
-    mute: f32,
-    /// Left end of the volume slider track, or None when there's no room for it
-    vol_x: Option<f32>,
-    /// Rotate / mirror buttons, None when there's no room for them
-    rotate: Option<f32>,
-    mirror: Option<f32>,
-    repeat: f32,
-    captions: f32,
-    ontop: f32,
-    speed: f32,
-    /// The last button, flush with the seek bar's right end
-    fullscreen: f32,
-}
-
-fn row_layout(left: f32, right: f32, time_w: f32) -> RowLayout {
-    let half = BTN_BOX / 2.0;
-    let play = left + SIDE + half;
-    let prev = play + BTN_STEP;
-    let next = prev + BTN_STEP;
-    let time_x = next + half + 10.0;
-    let time_end = time_x + time_w;
-
-    let fullscreen = right - SIDE - half;
-    let speed = fullscreen - BTN_STEP;
-    let ontop = speed - BTN_STEP;
-    let captions = ontop - BTN_STEP;
-    let repeat = captions - BTN_STEP;
-
-    // Then, right to left: mirror, rotate, the volume slider, the volume icon.
-    // When the window is too narrow the slider goes first (the wheel and arrow
-    // keys still set the volume), then rotate / mirror.
-    let mirror = repeat - BTN_STEP;
-    let rotate = mirror - BTN_STEP;
-    let fits = |mute: f32| mute - half >= time_end + 14.0;
-    let with_slider = |first: f32| {
-        let vol_x = first - half - 12.0 - VOL_W;
-        (vol_x - VOL_GAP - half, vol_x) // just room for the knob at 0 %
-    };
-    let (mute, vol_x, rotate, mirror) = {
-        let (m, v) = with_slider(rotate);
-        if fits(m) {
-            (m, Some(v), Some(rotate), Some(mirror))
-        } else if fits(rotate - BTN_STEP) {
-            (rotate - BTN_STEP, None, Some(rotate), Some(mirror))
-        } else {
-            (repeat - BTN_STEP, None, None, None)
-        }
-    };
-    RowLayout { play, prev, next, time_x, mute, vol_x, rotate, mirror, repeat, captions, ontop, speed, fullscreen }
-}
-
-// ── Folder navigation ─────────────────────────────────────────────────────────
-/// Video files in the same folder as `path`, in Explorer-like (natural) order
-/// (only files of the same kind: a video steps through videos, a picture through
-/// pictures, a song through music)
-fn scan_folder(path: &Path, by: SortBy, desc: bool) -> Vec<PathBuf> {
-    let Some(dir) = path.parent() else { return vec![path.to_owned()] };
-    let kind = media_kind(&path.to_string_lossy());
-    let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
-        .map(|rd| {
-            rd.filter_map(|e| e.ok())
-                .map(|e| e.path())
-                .filter(|p| {
-                    let k = media_kind(&p.to_string_lossy());
-                    p.is_file() && k.is_some() && (kind.is_none() || k == kind)
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-    sort_files(&mut files, by, desc);
-    files
-}
-
-/// Sort like Explorer: by name (natural order), date or size; ties go by name
-fn sort_files(files: &mut Vec<PathBuf>, by: SortBy, desc: bool) {
-    let name = |p: &PathBuf| p.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-    if by == SortBy::Name {
-        files.sort_by(|a, b| natural_cmp(&name(a), &name(b)));
-    } else {
-        // Read each file's date / size once
-        let key = |p: &PathBuf| -> u128 {
-            let Ok(md) = std::fs::metadata(p) else { return 0 };
-            let since = |t: std::io::Result<std::time::SystemTime>| {
-                t.ok()
-                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                    .map_or(0, |d| d.as_nanos())
-            };
-            match by {
-                SortBy::Modified => since(md.modified()),
-                SortBy::Created => since(md.created()),
-                _ => md.len() as u128,
-            }
-        };
-        let mut keyed: Vec<(u128, String, PathBuf)> = files.drain(..).map(|p| (key(&p), name(&p), p)).collect();
-        keyed.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| natural_cmp(&a.1, &b.1)));
-        files.extend(keyed.into_iter().map(|(_, _, p)| p));
-    }
-    if desc {
-        files.reverse();
-    }
-}
-
-/// Case-insensitive compare where digit runs compare by value ("2" < "10"),
-/// like Windows Explorer
-fn natural_cmp(a: &str, b: &str) -> Ordering {
-    let mut ai = a.chars().peekable();
-    let mut bi = b.chars().peekable();
-    loop {
-        match (ai.peek().copied(), bi.peek().copied()) {
-            (None, None) => return Ordering::Equal,
-            (None, Some(_)) => return Ordering::Less,
-            (Some(_), None) => return Ordering::Greater,
-            (Some(x), Some(y)) => {
-                if x.is_ascii_digit() && y.is_ascii_digit() {
-                    let mut na = String::new();
-                    while let Some(&c) = ai.peek() {
-                        if c.is_ascii_digit() { na.push(c); ai.next(); } else { break; }
-                    }
-                    let mut nb = String::new();
-                    while let Some(&c) = bi.peek() {
-                        if c.is_ascii_digit() { nb.push(c); bi.next(); } else { break; }
-                    }
-                    let (ta, tb) = (na.trim_start_matches('0'), nb.trim_start_matches('0'));
-                    let o = ta.len().cmp(&tb.len()).then_with(|| ta.cmp(tb));
-                    if o != Ordering::Equal { return o; }
-                } else {
-                    let o = x.to_lowercase().collect::<String>()
-                        .cmp(&y.to_lowercase().collect::<String>());
-                    if o != Ordering::Equal { return o; }
-                    ai.next();
-                    bi.next();
-                }
-            }
-        }
-    }
-}
-
 // ── Window edge resizing ──────────────────────────────────────────────────────
 /// Which resize edge/corner (if any) the pointer is on, with its cursor icon
 fn hit_edge(p: Pos2, screen: Rect) -> Option<(egui::viewport::ResizeDirection, egui::CursorIcon)> {
@@ -3001,779 +2016,10 @@ fn hsv_to_rgb(h: f32, s: f32, v: f32) -> (f32, f32, f32) {
     (r + m, g + m, b + m)
 }
 
-// ── Pop-ups ───────────────────────────────────────────────────────────────────
-/// Pill in the top left: icon, value, and a slim bar showing `frac`
-fn draw_osd(
-    ctx: &egui::Context,
-    icon: &dyn Fn(&egui::Painter, Pos2, Color32),
-    label: &str,
-    frac: f32,
-    accent: Color32,
-    alpha: f32,
-) {
-    let screen = ctx.screen_rect();
-    let p = ctx.layer_painter(egui::LayerId::new(egui::Order::Tooltip, egui::Id::new("osd")));
-    let font = FontId::new(17.0, FontFamily::Name("semibold".into()));
-    let label_w = p.layout_no_wrap(label.to_owned(), font.clone(), Color32::WHITE).size().x;
-    // Top left, just below the menu button and lined up with it
-    let size = vec2((label_w + 66.0).max(116.0).round(), 42.0);
-    let rect = Rect::from_min_size(pos2(screen.left() + OSD_LEFT, screen.top() + OSD_TOP), size);
-    p.rect_filled(rect, 8.0, Color32::from_rgba_unmultiplied(24, 24, 24, (225.0 * alpha) as u8));
-
-    let white = Color32::WHITE.gamma_multiply(alpha);
-    icon(&p, pos2(rect.left() + 26.0, rect.center().y - 3.0), white);
-    p.text(pos2(rect.right() - 16.0, rect.center().y - 3.0), Align2::RIGHT_CENTER, label, font, white);
-
-    // 4 px tall and lined up with whole screen pixels, so its round ends show
-    let ppp = ctx.pixels_per_point();
-    let snap = |v: f32| (v * ppp).round() / ppp;
-    let bar = Rect::from_min_max(
-        pos2(snap(rect.left() + 14.0), snap(rect.bottom() - 10.0)),
-        pos2(snap(rect.right() - 14.0), snap(rect.bottom() - 6.0)),
-    );
-    pill(&p, bar, VOL_TRACK.gamma_multiply(alpha * 0.6));
-    pill(
-        &p,
-        Rect::from_min_max(bar.min, pos2(bar.left() + bar.width() * frac.clamp(0.0, 1.0), bar.max.y)),
-        accent.gamma_multiply(alpha),
-    );
-}
-
-/// "🔊 55 %" with the volume level
-fn draw_volume_osd(ctx: &egui::Context, volume: f64, muted: bool, accent: Color32, alpha: f32) {
-    let label = if muted { "Muted".to_owned() } else { format!("{}%", volume.round() as i32) };
-    let frac = if muted { 0.0 } else { (volume / VOL_MAX) as f32 };
-    draw_osd(ctx, &|p, c, col| icon_volume(p, c, col, volume, muted), &label, frac, accent, alpha);
-}
-
-/// "⏩ +5 sec" after the arrow keys; the bar shows the position in the video
-fn draw_seek_osd(ctx: &egui::Context, kind: SeekOsd, target: f64, duration: f64, accent: Color32, alpha: f32) {
-    let (forward, label) = match kind {
-        SeekOsd::Step(secs) => {
-            let sign = if secs < 0.0 { "\u{2212}" } else { "+" };
-            let a = secs.abs();
-            (secs >= 0.0, if a < 60.0 { format!("{sign}{} sec", a.round()) } else { format!("{sign}{}", fmt_time(a)) })
-        }
-    };
-    let frac = if duration > 0.0 { (target / duration) as f32 } else { 0.0 };
-    draw_osd(ctx, &|p, c, col| icon_seek(p, c, col, forward), &label, frac, accent, alpha);
-}
-
-/// Fast-forward (two triangles), mirrored for rewind
-fn icon_seek(p: &egui::Painter, c: Pos2, col: Color32, forward: bool) {
-    let d = if forward { 1.0 } else { -1.0 };
-    for x0 in [-7.5_f32, 0.0] {
-        p.add(egui::Shape::convex_polygon(
-            vec![
-                pos2(c.x + d * x0 * K, c.y - 6.0 * K),
-                pos2(c.x + d * (x0 + 7.5) * K, c.y),
-                pos2(c.x + d * x0 * K, c.y + 6.0 * K),
-            ],
-            col,
-            Stroke::NONE,
-        ));
-    }
-}
-
-// ── Keyboard shortcuts panel (menu) ───────────────────────────────────────────
-/// Keys (each drawn as a key cap) and what they do
-const SHORTCUTS: &[(&[&str], &str)] = &[
-    (&["Space"], "Play / pause"),
-    (&["\u{2190}", "\u{2192}"], "Back / forward 5 seconds"),
-    (&["D"], "Previous frame"),
-    (&["F"], "Next frame"),
-    (&["\u{2191}", "\u{2193}"], "Volume up / down"),
-    (&["Mouse wheel"], "Volume up / down"),
-    (&["M"], "Mute"),
-    (&["P"], "Previous file"),
-    (&["N"], "Next file"),
-    (&["Enter"], "Full screen"),
-    (&["Double-click"], "Full screen"),
-    (&["Esc"], "Leave full screen / close menu"),
-    (&["R"], "Rotate 90\u{b0}"),
-    (&["Ctrl+O"], "Open file"),
-    (&["E"], "Picture & Sound"),
-    (&["Tab"], "Video info"),
-    (&["H"], "Next decoding method"),
-    (&["Media keys"], "Play / pause, next, previous"),
-];
-
-fn draw_shortcuts(app: &mut FluentMediaPlayer, ctx: &egui::Context) {
-    if !app.show_keys {
-        return;
-    }
-    const W: f32 = 380.0;
-    const HEAD_H: f32 = 48.0;
-    const ROW_H: f32 = 28.0;
-    const PAD: f32 = 10.0;
-    let screen = ctx.screen_rect();
-    let full_h = HEAD_H + SHORTCUTS.len() as f32 * ROW_H + PAD;
-    let size = vec2(W.min(screen.width() - 24.0), full_h.min(screen.height() - 40.0));
-    let ppp = ctx.pixels_per_point();
-    let r0 = Rect::from_center_size(screen.center(), size);
-    let rect = Rect::from_min_size(pos2((r0.left() * ppp).round() / ppp, (r0.top() * ppp).round() / ppp), size);
-
-    // A click anywhere outside the panel closes it
-    let pressed_outside = ctx.input(|i| {
-        i.pointer.any_pressed() && i.pointer.press_origin().map_or(false, |o| !rect.contains(o))
-    });
-    if pressed_outside {
-        app.show_keys = false;
-        return;
-    }
-
-    let id = egui::Id::new("shortcuts");
-    let mut close = false;
-    egui::Area::new(id)
-        .order(egui::Order::Foreground)
-        .fixed_pos(screen.min)
-        .show(ctx, |ui| {
-            // Dim the player behind, and keep its clicks / drags away from the video
-            ui.allocate_rect(screen, Sense::click_and_drag());
-            let p = ui.painter().clone();
-            p.rect_filled(screen, 0.0, Color32::from_black_alpha(110));
-            let r = 8.0;
-            glass::shadow(&p, rect, r, 1.0);
-            glass::fill(&p, rect, r, Color32::from_rgb(44, 44, 44), 1.0);
-            p.rect_stroke(rect.shrink(0.5), r, Stroke::new(1.0_f32, glass::edge(Color32::from_rgba_premultiplied(30, 30, 30, 30))));
-            ui.interact(rect, ui.id().with("panel"), Sense::click_and_drag());
-
-            let text = Color32::from_rgb(240, 240, 240);
-            p.text(
-                pos2(rect.left() + 18.0, rect.top() + HEAD_H / 2.0),
-                Align2::LEFT_CENTER,
-                "Keyboard shortcuts",
-                FontId::new(15.0, FontFamily::Name("semibold".into())),
-                text,
-            );
-
-            // Close button (top right)
-            let xr = Rect::from_center_size(pos2(rect.right() - 24.0, rect.top() + HEAD_H / 2.0), vec2(30.0, 30.0));
-            let xb = ui.interact(xr, ui.id().with("close"), Sense::click_and_drag());
-            if let Some(c) = adjust::state_fill(&xb) {
-                p.rect_filled(xr, 4.0, c);
-            }
-            let c = xr.center();
-            for (a, b) in [((-5.0, -5.0), (5.0, 5.0)), ((-5.0, 5.0), (5.0, -5.0))] {
-                p.line_segment([c + vec2(a.0, a.1), c + vec2(b.0, b.1)], Stroke::new(1.2_f32, text));
-            }
-            if xb.activated() {
-                close = true;
-            }
-            p.line_segment(
-                [pos2(rect.left() + 1.0, rect.top() + HEAD_H - 0.5), pos2(rect.right() - 1.0, rect.top() + HEAD_H - 0.5)],
-                Stroke::new(1.0_f32, Color32::from_rgba_premultiplied(26, 26, 26, 26)),
-            );
-
-            // The list (scrolls if the window is too short for all of it)
-            let list = Rect::from_min_max(pos2(rect.left(), rect.top() + HEAD_H + 4.0), pos2(rect.right(), rect.bottom() - 6.0));
-            let mut child = ui.child_ui(list, egui::Layout::top_down(egui::Align::Min));
-            egui::ScrollArea::vertical().max_height(list.height()).show(&mut child, |ui| {
-                ui.spacing_mut().item_spacing = vec2(0.0, 0.0);
-                for (keys, what) in SHORTCUTS {
-                    let (row, _) = ui.allocate_exact_size(vec2(list.width() - 8.0, ROW_H), Sense::hover());
-                    let p = ui.painter();
-                    let mut x = row.left() + 18.0;
-                    for key in keys.iter() {
-                        let g = p.layout_no_wrap(
-                            key.to_string(),
-                            FontId::new(12.5, FontFamily::Name("semibold".into())),
-                            text,
-                        );
-                        let cap = Rect::from_min_size(pos2(x, row.center().y - 10.5), vec2((g.size().x + 14.0).max(24.0), 21.0));
-                        p.rect_filled(cap, 4.0, Color32::from_rgb(64, 64, 66));
-                        p.rect_filled(
-                            Rect::from_min_max(pos2(cap.left() + 1.0, cap.bottom() - 2.0), pos2(cap.right() - 1.0, cap.bottom())),
-                            2.0,
-                            Color32::from_rgb(52, 52, 54),
-                        );
-                        p.galley(cap.center() - g.size() / 2.0 - vec2(0.0, 0.5), g, text);
-                        x = cap.right() + 6.0;
-                    }
-                    p.text(pos2(row.left() + 150.0, row.center().y), Align2::LEFT_CENTER, *what, FontId::proportional(13.5), text);
-                }
-            });
-        });
-    ctx.move_to_top(egui::LayerId::new(egui::Order::Foreground, id));
-    if close {
-        app.show_keys = false;
-    }
-}
-
-// ── Main menu (top left) ──────────────────────────────────────────────────────
-enum MenuRow {
-    Item { key: &'static str, label: &'static str, hint: Option<&'static str>, mark: Mark },
-    /// Opens a submenu to the right; `hint` is the current choice, shown at the right
-    Sub { key: &'static str, label: &'static str, hint: &'static str },
-    /// Centred heading
-    Title(&'static str),
-    Sep,
-}
-
-/// What's drawn in front of a menu item: nothing, a check mark (on/off setting) or a
-/// dot (one choice out of several, like Explorer's "Sort by")
-enum Mark {
-    None,
-    Check(bool),
-    Dot(bool),
-}
-
-const SORT_CHOICES: [(SortBy, &str); 4] = [
-    (SortBy::Name, "Name"),
-    (SortBy::Modified, "Date modified"),
-    (SortBy::Created, "Date created"),
-    (SortBy::Size, "Size"),
-];
-
-/// "Ascending" / "Descending" in words that fit the sort
-fn order_labels(by: SortBy) -> (&'static str, &'static str) {
-    match by {
-        SortBy::Name => ("A to Z", "Z to A"),
-        SortBy::Size => ("Smallest first", "Largest first"),
-        SortBy::Modified | SortBy::Created => ("Oldest first", "Newest first"),
-    }
-}
-
-const MENU_ITEM_H: f32 = 28.0;
-const MENU_PAD: f32 = 3.0;
-const MENU_SEP_H: f32 = 7.0;
-/// Hovering a row this long opens its submenu (or closes another one)
-const SUBMENU_DELAY: f32 = 0.3;
-
-fn menu_row_h(r: &MenuRow) -> f32 {
-    MenuSize::NORMAL.row_h(r)
-}
-
-/// Row sizes and fonts of a menu: the main menu, or the smaller speed menu
-#[derive(Clone, Copy)]
-struct MenuSize {
-    item_h: f32,
-    sep_h: f32,
-    font: f32,
-    small_font: f32,
-    /// Distance of the text / the mark from the row's left edge
-    text_x: f32,
-    mark_x: f32,
-}
-
-impl MenuSize {
-    const NORMAL: Self = Self { item_h: MENU_ITEM_H, sep_h: MENU_SEP_H, font: 14.5, small_font: 13.5, text_x: 28.0, mark_x: 14.0 };
-    const COMPACT: Self = Self { item_h: 22.0, sep_h: 5.0, font: 13.0, small_font: 12.5, text_x: 22.0, mark_x: 11.0 };
-
-    fn row_h(&self, r: &MenuRow) -> f32 {
-        match r {
-            MenuRow::Sep => self.sep_h,
-            _ => self.item_h,
-        }
-    }
-}
-
-/// Glass panel with rows; returns (row picked, hovered row key, rect of each Sub row)
-fn draw_menu_rows(
-    ui: &mut egui::Ui,
-    rect: Rect,
-    rows: &[MenuRow],
-    sub_open: Option<&'static str>,
-    selected: Option<Color32>,
-    size: MenuSize,
-) -> (Option<&'static str>, Option<&'static str>, Vec<(&'static str, Rect)>) {
-    // The menu's own background swallows clicks (so they don't reach the video)
-    ui.allocate_rect(rect, Sense::click_and_drag());
-    let p = ui.painter().clone();
-    let r = 8.0;
-    glass::shadow(&p, rect, r, 1.0);
-    glass::fill(&p, rect, r, Color32::from_rgb(44, 44, 44), 1.0);
-    p.rect_stroke(rect.shrink(0.5), r, Stroke::new(1.0_f32, glass::edge(Color32::from_rgba_premultiplied(30, 30, 30, 30))));
-
-    let text = Color32::from_rgb(240, 240, 240);
-    let dim = Color32::from_rgb(160, 160, 160);
-    let font = FontId::proportional(size.font);
-    let small = FontId::proportional(size.small_font);
-    let text_x = rect.left() + MENU_PAD + size.text_x;
-    let mark_x = rect.left() + MENU_PAD + size.mark_x;
-    let (mut picked, mut hovered, mut subs) = (None, None, Vec::new());
-
-    let mut top = rect.top() + MENU_PAD;
-    for row in rows {
-        let h = size.row_h(row);
-        let cy = top + h / 2.0;
-        let ir = Rect::from_min_size(pos2(rect.left() + MENU_PAD, top), vec2(rect.width() - 2.0 * MENU_PAD, h));
-        match row {
-            MenuRow::Sep => {
-                p.line_segment(
-                    [pos2(rect.left() + 1.0, cy), pos2(rect.right() - 1.0, cy)],
-                    Stroke::new(1.0_f32, Color32::from_rgba_premultiplied(26, 26, 26, 26)),
-                );
-            }
-            MenuRow::Title(label) => {
-                p.text(pos2(rect.center().x, cy), Align2::CENTER_CENTER, *label, small.clone(), dim);
-            }
-            MenuRow::Item { key, label, hint, mark } => {
-                let resp = ui.interact(ir, ui.id().with(*key), Sense::click_and_drag());
-                // The current choice (speed menu): tinted with the accent colour
-                if let (Some(sel), Mark::Dot(true)) = (selected, mark) {
-                    p.rect_filled(ir, 4.0, sel);
-                }
-                if let Some(c) = adjust::state_fill(&resp) {
-                    p.rect_filled(ir, 4.0, c);
-                }
-                match mark {
-                    Mark::Check(true) => {
-                        poly(&p, pos2(mark_x, cy), &[(-4.5, 0.0), (-1.5, 3.2), (4.5, -3.5)], text, 1.5);
-                    }
-                    Mark::Dot(true) => {
-                        adjust::disc(&p, pos2(mark_x, cy), if size.item_h < MENU_ITEM_H { 2.5 } else { 3.0 }, text);
-                    }
-                    _ => {}
-                }
-                p.text(pos2(text_x, cy), Align2::LEFT_CENTER, *label, font.clone(), text);
-                if let Some(hint) = hint {
-                    p.text(pos2(rect.right() - MENU_PAD - 10.0, cy), Align2::RIGHT_CENTER, *hint, small.clone(), dim);
-                }
-                if resp.hovered() {
-                    hovered = Some(*key);
-                }
-                if resp.activated() {
-                    picked = Some(*key);
-                }
-            }
-            MenuRow::Sub { key, label, hint } => {
-                let resp = ui.interact(ir, ui.id().with(*key), Sense::click_and_drag());
-                // Highlighted while hovered, or while its submenu is open
-                let fill = adjust::state_fill(&resp).or((sub_open == Some(*key)).then_some(adjust::HOVER));
-                if let Some(c) = fill {
-                    p.rect_filled(ir, 4.0, c);
-                }
-                p.text(pos2(text_x, cy), Align2::LEFT_CENTER, *label, font.clone(), text);
-                let c = pos2(rect.right() - MENU_PAD - 13.0, cy);
-                p.line_segment([c + vec2(-2.5, -4.5), c + vec2(2.0, 0.0)], Stroke::new(1.3_f32, text));
-                p.line_segment([c + vec2(2.0, 0.0), c + vec2(-2.5, 4.5)], Stroke::new(1.3_f32, text));
-                p.text(pos2(c.x - 14.0, cy), Align2::RIGHT_CENTER, *hint, small.clone(), dim);
-                if resp.hovered() {
-                    hovered = Some(*key);
-                }
-                if resp.activated() {
-                    picked = Some(*key);
-                }
-                subs.push((*key, ir));
-            }
-        }
-        top += h;
-    }
-    (picked, hovered, subs)
-}
-
-/// Is `p` inside the triangle a, b, c (either winding)?
-fn in_triangle(p: Pos2, a: Pos2, b: Pos2, c: Pos2) -> bool {
-    let side = |u: Pos2, v: Pos2| (v.x - u.x) * (p.y - u.y) - (v.y - u.y) * (p.x - u.x);
-    let (d1, d2, d3) = (side(a, b), side(b, c), side(c, a));
-    !((d1 < 0.0 || d2 < 0.0 || d3 < 0.0) && (d1 > 0.0 || d2 > 0.0 || d3 > 0.0))
-}
-
-fn draw_main_menu(app: &mut FluentMediaPlayer, ctx: &egui::Context) {
-    if !app.main_menu {
-        app.menu_sub = None;
-        app.menu_hover = None;
-        app.menu_aim = None;
-        return;
-    }
-    const W: f32 = 272.0;
-    const SUB_W: f32 = 190.0;
-
-    let sort_label = SORT_CHOICES.iter().find(|(by, _)| *by == app.sort_by).map_or("Name", |(_, l)| *l);
-    let rows = vec![
-        MenuRow::Item { key: "open", label: "Open file\u{2026}", hint: Some("Ctrl+O"), mark: Mark::None },
-        MenuRow::Sep,
-        MenuRow::Item { key: "adjust", label: "Picture & Sound", hint: Some("E"), mark: Mark::None },
-        MenuRow::Item { key: "snap", label: "Snap to screen edges", hint: None, mark: Mark::Check(app.snap) },
-        MenuRow::Item { key: "multi", label: "Allow multiple windows", hint: None, mark: Mark::Check(app.multi) },
-        MenuRow::Item { key: "border", label: "Accent color border", hint: None, mark: Mark::Check(app.border) },
-        MenuRow::Item { key: "glass", label: "Frosted glass menus", hint: None, mark: Mark::Check(app.glass) },
-        MenuRow::Sep,
-        MenuRow::Item { key: "autoplay", label: "Auto-play next file in folder", hint: None, mark: Mark::Check(app.autoplay) },
-        MenuRow::Sub { key: "sort", label: "Sort folder by", hint: sort_label },
-        MenuRow::Sep,
-        MenuRow::Item { key: "keys", label: "Keyboard shortcuts", hint: None, mark: Mark::None },
-        MenuRow::Item { key: "quit", label: "Quit", hint: Some("Alt+F4"), mark: Mark::None },
-    ];
-    let (asc, desc) = order_labels(app.sort_by);
-    let mut sub_rows: Vec<MenuRow> = SORT_CHOICES
-        .iter()
-        .map(|(by, label)| MenuRow::Item { key: label, label, hint: None, mark: Mark::Dot(app.sort_by == *by) })
-        .collect();
-    sub_rows.push(MenuRow::Sep);
-    sub_rows.push(MenuRow::Item { key: "asc", label: asc, hint: None, mark: Mark::Dot(!app.sort_desc) });
-    sub_rows.push(MenuRow::Item { key: "desc", label: desc, hint: None, mark: Mark::Dot(app.sort_desc) });
-
-    let screen = ctx.screen_rect();
-    let box_left = MENU_X - BTN_BOX / 2.0;
-    let rect = Rect::from_min_size(
-        pos2(box_left, MENU_Y + BTN_BOX / 2.0 + 4.0),
-        vec2(W, MENU_PAD * 2.0 + rows.iter().map(menu_row_h).sum::<f32>()),
-    );
-    // The submenu sits beside its row (last frame's position of the row), or over
-    // the menu's right side when the window is too narrow
-    let sub_h = MENU_PAD * 2.0 + sub_rows.iter().map(menu_row_h).sum::<f32>();
-    let sub_rect = app.menu_sub.map(|(_, row)| {
-        let x = if rect.right() - 2.0 + SUB_W <= screen.right() - 4.0 {
-            rect.right() - 2.0
-        } else {
-            (screen.right() - 4.0 - SUB_W).max(screen.left() + 4.0)
-        };
-        let y = (row.top() - MENU_PAD).min(screen.bottom() - 4.0 - sub_h).max(screen.top() + 4.0);
-        Rect::from_min_size(pos2(x, y), vec2(SUB_W, sub_h))
-    });
-
-    // Any press outside the menus (and the menu button, which toggles it) closes it
-    let anchor = app.menu_anchor;
-    let pressed_outside = ctx.input(|i| {
-        i.pointer.any_pressed()
-            && i.pointer.press_origin().map_or(false, |o| {
-                !rect.contains(o) && !anchor.contains(o) && !sub_rect.map_or(false, |s| s.contains(o))
-            })
-    });
-    if pressed_outside {
-        app.main_menu = false;
-        app.menu_sub = None;
-        return;
-    }
-
-    let id = egui::Id::new("main_menu");
-    let sub_open = app.menu_sub.map(|(k, _)| k);
-    let mut out = (None, None, Vec::new());
-    egui::Area::new(id).order(egui::Order::Foreground).fixed_pos(rect.min).show(ctx, |ui| {
-        out = draw_menu_rows(ui, rect, &rows, sub_open, None, MenuSize::NORMAL);
-    });
-    ctx.move_to_top(egui::LayerId::new(egui::Order::Foreground, id));
-    let (mut picked, hovered, subs) = out;
-
-    let mut sub_picked = None;
-    if let Some(sr) = sub_rect {
-        let sid = egui::Id::new("main_menu_sub");
-        egui::Area::new(sid).order(egui::Order::Foreground).fixed_pos(sr.min).show(ctx, |ui| {
-            sub_picked = draw_menu_rows(ui, sr, &sub_rows, None, None, MenuSize::NORMAL).0;
-        });
-        ctx.move_to_top(egui::LayerId::new(egui::Order::Foreground, sid));
-    }
-
-    // Submenu opening / closing, with a short delay like Windows' menus (so the
-    // pointer can cross other rows on its way into the submenu)
-    let now = std::time::Instant::now();
-    if hovered != app.menu_hover.map(|(k, _)| k) {
-        app.menu_hover = hovered.map(|k| (k, now));
-    }
-    let rested = app.menu_hover.map_or(false, |(_, t0)| t0.elapsed().as_secs_f32() >= SUBMENU_DELAY);
-    if app.menu_hover.is_some() && !rested {
-        ctx.request_repaint_after(std::time::Duration::from_millis(60));
-    }
-    let row_of = |key: &str| subs.iter().find(|(k, _)| *k == key).map(|(_, r)| *r);
-    let was_open = app.menu_sub.is_some();
-    let pointer = ctx.input(|i| i.pointer.hover_pos());
-    if hovered == Some("sort") {
-        app.menu_aim = pointer;
-    }
-    if picked == Some("sort") {
-        // Clicking the row opens / closes it straight away
-        app.menu_sub = if app.menu_sub.is_some() { None } else { row_of("sort").map(|r| ("sort", r)) };
-        picked = None;
-    } else if hovered.map_or(false, |k| k != "sort") {
-        // On another row the submenu closes straight away, unless the pointer is
-        // still moving across towards it (through the triangle between where it
-        // left the row and the submenu's near edge, like Windows' menus)
-        let heading_in = match (sub_rect, app.menu_aim, pointer) {
-            (Some(s), Some(from), Some(p)) => {
-                ctx.input(|i| i.pointer.time_since_last_movement()) < 0.12
-                    && in_triangle(p, from - vec2(2.0, 0.0), s.left_top() - vec2(0.0, 4.0), s.left_bottom() + vec2(0.0, 4.0))
-            }
-            _ => false,
-        };
-        if heading_in {
-            ctx.request_repaint_after(std::time::Duration::from_millis(40));
-        } else {
-            app.menu_sub = None;
-        }
-    } else if rested && hovered == Some("sort") && app.menu_sub.is_none() {
-        app.menu_sub = row_of("sort").map(|r| ("sort", r));
-    }
-    // Opened or closed after this frame was laid out: draw again right away
-    if app.menu_sub.is_some() != was_open {
-        ctx.request_repaint();
-    }
-    if sub_picked.is_some() {
-        picked = sub_picked;
-    }
-
-    // Any choice closes the menu
-    if picked.is_some() {
-        app.main_menu = false;
-        app.menu_sub = None;
-    }
-    match picked {
-        Some("open") => app.show_open_dialog(),
-        Some("keys") => app.show_keys = true,
-        Some("quit") => app.quit(),
-        Some("autoplay") => app.autoplay = !app.autoplay,
-        Some("adjust") => app.adjust_ui.open = true,
-        Some("multi") => app.multi = !app.multi,
-        Some("border") => app.border = !app.border,
-        Some("glass") => app.glass = !app.glass,
-        Some("snap") => {
-            app.snap = !app.snap;
-            taskbar::set_snap(app.snap);
-        }
-        Some("asc") => app.set_sort(app.sort_by, false),
-        Some("desc") => app.set_sort(app.sort_by, true),
-        Some(key) => {
-            if let Some((by, _)) = SORT_CHOICES.iter().find(|(_, label)| *label == key) {
-                app.set_sort(*by, app.sort_desc);
-            }
-        }
-        None => {}
-    }
-}
-
-/// Playback speed menu, above its button in the control bar
-fn draw_speed_menu(app: &mut FluentMediaPlayer, ctx: &egui::Context) {
-    if !app.speed_menu {
-        return;
-    }
-    const W: f32 = 124.0;
-    let mut rows = vec![MenuRow::Title("Playback speed"), MenuRow::Sep];
-    for (s, label) in SPEEDS {
-        rows.push(MenuRow::Item { key: label, label, hint: None, mark: Mark::Dot((app.speed - s).abs() < 1e-6) });
-    }
-    let h = MENU_PAD * 2.0 + rows.iter().map(|r| MenuSize::COMPACT.row_h(r)).sum::<f32>();
-    let screen = ctx.screen_rect();
-    let anchor = app.speed_anchor;
-    let x = (anchor.center().x + BTN_BOX / 2.0 - W).clamp(screen.left() + 4.0, screen.right() - 4.0 - W);
-    let y = (anchor.top() - 4.0 - h).max(screen.top() + 4.0);
-    let rect = Rect::from_min_size(pos2(x, y), vec2(W, h));
-
-    // A press outside (other than on its button, which toggles it) closes it
-    let pressed_outside = ctx.input(|i| {
-        i.pointer.any_pressed()
-            && i.pointer.press_origin().map_or(false, |o| !rect.contains(o) && !anchor.contains(o))
-    });
-    if pressed_outside {
-        app.speed_menu = false;
-        return;
-    }
-    let id = egui::Id::new("speed_menu");
-    let mut picked = None;
-    let selected = app.accent.gamma_multiply(0.42);
-    egui::Area::new(id).order(egui::Order::Foreground).fixed_pos(rect.min).show(ctx, |ui| {
-        picked = draw_menu_rows(ui, rect, &rows, None, Some(selected), MenuSize::COMPACT).0;
-    });
-    ctx.move_to_top(egui::LayerId::new(egui::Order::Foreground, id));
-    if let Some(key) = picked {
-        if let Some((s, _)) = SPEEDS.iter().find(|(_, l)| *l == key) {
-            app.set_speed(*s);
-        }
-        app.speed_menu = false;
-    }
-}
-
-/// Decoder / video details (toggle with I) — shows whether hardware decoding is active
-/// The info overlay (Tab): a frosted panel like the menus, with sections, bold
-/// labels and a value column
-fn draw_info_overlay(ctx: &egui::Context, rows: &[InfoRow], alpha: f32) {
-    if rows.is_empty() {
-        return;
-    }
-    const PAD_X: f32 = 16.0;
-    const PAD_Y: f32 = 10.0;
-    const ROW_H: f32 = 20.0;
-    const HEAD_H: f32 = 26.0;
-    const COL_GAP: f32 = 18.0;
-    const FOOT_H: f32 = 30.0;
-    let p = ctx.layer_painter(egui::LayerId::new(egui::Order::Tooltip, egui::Id::new("info_osd")));
-    let label_font = FontId::new(13.0, FontFamily::Name("semibold".into()));
-    let value_font = FontId::proportional(13.0);
-    let head_font = FontId::new(11.5, FontFamily::Name("semibold".into()));
-    let foot_font = FontId::proportional(12.0);
-    let (label_col, value_col) = (Color32::from_rgb(236, 236, 236).gamma_multiply(alpha), Color32::from_rgb(208, 208, 208).gamma_multiply(alpha));
-    let dim = Color32::from_rgb(150, 150, 150).gamma_multiply(alpha);
-    let width_of = |t: &str, f: &FontId| p.layout_no_wrap(t.to_owned(), f.clone(), Color32::WHITE).size().x;
-
-    let label_w = rows
-        .iter()
-        .filter_map(|r| if let InfoRow::Item(l, _) = r { Some(width_of(l, &label_font)) } else { None })
-        .fold(0.0_f32, f32::max);
-    // The value column only ever grows while the panel is open: numbers changing
-    // width every refresh would otherwise make the whole panel twitch
-    let value_now = rows
-        .iter()
-        .filter_map(|r| if let InfoRow::Item(_, v) = r { Some(width_of(v, &value_font)) } else { None })
-        .fold(0.0_f32, f32::max);
-    let id = egui::Id::new("info_value_w");
-    let value_w = ctx.data_mut(|d| {
-        let w = d.get_temp_mut_or(id, 0.0_f32);
-        *w = w.max(value_now);
-        *w
-    });
-    let footer = "Tab to close  \u{b7}  H for the next decoding method";
-    let width = (PAD_X * 2.0 + label_w + COL_GAP + value_w).max(width_of(footer, &foot_font) + PAD_X * 2.0).ceil();
-    let content_h: f32 = rows
-        .iter()
-        .enumerate()
-        .map(|(i, r)| match r {
-            InfoRow::Section(_) if i == 0 => HEAD_H - 6.0,
-            InfoRow::Section(_) => HEAD_H,
-            InfoRow::Item(..) => ROW_H,
-        })
-        .sum();
-    let screen = ctx.screen_rect();
-    let rect = Rect::from_min_size(
-        pos2(screen.left() + OSD_LEFT, screen.top() + INFO_TOP),
-        vec2(width, PAD_Y * 2.0 + content_h + FOOT_H),
-    );
-    glass::shadow(&p, rect, 8.0, alpha);
-    glass::fill(&p, rect, 8.0, Color32::from_rgb(43, 43, 43), alpha);
-    p.rect_stroke(
-        rect.shrink(0.5),
-        8.0,
-        Stroke::new(1.0_f32, glass::edge(Color32::from_rgba_premultiplied(26, 26, 26, 26)).gamma_multiply(alpha)),
-    );
-
-    let x = rect.left() + PAD_X;
-    let vx = x + label_w + COL_GAP;
-    let mut y = rect.top() + PAD_Y;
-    for (i, row) in rows.iter().enumerate() {
-        match row {
-            InfoRow::Section(name) => {
-                let h = if i == 0 { HEAD_H - 6.0 } else { HEAD_H };
-                p.text(pos2(x, y + h - 9.0), Align2::LEFT_CENTER, name.to_uppercase(), head_font.clone(), dim);
-                y += h;
-            }
-            InfoRow::Item(label, value) => {
-                let cy = y + ROW_H / 2.0;
-                p.text(pos2(x, cy), Align2::LEFT_CENTER, *label, label_font.clone(), label_col);
-                p.text(pos2(vx, cy), Align2::LEFT_CENTER, value, value_font.clone(), value_col);
-                y += ROW_H;
-            }
-        }
-    }
-    // Footer: a hairline, then the keys
-    let line_y = y + PAD_Y - 2.0;
-    p.line_segment(
-        [pos2(rect.left() + 1.0, line_y), pos2(rect.right() - 1.0, line_y)],
-        Stroke::new(1.0_f32, Color32::from_rgba_premultiplied(26, 26, 26, 26).gamma_multiply(alpha)),
-    );
-    p.text(pos2(x, (line_y + rect.bottom()) / 2.0), Align2::LEFT_CENTER, footer, foot_font, dim);
-}
-
 fn fmt_time(secs: f64) -> String {
     let s = if secs.is_finite() && secs > 0.0 { secs as u64 } else { 0 };
     let (h, m, s) = (s / 3600, (s % 3600) / 60, s % 60);
     if h > 0 { format!("{h}:{m:02}:{s:02}") } else { format!("{m}:{s:02}") }
-}
-
-// ── File types ────────────────────────────────────────────────────────────────
-/// Files mpv plays, by kind (drag-and-drop, the Open dialog, previous / next)
-const VIDEO_EXTS: &[&str] = &[
-    "mp4", "mkv", "avi", "mov", "wmv", "flv", "webm", "m4v", "ts", "m2ts", "mts", "mpg", "mpeg", "3gp", "ogv",
-];
-const MUSIC_EXTS: &[&str] = &[
-    "mp3", "flac", "wav", "m4a", "aac", "ogg", "oga", "opus", "wma", "alac", "aiff", "aif", "ape", "wv", "mka",
-];
-const IMAGE_EXTS: &[&str] = &[
-    "jpg", "jpeg", "png", "gif", "webp", "avif", "bmp", "tif", "tiff", "jxl",
-];
-const PLAYLIST_EXTS: &[&str] = &["m3u", "m3u8"];
-
-#[derive(Clone, Copy, PartialEq, Debug)]
-enum MediaKind {
-    Video,
-    Music,
-    Image,
-}
-
-fn media_kind(path: &str) -> Option<MediaKind> {
-    if has_ext(path, VIDEO_EXTS) {
-        Some(MediaKind::Video)
-    } else if has_ext(path, MUSIC_EXTS) {
-        Some(MediaKind::Music)
-    } else if has_ext(path, IMAGE_EXTS) {
-        Some(MediaKind::Image)
-    } else {
-        None
-    }
-}
-
-fn is_playlist_file(path: &str) -> bool {
-    has_ext(path, PLAYLIST_EXTS)
-}
-
-/// The entries of an .m3u / .m3u8 playlist that exist (or are web addresses),
-/// in order. Relative paths are relative to the playlist's folder.
-fn read_playlist(path: &Path) -> Vec<PathBuf> {
-    let Ok(bytes) = std::fs::read(path) else { return Vec::new() };
-    let base = path.parent().map(Path::to_path_buf).unwrap_or_default();
-    playlist_text(&bytes)
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty() && !l.starts_with('#'))
-        .filter_map(|line| {
-            if line.contains("://") && !line.starts_with("file://") {
-                return Some(PathBuf::from(line)); // web address: mpv streams it
-            }
-            let line = match line.strip_prefix("file:///").or_else(|| line.strip_prefix("file://")) {
-                Some(rest) => percent_decode(rest),
-                None => line.to_owned(),
-            };
-            let p = PathBuf::from(line.replace('/', "\\"));
-            let p = if p.is_absolute() { p } else { base.join(p) };
-            (p.is_file() && !is_playlist_file(&p.to_string_lossy())).then_some(p)
-        })
-        .collect()
-}
-
-/// .m3u8 (and modern .m3u) files are UTF-8; older .m3u files use the Windows
-/// language's code page
-fn playlist_text(bytes: &[u8]) -> String {
-    let bytes = bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(bytes);
-    if let Ok(s) = std::str::from_utf8(bytes) {
-        return s.to_owned();
-    }
-    unsafe {
-        let n = MultiByteToWideChar(0 /* CP_ACP */, 0, bytes.as_ptr(), bytes.len() as i32, std::ptr::null_mut(), 0);
-        if n > 0 {
-            let mut wide = vec![0u16; n as usize];
-            MultiByteToWideChar(0, 0, bytes.as_ptr(), bytes.len() as i32, wide.as_mut_ptr(), n);
-            return String::from_utf16_lossy(&wide);
-        }
-    }
-    String::from_utf8_lossy(bytes).into_owned()
-}
-
-/// "My%20Song.mp3" → "My Song.mp3" (for file:// entries)
-fn percent_decode(s: &str) -> String {
-    let b = s.as_bytes();
-    let mut out = Vec::with_capacity(b.len());
-    let mut i = 0;
-    while i < b.len() {
-        if b[i] == b'%' && i + 2 < b.len() {
-            if let Ok(v) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
-                out.push(v);
-                i += 3;
-                continue;
-            }
-        }
-        out.push(b[i]);
-        i += 1;
-    }
-    String::from_utf8_lossy(&out).into_owned()
-}
-
-fn has_ext(path: &str, exts: &[&str]) -> bool {
-    Path::new(path)
-        .extension()
-        .and_then(|e| e.to_str())
-        .map_or(false, |e| exts.iter().any(|x| x.eq_ignore_ascii_case(e)))
-}
-
-fn is_media_file(path: &str) -> bool {
-    media_kind(path).is_some()
 }
 
 fn main() -> eframe::Result<()> {

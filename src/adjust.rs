@@ -378,7 +378,7 @@ pub const PRESS: Color32 = Color32::from_rgba_premultiplied(58, 58, 58, 58);
 /// buttons (a plain "click" also needs the pointer to have stayed nearly still)
 pub fn activated(resp: &egui::Response) -> bool {
     resp.clicked()
-        || (resp.drag_stopped() && resp.ctx.input(|i| i.pointer.latest_pos()).map_or(false, |p| resp.rect.contains(p)))
+        || (resp.drag_stopped() && resp.ctx.input(|i| i.pointer.latest_pos()).is_some_and(|p| resp.rect.contains(p)))
 }
 
 /// Number of points for a round curve of radius `r` points, so each straight piece
@@ -404,7 +404,7 @@ pub fn disc(p: &egui::Painter, centre: Pos2, r: f32, color: Color32) {
 }
 
 pub fn state_fill(resp: &egui::Response) -> Option<Color32> {
-    let inside = resp.ctx.input(|i| i.pointer.latest_pos()).map_or(false, |p| resp.rect.contains(p));
+    let inside = resp.ctx.input(|i| i.pointer.latest_pos()).is_some_and(|p| resp.rect.contains(p));
     if resp.is_pointer_button_down_on() && inside {
         Some(PRESS)
     } else if resp.hovered() {
@@ -465,7 +465,7 @@ fn header(ui: &mut egui::Ui, p: &egui::Painter, rect: Rect, title: &str, id: &st
 /// A key cap button ("−" / "+") with its label at `size`; returns true when clicked
 fn cap_sized(ui: &mut egui::Ui, p: &egui::Painter, rect: Rect, label: &str, id: egui::Id, size: f32) -> bool {
     let resp = ui.interact(rect, id, Sense::click_and_drag());
-    let inside = resp.ctx.input(|i| i.pointer.latest_pos()).map_or(false, |p| rect.contains(p));
+    let inside = resp.ctx.input(|i| i.pointer.latest_pos()).is_some_and(|p| rect.contains(p));
     let pressed = resp.is_pointer_button_down_on() && inside;
     let fill = if pressed {
         Color32::from_rgb(112, 112, 114)
@@ -644,7 +644,7 @@ fn rows(a: &Adjust, normalize: bool, hq: bool, tab: Tab, denoise_skipped: bool) 
                 ),
                 Row::Sep,
                 Row::Switch("Deband", "Smooths visible steps in gradients such as skies and dark scenes.", a.deband, SwitchKey::Deband),
-                Row::Switch("Deinterlace", "Removes comb-like lines from old TV recordings and DVDs.", a.deinterlace, SwitchKey::Deinterlace),
+                Row::Switch("Deinterlace", "Removes comb-like lines from old TV recordings and DVDs. Only acts on video that's actually interlaced.", a.deinterlace, SwitchKey::Deinterlace),
                 Row::Switch("Smooth motion", "Matches films and other videos under 40 fps to your monitor's refresh rate, so panning shots judder less. (50 and 60 fps video doesn't need it, so it's left alone.)", a.smooth, SwitchKey::Smooth),
                 Row::Switch("High-quality upscaling", "A sharper, cleaner scaler when the video is smaller than the window (e.g. 1080p on a 4K screen). Uses more graphics card time.", hq, SwitchKey::Hq),
             ]
@@ -993,7 +993,7 @@ pub fn draw_eq(ctx: &egui::Context, ui_state: &mut AdjustUi, a: &mut Adjust, acc
 fn kelvin_rgb(k: f32) -> [f32; 3] {
     let kelvin = k / 100.0;
     let (r, g) = if kelvin <= 66.0 {
-        (1.0, 0.390_081_58 * kelvin.ln() - 0.631_841_44)
+        (1.0, 0.390_081_58 * kelvin.ln() - 0.631_841_4)
     } else {
         let t = (kelvin - 60.0).max(0.0);
         (1.292_936_2 * t.powf(-0.133_204_76), 1.129_890_9 * t.powf(-0.075_514_85))

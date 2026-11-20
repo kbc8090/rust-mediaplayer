@@ -131,7 +131,7 @@ fn run(mpv: Arc<Mutex<Mpv>>, rx: mpsc::Receiver<Job>, state: Arc<Mutex<Snapshot>
     loop {
         // Wait for work, or refresh the snapshot every 100 ms (25 ms just after a
         // file was opened)
-        let quick = quick_until.map_or(false, |t| Instant::now() < t);
+        let quick = quick_until.is_some_and(|t| Instant::now() < t);
         let tick = Duration::from_millis(if quick { 25 } else { 100 });
         let mut jobs = Vec::new();
         match rx.recv_timeout(tick) {
@@ -168,7 +168,7 @@ fn run(mpv: Arc<Mutex<Mpv>>, rx: mpsc::Receiver<Job>, state: Arc<Mutex<Snapshot>
                         quick_until = Some(Instant::now() + Duration::from_millis(1500));
                         // A previous file may have needed software threads (see below);
                         // a hardware decoder gets its single thread back
-                        if m.get_property::<String>("hwdec").map_or(false, |h| h != "no") {
+                        if m.get_property::<String>("hwdec").is_ok_and(|h| h != "no") {
                             let _ = m.set_property("vd-lavc-threads", 1_i64);
                         }
                     }
@@ -457,10 +457,8 @@ fn bit_depth(pf: &str) -> u32 {
         return 16;
     }
     let digits: String = pf.chars().rev().take_while(|c| c.is_ascii_digit()).collect::<Vec<_>>().into_iter().rev().collect();
-    match digits.parse::<u32>() {
-        Ok(n @ (9..=16)) => n,
-        _ => 8,
-    }
+    // (only 9..16 are bit depths: "rgb24" or "bgr0" end in digits that aren't)
+    digits.parse::<u32>().ok().filter(|n| (9..=16).contains(n)).unwrap_or(8)
 }
 
 /// "18.4 Mb/s" or "160 kb/s"
