@@ -37,10 +37,21 @@ pub struct Snapshot {
     pub dheight: i64,
     /// The video's frame rate (0 if unknown / no video)
     pub fps: f64,
+    /// The file these details belong to (as passed to loadfile)
+    pub path: String,
     /// Chapters (start time in seconds, title), empty if the file has none
     pub chapters: Arc<Vec<(f64, String)>>,
-    /// Decoder / video details, only filled while the info overlay is open
-    pub info: Vec<String>,
+    /// Video / audio details, only filled while the info overlay is open
+    pub info: Vec<InfoRow>,
+}
+
+/// A line of the info overlay
+#[derive(Clone)]
+pub enum InfoRow {
+    /// A heading ("Video", "Audio", ...)
+    Section(&'static str),
+    /// Label and value
+    Item(&'static str, String),
 }
 
 enum Job {
@@ -200,12 +211,14 @@ fn run(mpv: Arc<Mutex<Mpv>>, rx: mpsc::Receiver<Job>, state: Arc<Mutex<Snapshot>
                 .unwrap_or(0.0),
             chapters: chapters.clone(),
             info: Vec::new(),
+            path: String::new(),
         };
         let key = (
             m.get_property::<String>("path").unwrap_or_default(),
             m.get_property::<i64>("chapter-list/count").unwrap_or(0),
         );
         let path = key.0.clone();
+        s.path = path.clone();
         if key != chapter_key {
             let mut list = Vec::new();
             for i in 0..key.1 {
@@ -245,44 +258,7 @@ fn run(mpv: Arc<Mutex<Mpv>>, rx: mpsc::Receiver<Job>, state: Arc<Mutex<Snapshot>
             }
         }
         if want_info.load(Ordering::Relaxed) {
-            let hw = m.get_property::<String>("hwdec-current").unwrap_or_default();
-            s.info.push(match hw.as_str() {
-                "" => "Decoder: starting…".to_owned(),
-                "no" => "Decoder: software (CPU)".to_owned(),
-                other => format!("Decoder: hardware ({other})"),
-            });
-            let fmt = m.get_property::<String>("video-format").unwrap_or_default();
-            let w = m.get_property::<i64>("width").unwrap_or(0);
-            let h = m.get_property::<i64>("height").unwrap_or(0);
-            let fps = m.get_property::<f64>("estimated-vf-fps").unwrap_or(0.0);
-            s.info.push(format!("Video: {fmt} {w}x{h} @ {fps:.1} fps"));
-            let threads = m.get_property::<i64>("vd-lavc-threads").unwrap_or(-1);
-            s.info.push(format!(
-                "Decoder threads: {}",
-                if threads == 0 { "automatic".to_owned() } else { threads.to_string() }
-            ));
-            let dropped = m.get_property::<i64>("frame-drop-count").unwrap_or(0);
-            let dec_dropped = m.get_property::<i64>("decoder-frame-drop-count").unwrap_or(0);
-            let delayed = m.get_property::<i64>("vo-delayed-frame-count").unwrap_or(0);
-            let mistimed = m.get_property::<i64>("mistimed-frame-count").unwrap_or(0);
-            s.info.push(format!(
-                "Dropped frames: {dropped} (decoder: {dec_dropped}), late: {delayed}, mistimed: {mistimed}"
-            ));
-            let avsync = m.get_property::<f64>("avsync").unwrap_or(0.0) * 1000.0;
-            let display = m.get_property::<f64>("display-fps").unwrap_or(0.0);
-            let sync = m.get_property::<String>("video-sync").unwrap_or_default();
-            let interp = m.get_property::<bool>("interpolation").unwrap_or(false);
-            s.info.push(format!(
-                "Display: {display:.0} Hz, sync: {sync}{}, A/V offset {avsync:+.0} ms",
-                if interp { " + interpolation" } else { "" }
-            ));
-            let scale = m.get_property::<String>("scale").unwrap_or_default();
-            let dscale = m.get_property::<String>("dscale").unwrap_or_default();
-            s.info.push(format!("Scaling: up {scale}, down {dscale}"));
-            let ahead = m.get_property::<f64>("demuxer-cache-duration").unwrap_or(0.0);
-            s.info.push(format!("Buffered ahead: {ahead:.1} s"));
-            let version = m.get_property::<String>("mpv-version").unwrap_or_default();
-            s.info.push(format!("Engine: {version}"));
+            s.info = read_info(&m);
         }
         drop(m);
 
@@ -290,4 +266,207 @@ fn run(mpv: Arc<Mutex<Mpv>>, rx: mpsc::Receiver<Job>, state: Arc<Mutex<Snapshot>
             *st = s;
         }
     }
+}
+
+/// Everything the info overlay shows about the file and playback
+fn read_info(m: &Mpv) -> Vec<InfoRow> {
+    use InfoRow::{Item, Section};
+    let text = |k: &str| m.get_property::<String>(k).ok().filter(|v| !v.is_empty());
+    let float = |k: &str| m.get_property::<f64>(k).ok();
+    let int = |k: &str| m.get_property::<i64>(k).ok();
+    let mut info = Vec::new();
+
+    // ── Video
+    info.push(Section("Video"));
+    let mut fmt = Vec::new();
+    if let Some(c) = text("video-format") {
+        fmt.push(codec_name(&c));
+    }
+    if let (Some(w), Some(h)) = (int("width"), int("height")) {
+        if w > 0 && h > 0 {
+            fmt.push(format!("{w}\u{d7}{h}"));
+        }
+    }
+    if let Some(f) = float("container-fps").filter(|f| *f > 0.0).or_else(|| float("estimated-vf-fps")) {
+        fmt.push(format!("{} fps", short_num(f)));
+    }
+    if let Some(pf) = text("video-params/pixelformat") {
+        fmt.push(format!("{}-bit", bit_depth(&pf)));
+    }
+    match text("video-params/gamma").as_deref() {
+        Some("pq") => fmt.push("HDR10".into()),
+        Some("hlg") => fmt.push("HLG".into()),
+        _ => {}
+    }
+    info.push(Item("Format", if fmt.is_empty() { "\u{2013}".into() } else { fmt.join("  \u{b7}  ") }));
+    info.push(Item("Bitrate", float("video-bitrate").map_or("measuring\u{2026}".into(), bitrate)));
+    let threads = match int("vd-lavc-threads") {
+        Some(1) => "1 thread".to_owned(),
+        Some(n) if n > 1 => format!("{n} threads"),
+        _ => "all threads".to_owned(),
+    };
+    info.push(Item(
+        "Decoder",
+        match text("hwdec-current").as_deref() {
+            None => "starting\u{2026}".to_owned(),
+            Some("no") => format!("Software (CPU)  \u{b7}  {threads}"),
+            Some(other) => format!("Hardware ({other})"),
+        },
+    ));
+    let dropped = int("frame-drop-count").unwrap_or(0);
+    let dec_dropped = int("decoder-frame-drop-count").unwrap_or(0);
+    let late = int("vo-delayed-frame-count").unwrap_or(0);
+    let mistimed = int("mistimed-frame-count").unwrap_or(0);
+    info.push(Item(
+        "Dropped",
+        format!("{dropped}  \u{b7}  decoder {dec_dropped}  \u{b7}  late {late}  \u{b7}  mistimed {mistimed}"),
+    ));
+
+    // ── Audio
+    info.push(Section("Audio"));
+    let has_audio = match text("audio-codec-name") {
+        Some(codec) => {
+            let mut a = vec![codec_name(&codec)];
+            if let Some(sr) = int("audio-params/samplerate") {
+                a.push(format!("{} kHz", short_num(sr as f64 / 1000.0)));
+            }
+            if let Some(ch) = text("audio-params/hr-channels") {
+                a.push(channels_name(&ch));
+            }
+            info.push(Item("Format", a.join("  \u{b7}  ")));
+            info.push(Item("Bitrate", float("audio-bitrate").map_or("measuring\u{2026}".into(), bitrate)));
+            let mut o = Vec::new();
+            if let Some(ao) = text("current-ao") {
+                o.push(ao.to_uppercase());
+            }
+            if let Some(sr) = int("audio-out-params/samplerate") {
+                o.push(format!("{} kHz", short_num(sr as f64 / 1000.0)));
+            }
+            if let Some(f) = text("audio-out-params/format") {
+                o.push(sample_format_name(&f));
+            }
+            info.push(Item("Output", if o.is_empty() { "\u{2013}".into() } else { o.join("  \u{b7}  ") }));
+            true
+        }
+        None => {
+            info.push(Item("Format", "No audio track".into()));
+            false
+        }
+    };
+
+    // ── Playback
+    info.push(Section("Playback"));
+    let display = float("display-fps").unwrap_or(0.0);
+    let sync = match text("video-sync").as_deref() {
+        Some("display-resample") => {
+            if m.get_property::<bool>("interpolation").unwrap_or(false) {
+                "smooth motion"
+            } else {
+                "timed to display"
+            }
+        }
+        _ => "timed to audio",
+    };
+    info.push(Item(
+        "Display",
+        if display > 0.0 { format!("{display:.0} Hz  \u{b7}  {sync}") } else { sync.to_owned() },
+    ));
+    if has_audio {
+        let avsync = float("avsync").unwrap_or(0.0) * 1000.0;
+        info.push(Item("A/V offset", format!("{avsync:+.0} ms")));
+    }
+    let scale = text("scale").unwrap_or_default();
+    let dscale = text("dscale").unwrap_or_default();
+    info.push(Item("Scaling", format!("up {scale}  \u{b7}  down {dscale}")));
+    let ahead = float("demuxer-cache-duration").unwrap_or(0.0);
+    info.push(Item("Buffered", format!("{ahead:.1} s ahead")));
+    if let Some(v) = text("mpv-version") {
+        info.push(Item("Engine", v));
+    }
+    info
+}
+
+/// "VP9", "H.264", "Opus", ... from FFmpeg's codec names
+fn codec_name(c: &str) -> String {
+    let c = c.to_ascii_lowercase();
+    match c.as_str() {
+        "h264" => "H.264",
+        "hevc" | "h265" => "HEVC",
+        "av1" => "AV1",
+        "vp9" => "VP9",
+        "vp8" => "VP8",
+        "mpeg2video" => "MPEG-2",
+        "mpeg4" => "MPEG-4",
+        "prores" => "ProRes",
+        "aac" => "AAC",
+        "opus" => "Opus",
+        "mp3" | "mp3float" => "MP3",
+        "flac" => "FLAC",
+        "vorbis" => "Vorbis",
+        "ac3" => "Dolby Digital",
+        "eac3" => "Dolby Digital Plus",
+        "truehd" => "Dolby TrueHD",
+        "dts" => "DTS",
+        "alac" => "ALAC",
+        "wmav2" | "wmapro" => "WMA",
+        _ if c.starts_with("pcm") => "PCM",
+        _ => return c.to_uppercase(),
+    }
+    .to_owned()
+}
+
+/// "Stereo", "5.1", ... from mpv's channel layout names
+fn channels_name(ch: &str) -> String {
+    match ch {
+        "mono" => "Mono".to_owned(),
+        "stereo" => "Stereo".to_owned(),
+        other => other.to_owned(),
+    }
+}
+
+/// "32-bit float", "16-bit", ... from mpv's sample format names
+fn sample_format_name(f: &str) -> String {
+    let base = f.trim_end_matches('p');
+    match base {
+        "float" => "32-bit float".to_owned(),
+        "double" => "64-bit float".to_owned(),
+        "s16" => "16-bit".to_owned(),
+        "s24" => "24-bit".to_owned(),
+        "s32" => "32-bit".to_owned(),
+        "s64" => "64-bit".to_owned(),
+        "u8" => "8-bit".to_owned(),
+        _ if f.starts_with("spdif") => "passthrough".to_owned(),
+        _ => f.to_owned(),
+    }
+}
+
+/// Bits per colour from a pixel format name ("yuv420p10" is 10, "p010" is 10,
+/// "nv12" / "yuv420p" are 8)
+fn bit_depth(pf: &str) -> u32 {
+    if pf.starts_with("p010") {
+        return 10;
+    }
+    if pf.starts_with("p016") {
+        return 16;
+    }
+    let digits: String = pf.chars().rev().take_while(|c| c.is_ascii_digit()).collect::<Vec<_>>().into_iter().rev().collect();
+    match digits.parse::<u32>() {
+        Ok(n @ (9..=16)) => n,
+        _ => 8,
+    }
+}
+
+/// "18.4 Mb/s" or "160 kb/s"
+fn bitrate(bits_per_sec: f64) -> String {
+    if bits_per_sec >= 1_000_000.0 {
+        format!("{:.1} Mb/s", bits_per_sec / 1_000_000.0)
+    } else {
+        format!("{:.0} kb/s", bits_per_sec / 1000.0)
+    }
+}
+
+/// 60 → "60", 23.976 → "23.976", 44.1 → "44.1"
+fn short_num(v: f64) -> String {
+    let s = format!("{v:.3}");
+    s.trim_end_matches('0').trim_end_matches('.').to_owned()
 }

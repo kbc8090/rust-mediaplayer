@@ -10,7 +10,7 @@ mod splash;
 mod taskbar;
 mod thumbs;
 
-use mpv_link::{yn, MpvLink};
+use mpv_link::{yn, InfoRow, MpvLink};
 
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use std::sync::{Arc, Mutex};
@@ -450,7 +450,7 @@ struct FluentMediaPlayer {
     /// mpv sits on the last frame of a finished video
     eof: bool,
     /// Decoder / video lines from the mpv thread for the info overlay
-    mpv_info: Vec<String>,
+    mpv_info: Vec<InfoRow>,
     render_ctx_initialized: bool,
     current_file: String,
     is_playing: bool,
@@ -487,7 +487,7 @@ struct FluentMediaPlayer {
     volume_osd: Option<std::time::Instant>,
     /// Technical info overlay (toggle with I)
     show_info: bool,
-    info_lines: Vec<String>,
+    info_rows: Vec<InfoRow>,
     /// Hardware decoding mode, index into HW_MODES (cycle with H)
     hw_decode: usize,
     /// File given on the command line (drop on the .exe / "Open with"), played once ready
@@ -590,6 +590,9 @@ struct FluentMediaPlayer {
     /// The current video's frame rate, and whether smooth motion is active for it
     video_fps: f64,
     smooth_on: bool,
+    /// The current video is small enough for Denoise (1080p or less); false while
+    /// its size isn't known yet, so a 4K video never starts out denoised
+    denoise_ok: bool,
     last_af: Option<String>,
     /// High-quality upscaling (menu)
     hq: bool,
@@ -745,7 +748,7 @@ impl FluentMediaPlayer {
             accent_checked: std::time::Instant::now(),
             volume_osd: None,
             show_info: false,
-            info_lines: Vec::new(),
+            info_rows: Vec::new(),
             hw_decode: st.hwdec,
             startup_file,
             start_max: saved.maximized,
@@ -810,6 +813,7 @@ impl FluentMediaPlayer {
             last_shader: None,
             video_fps: 0.0,
             smooth_on: false,
+            denoise_ok: false,
             last_af: None,
         };
         app.apply_adjust_all();
@@ -867,6 +871,11 @@ impl FluentMediaPlayer {
         // for the previous one
         self.link.set("sid", "no");
         self.link.set("loop-file", if self.wants_loop() { "inf" } else { "no" });
+        // Denoise starts off for every file, until its size is known (see update)
+        if self.denoise_ok {
+            self.denoise_ok = false;
+            self.apply_vf();
+        }
         self.link.command("loadfile", &[path]);
         self.link.set("pause", "no");
         self.is_playing = true;
@@ -985,7 +994,7 @@ impl FluentMediaPlayer {
 
     /// Picture filters plus mirroring, as one filter chain
     fn apply_vf(&mut self) {
-        let chain = self.adjust.vf_chain(self.mirror);
+        let chain = self.adjust.vf_chain(self.mirror, self.denoise_ok);
         if chain != self.last_vf {
             match &chain {
                 Some(c) => self.link.command("vf", &["set", c]),
@@ -1193,18 +1202,25 @@ impl FluentMediaPlayer {
         self.seek_osd = None;
     }
 
-    /// Gather decoder / video details for the info overlay
+    /// Gather the details for the info overlay (Tab)
     fn refresh_info(&mut self) {
-        let mut lines = self.mpv_info.clone();
-        lines.push(format!(
-            "Decoding method: {}  (H for the next one)",
-            HW_MODES[self.hw_decode].1
-        ));
+        let mut rows = Vec::new();
+        for row in self.mpv_info.iter().cloned() {
+            let after_decoder = matches!(row, InfoRow::Item("Decoder", _));
+            rows.push(row);
+            if after_decoder {
+                rows.push(InfoRow::Item("Method", HW_MODES[self.hw_decode].1.to_owned()));
+            }
+        }
+        rows.push(InfoRow::Section("Performance"));
         let render_ms = RENDER_MS.with(|r| r.get());
-        lines.push(format!(
-            "Render: {render_ms:.1} ms per video frame, window redraws {:.0}/s{}",
-            self.ui_fps,
-            if self.resize_mode { " (resize settings active)" } else { "" }
+        rows.push(InfoRow::Item(
+            "Render",
+            format!(
+                "{render_ms:.1} ms per frame  \u{b7}  {:.0} redraws/s{}",
+                self.ui_fps,
+                if self.resize_mode { "  \u{b7}  resizing" } else { "" }
+            ),
         ));
         // CPU use of the whole player, as a share of all cores (100 % = every core busy)
         if let Some(cpu) = process_cpu_time() {
@@ -1219,19 +1235,19 @@ impl FluentMediaPlayer {
             } else {
                 self.cpu_mark = Some((cpu, now));
             }
-            lines.push(format!("CPU: {:.0} % of all cores", self.cpu_pct));
+            rows.push(InfoRow::Item("CPU", format!("{:.0} % of all cores", self.cpu_pct)));
+        }
+        if let Some((ws, private)) = process_memory_mb() {
+            rows.push(InfoRow::Item("Memory", format!("{ws:.0} MB  \u{b7}  {private:.0} MB private")));
         }
         let (n, sum, worst, worst_render) = self.rs_stats;
         if n > 0 {
-            lines.push(format!(
-                "Last resize: {n} frames, avg {:.0} ms, worst {worst:.0} ms (mpv render worst {worst_render:.0} ms)",
-                sum / n as f32
+            rows.push(InfoRow::Item(
+                "Last resize",
+                format!("{n} frames  \u{b7}  avg {:.0} ms  \u{b7}  worst {worst:.0} ms (render {worst_render:.0} ms)", sum / n as f32),
             ));
         }
-        if let Some((ws, private)) = process_memory_mb() {
-            lines.push(format!("Memory: {ws:.0} MB working set, {private:.0} MB private"));
-        }
-        self.info_lines = lines;
+        self.info_rows = rows;
     }
 
     fn set_mute(&mut self, mute: bool) {
@@ -1377,6 +1393,14 @@ impl FluentMediaPlayer {
 
 impl eframe::App for FluentMediaPlayer {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        // No button ever keeps keyboard focus. egui moves focus between buttons with
+        // Tab (our info key), and a focused button also "clicks" on Space / Enter,
+        // so Tab then Space would have paused *and* pressed some button.
+        ctx.memory_mut(|m| {
+            if let Some(id) = m.focused() {
+                m.surrender_focus(id);
+            }
+        });
         // ── Folder list from the background scan ──────────────────────────────
         let scanned = self.scan_result.lock().ok().and_then(|mut s| s.take());
         if let Some((gen, files)) = scanned {
@@ -1396,6 +1420,17 @@ impl eframe::App for FluentMediaPlayer {
             self.duration = snap.duration;
             self.video_fps = snap.fps;
             self.update_smooth();
+            // Denoise only up to 1080p, counted in pixels (so a 1080x1920 phone
+            // video counts too); larger videos play without it. (Sizes still
+            // from the previous file, just after switching, don't count.)
+            let same_file = snap.path == self.current_file;
+            let pixels = if same_file { snap.dwidth.max(0) * snap.dheight.max(0) } else { 0 };
+            let ok = pixels > 0 && pixels <= 1920 * 1088;
+            if ok != self.denoise_ok {
+                self.denoise_ok = ok;
+                self.apply_vf();
+            }
+            self.adjust_ui.denoise_skipped = self.adjust.denoise > 0 && pixels > 1920 * 1088;
             if now >= self.hold_until {
                 // The mpv thread reads the time only ~10x a second. While playing,
                 // move on by the elapsed time every frame and ease toward mpv's value,
@@ -1681,7 +1716,7 @@ impl eframe::App for FluentMediaPlayer {
             m:     i.key_pressed(egui::Key::M),
             n:     i.key_pressed(egui::Key::N),
             p:     i.key_pressed(egui::Key::P),
-            info:  i.key_pressed(egui::Key::I),
+            info:  i.key_pressed(egui::Key::Tab),
             hw:    i.key_pressed(egui::Key::H),
             esc:   i.key_pressed(egui::Key::Escape),
             open:  i.modifiers.ctrl && i.key_pressed(egui::Key::O),
@@ -1945,10 +1980,12 @@ impl eframe::App for FluentMediaPlayer {
                 .rect_stroke(screen.shrink(px / 2.0), 0.0, Stroke::new(px, col));
         }
 
-        // Technical info overlay (I)
+        // Technical info overlay (Tab)
         if self.show_info && self.has_file {
-            draw_info_overlay(ctx, &self.info_lines);
+            draw_info_overlay(ctx, &self.info_rows);
             ctx.request_repaint_after(std::time::Duration::from_millis(500));
+        } else {
+            ctx.data_mut(|d| d.remove::<f32>(egui::Id::new("info_value_w")));
         }
 
         // Schedule a time-display refresh every ~250ms while playing.
@@ -3049,7 +3086,7 @@ const SHORTCUTS: &[(&[&str], &str)] = &[
     (&["R"], "Rotate 90\u{b0}"),
     (&["Ctrl+O"], "Open file"),
     (&["E"], "Picture & Sound"),
-    (&["I"], "Video info"),
+    (&["Tab"], "Video info"),
     (&["H"], "Next decoding method"),
     (&["Media keys"], "Play / pause, next, previous"),
 ];
@@ -3530,30 +3567,88 @@ fn draw_speed_menu(app: &mut FluentMediaPlayer, ctx: &egui::Context) {
 }
 
 /// Decoder / video details (toggle with I) — shows whether hardware decoding is active
-fn draw_info_overlay(ctx: &egui::Context, lines: &[String]) {
-    if lines.is_empty() { return; }
+/// The info overlay (Tab): a frosted panel like the menus, with sections, bold
+/// labels and a value column
+fn draw_info_overlay(ctx: &egui::Context, rows: &[InfoRow]) {
+    if rows.is_empty() {
+        return;
+    }
+    const PAD_X: f32 = 16.0;
+    const PAD_Y: f32 = 10.0;
+    const ROW_H: f32 = 20.0;
+    const HEAD_H: f32 = 26.0;
+    const COL_GAP: f32 = 18.0;
+    const FOOT_H: f32 = 30.0;
     let p = ctx.layer_painter(egui::LayerId::new(egui::Order::Tooltip, egui::Id::new("info_osd")));
-    let font = FontId::proportional(13.0);
-    let line_h = 20.0;
-    let text_w = lines
+    let label_font = FontId::new(13.0, FontFamily::Name("semibold".into()));
+    let value_font = FontId::proportional(13.0);
+    let head_font = FontId::new(11.5, FontFamily::Name("semibold".into()));
+    let foot_font = FontId::proportional(12.0);
+    let (label_col, value_col) = (Color32::from_rgb(236, 236, 236), Color32::from_rgb(208, 208, 208));
+    let dim = Color32::from_rgb(150, 150, 150);
+    let width_of = |t: &str, f: &FontId| p.layout_no_wrap(t.to_owned(), f.clone(), Color32::WHITE).size().x;
+
+    let label_w = rows
         .iter()
-        .map(|l| p.layout_no_wrap(l.clone(), font.clone(), Color32::WHITE).size().x)
+        .filter_map(|r| if let InfoRow::Item(l, _) = r { Some(width_of(l, &label_font)) } else { None })
         .fold(0.0_f32, f32::max);
+    // The value column only ever grows while the panel is open: numbers changing
+    // width every refresh would otherwise make the whole panel twitch
+    let value_now = rows
+        .iter()
+        .filter_map(|r| if let InfoRow::Item(_, v) = r { Some(width_of(v, &value_font)) } else { None })
+        .fold(0.0_f32, f32::max);
+    let id = egui::Id::new("info_value_w");
+    let value_w = ctx.data_mut(|d| {
+        let w = d.get_temp_mut_or(id, 0.0_f32);
+        *w = w.max(value_now);
+        *w
+    });
+    let footer = "Tab to close  \u{b7}  H for the next decoding method";
+    let width = (PAD_X * 2.0 + label_w + COL_GAP + value_w).max(width_of(footer, &foot_font) + PAD_X * 2.0).ceil();
+    let content_h: f32 = rows
+        .iter()
+        .enumerate()
+        .map(|(i, r)| match r {
+            InfoRow::Section(_) if i == 0 => HEAD_H - 6.0,
+            InfoRow::Section(_) => HEAD_H,
+            InfoRow::Item(..) => ROW_H,
+        })
+        .sum();
     let screen = ctx.screen_rect();
     let rect = Rect::from_min_size(
         pos2(screen.left() + OSD_LEFT, screen.top() + INFO_TOP),
-        vec2(text_w + 28.0, lines.len() as f32 * line_h + 16.0),
+        vec2(width, PAD_Y * 2.0 + content_h + FOOT_H),
     );
-    p.rect_filled(rect, 8.0, Color32::from_rgba_unmultiplied(24, 24, 24, 215));
-    for (i, line) in lines.iter().enumerate() {
-        p.text(
-            pos2(rect.left() + 14.0, rect.top() + 8.0 + line_h * (i as f32 + 0.5)),
-            Align2::LEFT_CENTER,
-            line,
-            font.clone(),
-            Color32::WHITE,
-        );
+    glass::shadow(&p, rect, 8.0, 1.0);
+    glass::fill(&p, rect, 8.0, Color32::from_rgb(43, 43, 43), 1.0);
+    p.rect_stroke(rect.shrink(0.5), 8.0, Stroke::new(1.0_f32, glass::edge(Color32::from_rgba_premultiplied(26, 26, 26, 26))));
+
+    let x = rect.left() + PAD_X;
+    let vx = x + label_w + COL_GAP;
+    let mut y = rect.top() + PAD_Y;
+    for (i, row) in rows.iter().enumerate() {
+        match row {
+            InfoRow::Section(name) => {
+                let h = if i == 0 { HEAD_H - 6.0 } else { HEAD_H };
+                p.text(pos2(x, y + h - 9.0), Align2::LEFT_CENTER, name.to_uppercase(), head_font.clone(), dim);
+                y += h;
+            }
+            InfoRow::Item(label, value) => {
+                let cy = y + ROW_H / 2.0;
+                p.text(pos2(x, cy), Align2::LEFT_CENTER, *label, label_font.clone(), label_col);
+                p.text(pos2(vx, cy), Align2::LEFT_CENTER, value, value_font.clone(), value_col);
+                y += ROW_H;
+            }
+        }
     }
+    // Footer: a hairline, then the keys
+    let line_y = y + PAD_Y - 2.0;
+    p.line_segment(
+        [pos2(rect.left() + 1.0, line_y), pos2(rect.right() - 1.0, line_y)],
+        Stroke::new(1.0_f32, Color32::from_rgba_premultiplied(26, 26, 26, 26)),
+    );
+    p.text(pos2(x, (line_y + rect.bottom()) / 2.0), Align2::LEFT_CENTER, footer, foot_font, dim);
 }
 
 fn fmt_time(secs: f64) -> String {

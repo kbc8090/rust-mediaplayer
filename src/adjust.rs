@@ -190,10 +190,12 @@ impl Adjust {
     /// Only Denoise and mirroring are left here: Color temperature, Vibrance and
     /// Sharpen run on the GPU (see `shader`). Done in FFmpeg they had every frame
     /// converted to RGB and processed on the CPU at full size, which a 4K 60 fps
-    /// video couldn't keep up with.
-    pub fn vf_chain(&self, mirror: bool) -> Option<String> {
+    /// video couldn't keep up with. Denoise can't move (it compares each frame
+    /// with the previous ones, which mpv's shaders can't see), so it's only used
+    /// where `denoise_ok` says the video is small enough (1080p or less).
+    pub fn vf_chain(&self, mirror: bool, denoise_ok: bool) -> Option<String> {
         let mut f: Vec<String> = Vec::new();
-        if self.denoise > 0 {
+        if self.denoise > 0 && denoise_ok {
             f.push(format!("hqdn3d={}", [0, 2, 4, 7][self.denoise as usize]));
         }
         if mirror {
@@ -334,6 +336,9 @@ pub struct AdjustUi {
     tip_row: Option<&'static str>,
     tip_since: std::time::Instant,
     tip_shown: bool,
+    /// Denoise is on but not used for the current video (larger than 1080p);
+    /// set by the app every frame, and mentioned in Denoise's description
+    pub denoise_skipped: bool,
 }
 
 impl AdjustUi {
@@ -347,6 +352,7 @@ impl AdjustUi {
             tip_row: None,
             tip_since: std::time::Instant::now(),
             tip_shown: false,
+            denoise_skipped: false,
         }
     }
 
@@ -599,7 +605,7 @@ fn flip(a: &mut Adjust, normalize: &mut bool, hq: &mut bool, key: SwitchKey) {
     }
 }
 
-fn rows(a: &Adjust, normalize: bool, hq: bool, tab: Tab) -> Vec<Row> {
+fn rows(a: &Adjust, normalize: bool, hq: bool, tab: Tab, denoise_skipped: bool) -> Vec<Row> {
     let level = |v: i32| (signed(v), v != 0);
     match tab {
         Tab::Picture => {
@@ -625,7 +631,17 @@ fn rows(a: &Adjust, normalize: bool, hq: bool, tab: Tab) -> Vec<Row> {
                 Row::Step("Vibrance", "A stronger colour boost than Saturation, strongest where colours are already rich.", v, vc, StepKey::Vibrance),
                 Row::Step("Color temperature", "Warmer (more orange) or cooler (more blue) white balance.", temp, a.temperature != 0, StepKey::Temperature),
                 Row::Step("Sharpen", "Crisper edges (AMD's contrast-adaptive sharpening). High levels can look harsh on grainy video.", sharpen, a.sharpen != 0, StepKey::Sharpen),
-                Row::Step("Denoise", "Smooths grain and compression noise. Uses a lot of processor time and may stutter on 4K video.", denoise, a.denoise != 0, StepKey::Denoise),
+                Row::Step(
+                    "Denoise",
+                    if denoise_skipped {
+                        "Smooths grain and compression noise. Only used on videos up to 1080p (it runs on the processor, which can't keep up with bigger ones), so it's off for this video."
+                    } else {
+                        "Smooths grain and compression noise. Only used on videos up to 1080p (it runs on the processor, which can't keep up with bigger ones)."
+                    },
+                    denoise,
+                    a.denoise != 0,
+                    StepKey::Denoise,
+                ),
                 Row::Sep,
                 Row::Switch("Deband", "Smooths visible steps in gradients such as skies and dark scenes.", a.deband, SwitchKey::Deband),
                 Row::Switch("Deinterlace", "Removes comb-like lines from old TV recordings and DVDs.", a.deinterlace, SwitchKey::Deinterlace),
@@ -665,7 +681,7 @@ pub fn draw_panel(ctx: &egui::Context, ui_state: &mut AdjustUi, a: &mut Adjust, 
         return;
     }
     let screen = ctx.screen_rect();
-    let list = rows(a, *normalize, *hq, ui_state.tab);
+    let list = rows(a, *normalize, *hq, ui_state.tab, ui_state.denoise_skipped);
     let row_h = |r: &Row| if matches!(r, Row::Sep) { 9.0 } else { ROW_H };
     let content_h: f32 = list.iter().map(row_h).sum();
     const TABS_H: f32 = 42.0;
