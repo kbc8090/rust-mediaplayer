@@ -59,6 +59,8 @@ enum Job {
     Command(String, Vec<String>),
     /// true: switch on the live-resize settings (saving the current ones); false: restore
     ResizeMode(bool),
+    /// Nothing to do, just refresh the snapshot now (instead of at the next tick)
+    Wake,
 }
 
 pub struct MpvLink {
@@ -99,7 +101,11 @@ impl MpvLink {
     }
 
     pub fn want_info(&self, on: bool) {
-        self.want_info.store(on, Ordering::Relaxed);
+        // Just switched on: refresh right away, so the overlay has its details
+        // within a moment instead of at the next 100 ms tick
+        if !self.want_info.swap(on, Ordering::Relaxed) && on {
+            let _ = self.tx.send(Job::Wake);
+        }
     }
 
     /// The most recent state. Never waits for mpv.
@@ -182,6 +188,7 @@ fn run(mpv: Arc<Mutex<Mpv>>, rx: mpsc::Receiver<Job>, state: Arc<Mutex<Snapshot>
                         resize_saved = Some(saved);
                     }
                 }
+                Job::Wake => {}
                 Job::ResizeMode(false) => {
                     if let Some(saved) = resize_saved.take() {
                         for (k, v) in &saved {

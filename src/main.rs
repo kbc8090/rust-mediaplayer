@@ -1813,6 +1813,8 @@ impl eframe::App for FluentMediaPlayer {
             } else if self.adjust_ui.open || self.adjust_ui.eq_open {
                 self.adjust_ui.open = false;
                 self.adjust_ui.eq_open = false;
+            } else if self.show_info {
+                self.show_info = false;
             } else if self.is_fullscreen {
                 self.exit_fullscreen(ctx);
             }
@@ -1980,10 +1982,15 @@ impl eframe::App for FluentMediaPlayer {
                 .rect_stroke(screen.shrink(px / 2.0), 0.0, Stroke::new(px, col));
         }
 
-        // Technical info overlay (Tab)
-        if self.show_info && self.has_file {
-            draw_info_overlay(ctx, &self.info_rows);
-            ctx.request_repaint_after(std::time::Duration::from_millis(500));
+        // Technical info overlay (Tab). It appears once mpv's details have arrived
+        // (a moment after Tab), so it never shows up half filled, and fades in/out.
+        let info_visible = self.show_info && self.has_file && !self.mpv_info.is_empty();
+        let info_t = ctx.animate_bool_with_time(egui::Id::new("info_fade"), info_visible, 0.12);
+        if info_t > 0.0 {
+            draw_info_overlay(ctx, &self.info_rows, info_t);
+            if info_visible {
+                ctx.request_repaint_after(std::time::Duration::from_millis(500));
+            }
         } else {
             ctx.data_mut(|d| d.remove::<f32>(egui::Id::new("info_value_w")));
         }
@@ -3569,7 +3576,7 @@ fn draw_speed_menu(app: &mut FluentMediaPlayer, ctx: &egui::Context) {
 /// Decoder / video details (toggle with I) — shows whether hardware decoding is active
 /// The info overlay (Tab): a frosted panel like the menus, with sections, bold
 /// labels and a value column
-fn draw_info_overlay(ctx: &egui::Context, rows: &[InfoRow]) {
+fn draw_info_overlay(ctx: &egui::Context, rows: &[InfoRow], alpha: f32) {
     if rows.is_empty() {
         return;
     }
@@ -3584,8 +3591,8 @@ fn draw_info_overlay(ctx: &egui::Context, rows: &[InfoRow]) {
     let value_font = FontId::proportional(13.0);
     let head_font = FontId::new(11.5, FontFamily::Name("semibold".into()));
     let foot_font = FontId::proportional(12.0);
-    let (label_col, value_col) = (Color32::from_rgb(236, 236, 236), Color32::from_rgb(208, 208, 208));
-    let dim = Color32::from_rgb(150, 150, 150);
+    let (label_col, value_col) = (Color32::from_rgb(236, 236, 236).gamma_multiply(alpha), Color32::from_rgb(208, 208, 208).gamma_multiply(alpha));
+    let dim = Color32::from_rgb(150, 150, 150).gamma_multiply(alpha);
     let width_of = |t: &str, f: &FontId| p.layout_no_wrap(t.to_owned(), f.clone(), Color32::WHITE).size().x;
 
     let label_w = rows
@@ -3620,9 +3627,13 @@ fn draw_info_overlay(ctx: &egui::Context, rows: &[InfoRow]) {
         pos2(screen.left() + OSD_LEFT, screen.top() + INFO_TOP),
         vec2(width, PAD_Y * 2.0 + content_h + FOOT_H),
     );
-    glass::shadow(&p, rect, 8.0, 1.0);
-    glass::fill(&p, rect, 8.0, Color32::from_rgb(43, 43, 43), 1.0);
-    p.rect_stroke(rect.shrink(0.5), 8.0, Stroke::new(1.0_f32, glass::edge(Color32::from_rgba_premultiplied(26, 26, 26, 26))));
+    glass::shadow(&p, rect, 8.0, alpha);
+    glass::fill(&p, rect, 8.0, Color32::from_rgb(43, 43, 43), alpha);
+    p.rect_stroke(
+        rect.shrink(0.5),
+        8.0,
+        Stroke::new(1.0_f32, glass::edge(Color32::from_rgba_premultiplied(26, 26, 26, 26)).gamma_multiply(alpha)),
+    );
 
     let x = rect.left() + PAD_X;
     let vx = x + label_w + COL_GAP;
@@ -3646,7 +3657,7 @@ fn draw_info_overlay(ctx: &egui::Context, rows: &[InfoRow]) {
     let line_y = y + PAD_Y - 2.0;
     p.line_segment(
         [pos2(rect.left() + 1.0, line_y), pos2(rect.right() - 1.0, line_y)],
-        Stroke::new(1.0_f32, Color32::from_rgba_premultiplied(26, 26, 26, 26)),
+        Stroke::new(1.0_f32, Color32::from_rgba_premultiplied(26, 26, 26, 26).gamma_multiply(alpha)),
     );
     p.text(pos2(x, (line_y + rect.bottom()) / 2.0), Align2::LEFT_CENTER, footer, foot_font, dim);
 }
