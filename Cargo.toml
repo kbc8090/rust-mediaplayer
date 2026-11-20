@@ -8,18 +8,19 @@ name = "RustMediaPlayer"
 path = "src/main.rs"
 
 [dependencies]
-# Activates eframe with the native OpenGL/Glow window management hooks
-# (default features off: drops the screen-reader bridge and Linux-only window
-# backends the player doesn't use; "x11" only matters when checking on Linux)
+# Window, input and UI (OpenGL). Default features off: drops the screen-reader
+# bridge and Linux-only window backends the player doesn't use ("x11" only
+# matters when checking the code on Linux)
 eframe = { version = "0.27", default-features = false, features = ["glow", "default_fonts", "x11"] }
 
-# Explicitly pull in egui_glow to get access to native canvas paint callbacks
+# OpenGL paint callbacks (video, frosted glass, thumbnails)
 egui_glow = "0.27"
 
-# Critical: You must tell libmpv2 to expose its internal OpenGL Init bindings
-libmpv2 = { version = "6.0.0", features = ["render"] }
+# Rust bindings to libmpv (the DLL itself comes from the mpv builds); "render"
+# adds the OpenGL render API the video is drawn with
+libmpv2 = { version = "7.0.1", features = ["render"] }
 
-# Gives access to the native window handle (HWND) from eframe's Frame
+# The native window handle (HWND), for the Windows integration in taskbar.rs
 raw-window-handle = "0.6"
 
 [target.'cfg(windows)'.build-dependencies]
@@ -27,8 +28,8 @@ raw-window-handle = "0.6"
 winresource = "0.1"
 
 [profile.release]
-opt-level = 3           # Maximize pure execution speed (replaces "s")
-lto = true              # Deep Link-Time Optimization across all crates
-codegen-units = 1       # Reduces parallelism to allow maximum compiler optimization
-panic = "abort"         # Removes stack unwinding overhead for raw speed and smaller binary
-strip = true            # Hard strip all symbols out of the final executable
+opt-level = 3
+lto = true              # optimise across crates
+codegen-units = 1       # slower build, faster program
+panic = "abort"         # smaller binary
+strip = true            # no debug symbols in the .exe
