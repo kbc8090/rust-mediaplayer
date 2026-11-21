@@ -6,7 +6,62 @@ on:
   workflow_dispatch:
 
 jobs:
+  # ffmpeg.exe for Save As…: yt-dlp uses it to join the downloaded video and audio
+  # into one file. Built from FFmpeg's source with only what joining needs (no
+  # codecs, no network), so it's a few MB instead of 100+. Cached: it only builds
+  # again when FFMPEG_VERSION or FFMPEG_RECIPE changes. If this job ever fails,
+  # the Windows build bundles a ready-made full ffmpeg instead.
+  ffmpeg:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    env:
+      FFMPEG_VERSION: n8.1.3
+      FFMPEG_RECIPE: "1"   # bump this after changing the configure line below
+    steps:
+      - name: Restore ffmpeg.exe from Cache
+        id: cache
+        uses: actions/cache@v5
+        with:
+          path: ffmpeg-out
+          key: ffmpeg-mini-${{ env.FFMPEG_VERSION }}-r${{ env.FFMPEG_RECIPE }}
+
+      - name: Build a Small ffmpeg.exe
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q gcc-mingw-w64-x86-64
+          git clone -q --depth 1 --branch "$FFMPEG_VERSION" https://github.com/FFmpeg/FFmpeg.git ffmpeg-src
+          cd ffmpeg-src
+          # Cross-compiled for 64-bit Windows, one self-contained .exe. Stream copy
+          # only: reads and writes the usual containers (mp4/m4a, webm/mkv, ts,
+          # mp3, ogg/opus, flac, wav), with their parsers and bitstream filters.
+          ./configure \
+            --target-os=mingw32 --arch=x86_64 --cross-prefix=x86_64-w64-mingw32- \
+            --enable-w32threads --extra-ldflags=-static --disable-x86asm \
+            --disable-everything --disable-autodetect --disable-doc --disable-debug \
+            --disable-network --disable-ffplay --disable-ffprobe --disable-avdevice \
+            --enable-small \
+            --enable-protocol=file,pipe \
+            --enable-demuxer=mov,matroska,mpegts,aac,mp3,ogg,flac,wav,flv,ac3,eac3 \
+            --enable-muxer=mp4,mov,ipod,matroska,webm,mp3,ogg,opus,adts,flac,wav \
+            --enable-parser=aac,ac3,av1,flac,h264,hevc,mpegaudio,opus,vorbis,vp8,vp9 \
+            --enable-bsfs
+          make -j"$(nproc)"
+          mkdir -p ../ffmpeg-out
+          cp ffmpeg.exe ../ffmpeg-out/
+          ls -l ../ffmpeg-out
+
+      - name: Hand ffmpeg.exe to the Windows Build
+        uses: actions/upload-artifact@v6
+        with:
+          name: ffmpeg-mini
+          path: ffmpeg-out/ffmpeg.exe
+          retention-days: 1
+
   build-windows:
+    needs: ffmpeg
+    # (runs even if the ffmpeg job failed: it falls back to a ready-made ffmpeg)
+    if: ${{ !cancelled() }}
     runs-on: windows-latest
 
     steps:
@@ -74,17 +129,40 @@ jobs:
           & "C:\Program Files\7-Zip\7z.exe" x $archive -o"C:\mpv_dev" -y
           if ($LASTEXITCODE -ne 0) { Write-Error "Extracting libmpv failed"; exit 1 }
 
-          # Locate the import library and flatten it to the root as mpv.lib
-          $libFile = Get-ChildItem -Path "C:\mpv_dev" -Filter "*mpv*.lib" -Recurse | Select-Object -First 1
-          if ($null -eq $libFile) {
-              $libFile = Get-ChildItem -Path "C:\mpv_dev" -Filter "*mpv*.dll.a" -Recurse | Select-Object -First 1
+          # The link library, as C:\mpv_dev\mpv.lib. Made from the DLL's own list of
+          # functions with Microsoft's tools: the player loads libmpv on first use
+          # ("delay-loaded", see build.rs) so it can report a missing DLL itself,
+          # and that only works with this kind of library. The archive's own
+          # libmpv.dll.a is the fallback (it links fine, just without that).
+          $dll = Get-ChildItem -Path "C:\mpv_dev" -Recurse -File |
+                 Where-Object { $_.Name -like '*mpv*' -and $_.Extension -eq '.dll' } |
+                 Select-Object -First 1
+          if ($null -eq $dll) { Write-Error "No libmpv DLL inside the downloaded archive"; exit 1 }
+          $made = $false
+          try {
+            $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+            $libExe = & $vswhere -latest -products * -find "VC\Tools\MSVC\**\bin\Hostx64\x64\lib.exe" | Select-Object -First 1
+            $dumpbin = Join-Path (Split-Path $libExe) "dumpbin.exe"
+            $exports = & $dumpbin /nologo /exports $dll.FullName |
+                       ForEach-Object { if ($_ -match '^\s+\d+\s+[0-9A-Fa-f]+\s+[0-9A-Fa-f]{8}\s+(\S+)') { $Matches[1] } }
+            if (@($exports).Count -gt 0) {
+              Set-Content -Path "C:\mpv_dev\mpv.def" -Value (@("LIBRARY $($dll.Name)", "EXPORTS") + $exports) -Encoding ascii
+              & $libExe /nologo /def:C:\mpv_dev\mpv.def /machine:x64 /out:C:\mpv_dev\mpv.lib
+              if ($LASTEXITCODE -eq 0) {
+                $made = $true
+                Write-Host "Made mpv.lib for $($dll.Name) ($(@($exports).Count) functions)"
+                # build.rs delay-loads the DLL by this name
+                echo "MPV_DLL_NAME=$($dll.Name)" >> $env:GITHUB_ENV
+              }
+            }
+          } catch {
+            Write-Warning "Making mpv.lib failed: $_"
           }
-          if ($libFile) {
-              Copy-Item $libFile.FullName -Destination "C:\mpv_dev\mpv.lib" -Force
-              Write-Host "Staged link library from $($libFile.Name) as C:\mpv_dev\mpv.lib"
-          } else {
-              Write-Error "Could not find an mpv import library inside the downloaded archive."
-              exit 1
+          if (-not $made) {
+            $libFile = Get-ChildItem -Path "C:\mpv_dev" -Filter "*mpv*.dll.a" -Recurse | Select-Object -First 1
+            if ($null -eq $libFile) { Write-Error "Could not find an mpv import library inside the downloaded archive."; exit 1 }
+            Copy-Item $libFile.FullName -Destination "C:\mpv_dev\mpv.lib" -Force
+            Write-Warning "Using the archive's $($libFile.Name) as mpv.lib: a missing $($dll.Name) won't get the player's own message"
           }
 
           # Inject paths into the MSVC linker environment
@@ -123,6 +201,54 @@ jobs:
               Write-Error "Could not find the mpv runtime library (.dll) to package."
               exit 1
           }
+
+      # yt-dlp plays and saves links (it keeps itself up to date after this).
+      # Deno is the JavaScript runtime yt-dlp needs for YouTube; yt-dlp finds
+      # deno.exe in its own folder. Both are the latest releases at build time.
+      - name: Bundle yt-dlp and Deno
+        shell: pwsh
+        run: |
+          $bundle = "target\bundle"
+          curl.exe -fsSL --retry 5 --retry-delay 10 -o "$bundle\yt-dlp.exe" "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe"
+          if ($LASTEXITCODE -ne 0) { Write-Error "Could not download yt-dlp.exe"; exit 1 }
+
+          $zip = "$env:RUNNER_TEMP\deno.zip"
+          curl.exe -fsSL --retry 5 --retry-delay 10 -o $zip "https://github.com/denoland/deno/releases/latest/download/deno-x86_64-pc-windows-msvc.zip"
+          if ($LASTEXITCODE -ne 0) { Write-Error "Could not download Deno"; exit 1 }
+          Expand-Archive -Path $zip -DestinationPath $bundle -Force
+
+          # Shows in the log whether yt-dlp found Deno beside it
+          & "$bundle\yt-dlp.exe" -v 2>&1 | Select-String "JS runtimes"
+          & "$bundle\deno.exe" --version
+
+      - name: Fetch the Small ffmpeg.exe
+        continue-on-error: true
+        uses: actions/download-artifact@v8
+        with:
+          name: ffmpeg-mini
+          path: target/bundle
+
+      - name: Check ffmpeg.exe
+        shell: pwsh
+        run: |
+          $ff = "target\bundle\ffmpeg.exe"
+          $works = $false
+          if (Test-Path $ff) {
+            $works = ((& $ff -hide_banner -version 2>$null | Select-Object -First 1) -match '^ffmpeg version')
+          }
+          if (-not $works) {
+            # Fallback: yt-dlp's own full Windows build (about 130 MB)
+            Write-Warning "The small ffmpeg.exe is missing or doesn't run; bundling a full ffmpeg build instead"
+            $zip = "$env:RUNNER_TEMP\ffmpeg-full.zip"
+            curl.exe -fsSL --retry 5 --retry-delay 10 -o $zip "https://github.com/yt-dlp/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip"
+            if ($LASTEXITCODE -ne 0) { Write-Error "Could not download ffmpeg"; exit 1 }
+            Expand-Archive -Path $zip -DestinationPath "$env:RUNNER_TEMP\ffmpeg-full" -Force
+            $exe = Get-ChildItem "$env:RUNNER_TEMP\ffmpeg-full" -Recurse -Filter "ffmpeg.exe" | Select-Object -First 1
+            if ($null -eq $exe) { Write-Error "No ffmpeg.exe in the full build"; exit 1 }
+            Copy-Item $exe.FullName $ff -Force
+          }
+          & $ff -hide_banner -version | Select-Object -First 1
+          Write-Host ("ffmpeg.exe: {0:N1} MB" -f ((Get-Item $ff).Length / 1MB))
 
       - name: Upload Complete Media Player Package
         uses: actions/upload-artifact@v6
