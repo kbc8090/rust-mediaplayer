@@ -210,6 +210,10 @@ const VOL_W: f32 = 90.0;
 const VOL_GAP: f32 = 7.0;
 const WIN_BTN_W: f32 = 46.0;
 const WIN_BTN_H: f32 = 34.0;
+/// Resize strip along the window edge over the window buttons (the top edge above
+/// all three, the right edge beside Close), like Windows' own windows. The buttons
+/// work everywhere else. (Not when maximised: then the buttons reach the corner.)
+const BTN_EDGE: f32 = 5.0;
 /// What the Deinterlace switch sets: mpv's "auto" deinterlaces only frames the file
 /// marks as interlaced. "yes" ran a CPU deinterlacer on every frame of every video,
 /// progressive ones included, doubling the frame count. (mpv doesn't make "auto" its
@@ -1918,13 +1922,23 @@ fn hit_edge(p: Pos2, screen: Rect) -> Option<(egui::viewport::ResizeDirection, e
     const EDGE: f32 = 6.0;
     const CORNER: f32 = 14.0;
 
-    // Keep the close/maximize/minimize buttons clickable in the top-right corner
-    if p.y < WIN_BTN_H && p.x > screen.right() - WIN_BTN_W * 3.0 {
-        return None;
-    }
-
     let (dl, dr) = (p.x - screen.left(), screen.right() - p.x);
     let (dt, db) = (p.y - screen.top(), screen.bottom() - p.y);
+
+    // Over the minimize / maximize / close buttons only a thin strip along the edge
+    // resizes, so the buttons stay easy to hit
+    if p.y < WIN_BTN_H && p.x > screen.right() - WIN_BTN_W * 3.0 {
+        if (dt < BTN_EDGE && dr < CORNER) || (dr < BTN_EDGE && dt < CORNER) {
+            return Some((D::NorthEast, C::ResizeNeSw));
+        }
+        if dt < BTN_EDGE {
+            return Some((D::North, C::ResizeVertical));
+        }
+        if dr < BTN_EDGE {
+            return Some((D::East, C::ResizeHorizontal));
+        }
+        return None;
+    }
 
     if dl < CORNER && dt < CORNER { return Some((D::NorthWest, C::ResizeNwSe)); }
     if dr < CORNER && dt < CORNER { return Some((D::NorthEast, C::ResizeNeSw)); }

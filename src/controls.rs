@@ -387,10 +387,19 @@ pub(crate) fn draw_top_bar(app: &mut FluentMediaPlayer, ctx: &egui::Context, t: 
                         pos2(screen.right() - WIN_BTN_W * (3 - k) as f32, screen.top()),
                         vec2(WIN_BTN_W, WIN_BTN_H),
                     );
+                    // The strip along the window edge resizes instead (see hit_edge), so
+                    // the button only reacts inside it (unless maximised)
+                    let mut hit_r = r;
+                    if !maximized {
+                        hit_r.min.y += BTN_EDGE;
+                        if k == 2 {
+                            hit_r.max.x -= BTN_EDGE;
+                        }
+                    }
                     // click_and_drag: a button must also "own" drags that start on it,
                     // otherwise egui hands the drag to the draggable title strip behind
                     // it and the window moves
-                    let resp = ui.interact(r, ui.id().with(("winbtn", k)), Sense::click_and_drag());
+                    let resp = ui.interact(hit_r, ui.id().with(("winbtn", k)), Sense::click_and_drag());
                     let label = match k {
                         0 => "Minimize",
                         1 if maximized => "Restore Down",
@@ -401,7 +410,7 @@ pub(crate) fn draw_top_bar(app: &mut FluentMediaPlayer, ctx: &egui::Context, t: 
                     // Like Windows: lighter while held down (darker for close), and no
                     // highlight while held with the pointer moved off the button
                     let held = resp.is_pointer_button_down_on();
-                    let inside = ctx.input(|i| i.pointer.latest_pos()).is_some_and(|pp| r.contains(pp));
+                    let inside = ctx.input(|i| i.pointer.latest_pos()).is_some_and(|pp| hit_r.contains(pp));
                     let pressed = held && inside;
                     if pressed || (resp.hovered() && !held) {
                         // Windows' own colours (the close red differs on 10 and 11)
