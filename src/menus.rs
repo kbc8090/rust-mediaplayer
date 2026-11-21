@@ -23,6 +23,9 @@ pub(crate) const SHORTCUTS: &[(&[&str], &str)] = &[
     (&["Ctrl+O"], "Open file"),
     (&["Ctrl+U"], "Open URL"),
     (&["Ctrl+S"], "Save video as (online videos)"),
+    (&["Ctrl+Shift+S"], "Save clip as"),
+    (&["[  ]"], "Clip: start / end at the playhead"),
+    (&["Z"], "Clip: zoom the seek bar in / out"),
     (&["Ctrl+V"], "Play a copied link"),
     (&["E"], "Picture & Sound"),
     (&["Tab"], "Video info"),
@@ -329,6 +332,10 @@ pub(crate) fn draw_main_menu(app: &mut FluentMediaPlayer, ctx: &egui::Context) {
             MenuRow::Item { key: "save", label: "Save video as\u{2026}", hint: Some("Ctrl+S"), mark: Mark::None }
         });
     }
+    // Save clip as… for anything playing (a link or a file here)
+    if app.has_file && app.duration > 1.0 {
+        rows.push(MenuRow::Item { key: "clip", label: "Save clip as\u{2026}", hint: Some("Ctrl+Shift+S"), mark: Mark::None });
+    }
     rows.extend([
         MenuRow::Sep,
         MenuRow::Item { key: "adjust", label: "Picture & Sound", hint: Some("E"), mark: Mark::None },
@@ -478,6 +485,7 @@ pub(crate) fn draw_main_menu(app: &mut FluentMediaPlayer, ctx: &egui::Context) {
         Some("autoplay") => app.autoplay = !app.autoplay,
         Some("open_url") => app.show_url_box(),
         Some("save") => app.ask_save_folder(),
+        Some("clip") => app.start_clip(),
         Some("cancel_save") => app.save = None,
         Some("adjust") => {
             app.adjust_ui.open = true;

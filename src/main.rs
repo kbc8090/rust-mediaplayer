@@ -386,8 +386,14 @@ struct FluentMediaPlayer {
     retried_url: Option<String>,
     /// The link whose preview stream the thumbnails are using
     link_thumbs: Option<String>,
-    /// Save As…: the link and title waiting for a folder to be picked
-    save_pending: Option<(String, String)>,
+    /// Save video as… / Save clip as…: what to save, waiting for a folder
+    save_pending: Option<SavePending>,
+    /// Save clip as…: the clip being set up (panel at the top, ends on the seek bar)
+    clip: Option<ClipUi>,
+    /// The window's title as Windows has it (taskbar thumbnail, Alt+Tab)
+    os_title: String,
+    /// A right-button press that will open the main menu where it's let go
+    right_press: bool,
     /// A link being saved (or just saved): the card in the top right
     save: Option<SaveJob>,
     /// Current and last-written window geometry
@@ -640,6 +646,9 @@ impl FluentMediaPlayer {
             retried_url: None,
             link_thumbs: None,
             save_pending: None,
+            clip: None,
+            os_title: String::new(),
+            right_press: false,
             save: None,
             win_state: saved,
             win_saved: saved,
@@ -769,6 +778,7 @@ impl FluentMediaPlayer {
         self.eof = false;
         self.chapters = Arc::new(Vec::new());
         self.link_thumbs = None;
+        self.clip = None;
         if is_url(path) {
             self.thumbs.forget();
         } else {
@@ -1288,8 +1298,15 @@ impl eframe::App for FluentMediaPlayer {
         // No button ever keeps keyboard focus. egui moves focus between buttons with
         // Tab (our info key), and a focused button also "clicks" on Space / Enter,
         // so Tab then Space would have paused *and* pressed some button.
-        // (The Open URL box's text field is the exception while the box is open.)
-        let typing = self.url_box.is_some().then(|| egui::Id::new(URL_FIELD));
+        // (The Open URL box's text field, and a clip time being typed, are the
+        // exceptions while they're open.)
+        let typing = if self.url_box.is_some() {
+            Some(egui::Id::new(URL_FIELD))
+        } else if self.clip.as_ref().is_some_and(|c| c.editing.is_some()) {
+            Some(egui::Id::new(CLIP_FIELD))
+        } else {
+            None
+        };
         ctx.memory_mut(|m| {
             if let Some(id) = m.focused() {
                 if Some(id) != typing {
@@ -1368,10 +1385,24 @@ impl eframe::App for FluentMediaPlayer {
             // A video just ended: go on to the next one in the folder if wanted
             // (a playlist always plays on)
             let play_on = self.autoplay || self.playlist.is_some();
-            if snap.eof && !self.snap_eof && self.has_file && play_on && !self.repeat && self.has_next() {
+            if snap.eof && !self.snap_eof && self.has_file && play_on && !self.repeat && self.has_next() && self.clip.is_none() {
                 self.play_adjacent(1);
             }
             self.snap_eof = snap.eof;
+        }
+        // Setting up a clip with "Play the clip on repeat": back to its start each
+        // time playback runs past its end (not when sent past it on purpose)
+        if let Some((start, end)) = self.clip.as_ref().filter(|c| c.repeat && c.dragging.is_none()).map(|c| (c.start, c.end)) {
+            let ran_past = self.is_playing && self.time_pos >= end && self.time_pos < end + 1.5;
+            let ended = self.eof && end >= self.duration - 0.5;
+            if self.has_file && (ran_past || ended) {
+                self.seek_to(start);
+                if ended {
+                    self.link.set("pause", "no");
+                    self.is_playing = true;
+                    self.eof = false;
+                }
+            }
         }
         self.link.want_info(self.show_info);
 
@@ -1632,7 +1663,12 @@ impl eframe::App for FluentMediaPlayer {
             esc:   i.key_pressed(egui::Key::Escape),
             open:  i.modifiers.ctrl && i.key_pressed(egui::Key::O),
             open_url: i.modifiers.ctrl && i.key_pressed(egui::Key::U),
-            save: i.modifiers.ctrl && i.key_pressed(egui::Key::S),
+            save: i.modifiers.ctrl && !i.modifiers.shift && i.key_pressed(egui::Key::S),
+            clip: i.modifiers.ctrl && i.modifiers.shift && i.key_pressed(egui::Key::S),
+            // ([ and ] by the character typed: egui 0.27 has no key codes for them)
+            clip_start: i.events.iter().any(|e| matches!(e, egui::Event::Text(t) if t == "[")),
+            clip_end: i.events.iter().any(|e| matches!(e, egui::Event::Text(t) if t == "]")),
+            zoom: !i.modifiers.ctrl && i.key_pressed(egui::Key::Z),
             pasted: i.events.iter().find_map(|e| if let egui::Event::Paste(t) = e { Some(t.clone()) } else { None }),
             rotate: !i.modifiers.ctrl && i.key_pressed(egui::Key::R),
             adjust: !i.modifiers.ctrl && i.key_pressed(egui::Key::E),
@@ -1643,7 +1679,7 @@ impl eframe::App for FluentMediaPlayer {
                 || i.events.iter().any(|e| matches!(e, egui::Event::Key { pressed: true, .. })),
             pointer: i.pointer.hover_pos(),
         });
-        if self.url_box.is_some() {
+        if self.url_box.is_some() || self.clip.as_ref().is_some_and(|c| c.editing.is_some()) {
             inp.keys_for_typing();
         }
         // Alt+Tab back to the player, letting go of Alt a moment before Tab: Windows
@@ -1691,13 +1727,14 @@ impl eframe::App for FluentMediaPlayer {
             let over_top = inp.pointer.is_some_and(|p| p.y < TOP_H);
             let over_bottom = inp.pointer.is_some_and(|p| p.y > screen.bottom() - BOTTOM_H);
             let speed_menu = self.speed_menu;
-            self.show_controls = speed_menu || (armed && over_bottom);
+            // (setting up a clip: its ends are on the seek bar, so it stays)
+            self.show_controls = speed_menu || self.clip.is_some() || (armed && over_bottom);
             self.show_top = self.main_menu || (armed && over_top);
         } else if settling {
             self.show_controls = true;
             self.show_top = true;
         } else {
-            self.show_controls = !self.has_file || !self.is_playing || menu_open || near_edge || idle < HIDE_AFTER;
+            self.show_controls = !self.has_file || !self.is_playing || menu_open || near_edge || idle < HIDE_AFTER || self.clip.is_some();
             self.show_top = self.show_controls;
         }
         // Hide the mouse cursor too once it has been still for a moment
@@ -1722,6 +1759,19 @@ impl eframe::App for FluentMediaPlayer {
         if inp.open  { self.main_menu = false; self.show_open_dialog(); }
         if inp.open_url { self.show_url_box(); }
         if inp.save { self.ask_save_folder(); }
+        if inp.clip { self.start_clip(); }
+        if let Some(c) = self.clip.as_mut() {
+            if inp.clip_start {
+                c.set(ClipEnd::Start, self.time_pos, self.duration);
+            }
+            if inp.clip_end {
+                c.set(ClipEnd::End, self.time_pos, self.duration);
+            }
+            if inp.zoom {
+                c.zoom = !c.zoom;
+                c.refit(self.duration);
+            }
+        }
         // Ctrl+V on the player with a link on the clipboard plays it straight away
         if let Some(url) = inp.pasted.as_deref().and_then(normalize_url) {
             self.open_url(&url);
@@ -1751,6 +1801,10 @@ impl eframe::App for FluentMediaPlayer {
         if inp.esc {
             if self.url_box.is_some() {
                 self.url_box = None;
+            } else if let Some(c) = self.clip.as_mut().filter(|c| c.editing.is_some()) {
+                c.editing = None; // (stop typing, keep the old time)
+            } else if self.clip.is_some() {
+                self.clip = None;
             } else if self.show_keys {
                 self.show_keys = false;
             } else if self.speed_menu {
@@ -1792,18 +1846,9 @@ impl eframe::App for FluentMediaPlayer {
                 if resp.double_clicked() {
                     self.toggle_fullscreen(ctx);
                 }
-                // Right-click → the main menu, where the pointer is (on letting go,
-                // like Windows' own right-click menus)
-                if self.right_click_menu && resp.secondary_clicked() {
-                    if let Some(p) = resp.interact_pointer_pos().or_else(|| ctx.pointer_latest_pos()) {
-                        self.main_menu = true;
-                        self.menu_at = Some(p);
-                        self.menu_sub = None;
-                        self.speed_menu = false;
-                    }
-                }
-                // Drag anywhere on the video → move the window
-                if resp.drag_started() && !self.is_fullscreen && edge.is_none() {
+
+                // Drag anywhere on the video (left button) → move the window
+                if resp.drag_started_by(egui::PointerButton::Primary) && !self.is_fullscreen && edge.is_none() {
                     ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
                 }
 
@@ -1857,6 +1902,33 @@ impl eframe::App for FluentMediaPlayer {
         }
         glass::set_style(self.glass);
 
+        // Right-click on the video, or on the title / control bars over it: the
+        // main menu, where the button is let go (like Windows' own right-click
+        // menus; holding it and moving first works too)
+        let (r_down, r_up, origin, at) = ctx.input(|i| {
+            (
+                i.pointer.button_pressed(egui::PointerButton::Secondary),
+                i.pointer.button_released(egui::PointerButton::Secondary),
+                i.pointer.press_origin(),
+                i.pointer.latest_pos(),
+            )
+        });
+        if r_down {
+            let bars = [egui::Id::new("top_bar"), egui::Id::new("bottom_bar")];
+            self.right_press = self.right_click_menu
+                && origin
+                    .and_then(|o| ctx.layer_id_at(o))
+                    .is_some_and(|l| l.order == egui::Order::Background || bars.contains(&l.id));
+        }
+        if r_up && std::mem::take(&mut self.right_press) {
+            if let Some(p) = at {
+                self.main_menu = true;
+                self.menu_at = Some(p);
+                self.menu_sub = None;
+                self.speed_menu = false;
+            }
+        }
+
         // A click on the video itself (not on the bars, menus or panels) closes the
         // menu and the Picture & Sound / equalizer panels
         let on_video = ctx.input(|i| i.pointer.any_pressed().then(|| i.pointer.press_origin()).flatten())
@@ -1891,6 +1963,14 @@ impl eframe::App for FluentMediaPlayer {
         if self.online != online_before {
             self.apply_online();
         }
+        // Save clip as…: its panel at the top
+        if let Some(c) = self.clip.as_mut() {
+            match adjust::draw_clip_panel(ctx, c, self.duration, self.time_pos, self.accent) {
+                adjust::ClipAction::Save => self.ask_clip_folder(),
+                adjust::ClipAction::Close => self.clip = None,
+                adjust::ClipAction::None => {}
+            }
+        }
         if let Some(b) = self.url_box.as_mut() {
             match adjust::draw_url_box(ctx, b, self.accent) {
                 adjust::UrlBoxAction::Open(text) => {
@@ -1904,6 +1984,13 @@ impl eframe::App for FluentMediaPlayer {
         }
         if self.has_file || self.link_error.is_some() || self.link_retry.is_some() {
             draw_link_status(self, ctx);
+        }
+
+        // The window's title as Windows shows it (taskbar thumbnail, Alt+Tab)
+        let title = if self.has_file { format!("{} - RustMediaPlayer", self.file_name()) } else { "RustMediaPlayer".to_owned() };
+        if title != self.os_title {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
+            self.os_title = title;
         }
 
         // The save card: with the title bar while saving; on its own for a few
@@ -2029,6 +2116,12 @@ struct InputSnapshot {
     f: bool, d: bool, enter: bool, m: bool, n: bool, p: bool, info: bool, hw: bool, esc: bool, open: bool, rotate: bool, adjust: bool,
     open_url: bool,
     save: bool,
+    /// Save clip as… (Ctrl+Shift+S), and while setting one up: [ / ] set the
+    /// start / end to now, Z zooms the seek bar in or out
+    clip: bool,
+    clip_start: bool,
+    clip_end: bool,
+    zoom: bool,
     /// The window came back to the front this frame, and whether Tab is held
     focus_back: bool,
     tab_down: bool,
@@ -2062,6 +2155,10 @@ impl InputSnapshot {
         self.adjust = false;
         self.open_url = false;
         self.save = false;
+        self.clip = false;
+        self.clip_start = false;
+        self.clip_end = false;
+        self.zoom = false;
         self.pasted = None;
     }
 }
@@ -2318,6 +2415,9 @@ fn main() -> eframe::Result<()> {
     if !libmpv_loads() {
         return Ok(());
     }
+    // Anything the player starts (yt-dlp and the Deno it runs, ffmpeg; also
+    // mpv's own yt-dlp runs) ends when the player does, however it closes
+    taskbar::end_children_with_player();
 
     // Single window: if the player is already running, hand it the file (it plays
     // it in place of the current one) and leave
@@ -2332,7 +2432,7 @@ fn main() -> eframe::Result<()> {
     }
 
     let mut viewport = egui::ViewportBuilder::default()
-        .with_title("Rust Media Player")
+        .with_title("RustMediaPlayer")
         .with_inner_size([960.0, 540.0])
         .with_min_inner_size([480.0, 300.0])
         // We draw our own title bar and window buttons

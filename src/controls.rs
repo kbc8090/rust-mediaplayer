@@ -344,7 +344,7 @@ pub(crate) fn draw_top_bar(app: &mut FluentMediaPlayer, ctx: &egui::Context, t: 
                 let pressed_on_edge = ctx
                     .input(|i| i.pointer.press_origin())
                     .is_some_and(|o| hit_edge(o, screen).is_some());
-                if drag.drag_started() && !pressed_on_edge {
+                if drag.drag_started_by(egui::PointerButton::Primary) && !pressed_on_edge {
                     ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
                 }
                 // (fullscreen, like double-clicking the video; the maximise button
@@ -358,7 +358,7 @@ pub(crate) fn draw_top_bar(app: &mut FluentMediaPlayer, ctx: &egui::Context, t: 
             let mc = pos2(MENU_X, MENU_Y);
             let menu = hit_at(ui, mc, "menu", "Menu", t, false);
             app.menu_anchor = menu.rect;
-            if app.main_menu && !menu.hovered() {
+            if app.main_menu && app.menu_at.is_none() && !menu.hovered() {
                 // keep it highlighted while its menu is open
                 p.rect_filled(Rect::from_center_size(mc, vec2(BTN_BOX, BTN_BOX)), 8.0, Color32::from_white_alpha((8.0 * t) as u8));
             }
@@ -494,7 +494,7 @@ pub(crate) fn draw_bottom_bar(app: &mut FluentMediaPlayer, ctx: &egui::Context, 
             let pressed_on_edge = ctx
                 .input(|i| i.pointer.press_origin())
                 .is_some_and(|o| hit_edge(o, screen).is_some());
-            if bg.drag_started() && !app.is_fullscreen && !pressed_on_edge {
+            if bg.drag_started_by(egui::PointerButton::Primary) && !app.is_fullscreen && !pressed_on_edge {
                 ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
             }
 
@@ -510,32 +510,65 @@ pub(crate) fn draw_bottom_bar(app: &mut FluentMediaPlayer, ctx: &egui::Context, 
             const KNOB_INSET: f32 = 7.5;
             let (k0, kw) = (sr.left() + KNOB_INSET, sr.width() - 2.0 * KNOB_INSET);
             let frac_at = |x: f32| ((x - k0) / kw).clamp(0.0, 1.0);
-            let dragging = seek.is_pointer_button_down_on() || seek.dragged();
+            // The stretch of the video the bar stands for: all of it, or (setting up
+            // a clip) the part around the clip
+            let duration = app.duration;
+            let (v0, v1) = app.clip.as_ref().map_or((0.0, duration), |c| c.bar_range(duration));
+            let span = (v1 - v0).max(1e-6);
+            let to_frac = |t: f64| ((t - v0) / span).clamp(0.0, 1.0) as f32;
+            let to_secs = |f: f32| v0 + f as f64 * span;
+
+            // A clip's ends: drag them along the bar (they sit on top of the seek bar)
+            let mut end_drag: Option<(ClipEnd, f32)> = None;
+            if let Some(c) = app.clip.as_mut() {
+                for which in [ClipEnd::Start, ClipEnd::End] {
+                    let x = k0 + kw * to_frac(c.time(which));
+                    let hr = Rect::from_center_size(pos2(x, seek_y), vec2(14.0, 26.0));
+                    let h = ui.interact(hr, ui.id().with(("clip_end", which == ClipEnd::Start)), Sense::click_and_drag());
+                    if h.hovered() || h.dragged() {
+                        ctx.set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+                    }
+                    if h.dragged_by(egui::PointerButton::Primary) {
+                        if let Some(pp) = h.interact_pointer_pos() {
+                            c.drag(which, to_secs(frac_at(pp.x)), duration);
+                            end_drag = Some((which, to_frac(c.time(which))));
+                        }
+                    }
+                    if h.drag_stopped() {
+                        c.dragging = None;
+                        c.refit(duration);
+                    }
+                }
+            }
+
+            let dragging = end_drag.is_none()
+                && (seek.dragged_by(egui::PointerButton::Primary)
+                    || (seek.is_pointer_button_down_on() && ctx.input(|i| i.pointer.primary_down())));
             if dragging {
                 if let Some(pos) = seek.interact_pointer_pos() {
                     let f = frac_at(pos.x);
                     app.drag_frac = Some(f);
-                    if app.duration > 0.0 { app.seek_to(f as f64 * app.duration); }
+                    if duration > 0.0 { app.seek_to(to_secs(f)); }
                 }
             } else {
                 app.drag_frac = None;
             }
-            let frac = app.drag_frac.unwrap_or(if app.duration > 0.0 {
-                (app.time_pos / app.duration).clamp(0.0, 1.0) as f32
-            } else { 0.0 });
-            let hot = seek.hovered() || dragging;
+            let frac = app.drag_frac.unwrap_or(if duration > 0.0 { to_frac(app.time_pos) } else { 0.0 });
+            let hot = seek.hovered() || dragging || end_drag.is_some();
 
             let track_h = if hot { 4.0 } else { 3.0 };
             let (y0, y1) = (seek_y - track_h / 2.0, seek_y + track_h / 2.0);
             pill(&p, Rect::from_min_max(pos2(sr.left(), y0), pos2(sr.right(), y1)), TRACK.gamma_multiply(t));
             let fill_x = k0 + kw * frac;
-            pill(&p, Rect::from_min_max(pos2(sr.left(), y0), pos2(fill_x, y1)), accent);
+            if app.clip.is_none() {
+                pill(&p, Rect::from_min_max(pos2(sr.left(), y0), pos2(fill_x, y1)), accent);
+            }
             // Chapter marks: small gaps in the bar
-            if app.duration > 0.0 {
+            if duration > 0.0 {
                 let ppp = ctx.pixels_per_point();
                 for &(start, _) in app.chapters.iter() {
-                    if start > 0.5 && start < app.duration - 0.5 {
-                        let x = ((k0 + kw * (start / app.duration) as f32) * ppp).round() / ppp;
+                    if start > 0.5 && start < duration - 0.5 && start > v0 && start < v1 {
+                        let x = ((k0 + kw * to_frac(start)) * ppp).round() / ppp;
                         p.rect_filled(
                             Rect::from_center_size(pos2(x, seek_y), vec2(2.0, track_h)),
                             0.0, Color32::from_black_alpha((200.0 * t) as u8),
@@ -543,15 +576,49 @@ pub(crate) fn draw_bottom_bar(app: &mut FluentMediaPlayer, ctx: &egui::Context, 
                     }
                 }
             }
-            draw_knob(&p, ctx.pixels_per_point(), pos2(fill_x, seek_y), hot, accent, t);
+            if let Some(c) = &app.clip {
+                // The clip: a wider band in the accent colour, a grip at each end,
+                // and the playhead as a thin line
+                let (xa, xb) = (k0 + kw * to_frac(c.start), k0 + kw * to_frac(c.end));
+                p.rect_filled(Rect::from_min_max(pos2(xa, seek_y - 4.5), pos2(xb, seek_y + 4.5)), 2.0, accent);
+                for x in [xa, xb] {
+                    let g = Rect::from_center_size(pos2(x, seek_y), vec2(8.0, 21.0));
+                    p.rect_filled(g.translate(vec2(0.0, 1.0)), 3.0, Color32::from_black_alpha((90.0 * t) as u8));
+                    p.rect_filled(g, 3.0, white);
+                    p.rect_filled(Rect::from_center_size(g.center(), vec2(2.0, 9.0)), 1.0, Color32::from_black_alpha((80.0 * t) as u8));
+                }
+                if app.time_pos >= v0 && app.time_pos <= v1 {
+                    p.rect_filled(Rect::from_center_size(pos2(fill_x, seek_y), vec2(2.0, 26.0)), 1.0, white);
+                }
+                // Zoomed in: the stretch's ends, and how to see the whole video
+                if c.zoomed_in(duration) {
+                    let small = FontId::proportional(11.5);
+                    let dim = Color32::from_rgb(210, 210, 210).gamma_multiply(t);
+                    p.text(pos2(sr.left(), seek_y - 13.0), Align2::LEFT_BOTTOM, fmt_time(v0), small.clone(), dim);
+                    p.text(pos2(sr.right(), seek_y - 13.0), Align2::RIGHT_BOTTOM, fmt_time(v1), small.clone(), dim);
+                    if !seek.hovered() && end_drag.is_none() {
+                        let g = p.layout_no_wrap("Zoomed in around the clip \u{b7} Z: whole video".to_owned(), small, dim);
+                        let r = Rect::from_center_size(pos2(sr.center().x, seek_y - 20.0), g.size() + vec2(16.0, 6.0));
+                        p.rect_filled(r, r.height() / 2.0, Color32::from_black_alpha((115.0 * t) as u8));
+                        p.galley(r.center() - g.size() / 2.0, g, dim);
+                    }
+                }
+            } else {
+                draw_knob(&p, ctx.pixels_per_point(), pos2(fill_x, seek_y), hot, accent, t);
+            }
 
-            // Hover / drag time preview
-            let preview = if dragging { app.drag_frac }
+            // Hover / drag time preview (dragging a clip end: that end's time)
+            let preview = if let Some((_, f)) = end_drag { Some(f) }
+                else if dragging { app.drag_frac }
                 else if seek.hovered() { seek.hover_pos().map(|pp| frac_at(pp.x)) }
                 else { None };
-            if let (Some(f), true) = (preview, app.duration > 0.0) {
-                let secs = f as f64 * app.duration;
-                let txt = fmt_time(secs);
+            if let (Some(f), true) = (preview, duration > 0.0) {
+                let secs = to_secs(f);
+                let txt = match end_drag {
+                    Some((ClipEnd::Start, _)) => format!("Start \u{b7} {}", fmt_tenths(secs)),
+                    Some((ClipEnd::End, _)) => format!("End \u{b7} {}", fmt_tenths(secs)),
+                    None => fmt_time(secs),
+                };
                 let font = FontId::proportional(13.0);
                 let w = p.layout_no_wrap(txt.clone(), font.clone(), Color32::WHITE).size().x + 16.0;
                 let cx = (k0 + kw * f).clamp(sr.left() + w / 2.0, sr.right() - w / 2.0);

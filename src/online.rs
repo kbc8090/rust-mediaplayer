@@ -676,7 +676,7 @@ pub(crate) fn draw_link_status(app: &FluentMediaPlayer, ctx: &egui::Context) {
     };
     if let Some(load) = &app.url_load {
         spinner(load.since);
-        lines(c + vec2(0.0, 14.0), &[("Opening link\u{2026}", FontId::proportional(14.0), text_col)]);
+        lines(c + vec2(0.0, 14.0), &[("Opening video URL\u{2026}", FontId::proportional(14.0), text_col)]);
     } else if let Some(retry) = &app.link_retry {
         spinner(retry.since);
         let reason = retry.reason.as_deref().map(|r| format!("It didn't open: {r}"));
@@ -713,7 +713,7 @@ pub(crate) fn draw_link_status(app: &FluentMediaPlayer, ctx: &egui::Context) {
     }
 }
 
-// ── Saving a link to a file (Save As…) ────────────────────────────────────────
+// ── Saving a link to a file (Save video as…) ──────────────────────────────────
 // yt-dlp downloads the same video and audio that are playing (the Online video
 // settings), and ffmpeg (shipped beside it) joins them into one file in the
 // folder picked: .mp4 for H.264 / AV1 with AAC, .webm for VP9 / AV1 with Opus,
@@ -739,6 +739,8 @@ pub(crate) enum SaveStage {
     Finishing(bool),
     /// It failed: yt-dlp is updating, then it tries again
     Updating,
+    /// Cutting a clip out of a file on this PC (ffmpeg), and how far (0–1)
+    Cutting(Option<f32>),
     /// Saved, at this path
     Done(String),
     /// Didn't work: why
@@ -822,7 +824,7 @@ impl SaveJob {
 
     /// Start yt-dlp saving `url` into `folder`, with the formats from `o`. If it
     /// fails, yt-dlp updates itself and it's tried once more.
-    fn start(ctx: &egui::Context, url: &str, title: String, folder: &str, o: Online) -> Self {
+    fn start(ctx: &egui::Context, url: &str, title: String, folder: &str, o: Online, clip: Option<(f64, f64)>) -> Self {
         let Some(exe) = ytdlp_path() else {
             return Self::failed(title, "yt-dlp.exe isn't in the player's folder");
         };
@@ -844,10 +846,19 @@ impl SaveJob {
         add("mp4/webm/mkv");
         add("-P");
         add(folder);
+        // A clip: only that stretch is downloaded (yt-dlp has ffmpeg fetch just that
+        // part of the streams), cut at the nearest keyframes, no re-encoding
+        let mut tag = String::new();
+        if let Some((a, b)) = clip {
+            add("--download-sections");
+            add(&format!("*{a:.2}-{b:.2}"));
+            tag = format!(" [{}]", clip_tag(a, b));
+        }
         add("-o");
         // (audio gets its own name: as "Title.webm" it would be taken for an earlier
         // save of the video, and that file used and deleted)
-        add(if audio_only { "%(title).150B (audio).%(ext)s" } else { "%(title).150B.%(ext)s" });
+        let audio = if audio_only { " (audio)" } else { "" };
+        add(&format!("%(title).140B{audio}{tag}.%(ext)s"));
         // Progress, the file's name before it downloads (to tidy up after a cancel),
         // and where it ended up; one line each, easy to read back
         for a in ["--progress", "--progress-template", PROGRESS_TEMPLATE] {
@@ -951,6 +962,8 @@ fn run_ytdlp(exe: &Path, args: &[std::ffi::OsString], run: &SaveRun, set: &dyn F
                 }
             } else if let Some(p) = line.strip_prefix("RMP-FILE ") {
                 file = Some(p.to_owned());
+                // (found the video; downloading starts. Clips report no progress.)
+                set(SaveStage::Downloading(SavePart::Both, None));
             } else if let Some(p) = line.strip_prefix("RMP-SAVED ") {
                 saved = Some(p.to_owned());
             }
@@ -1084,27 +1097,347 @@ pub(crate) fn show_in_folder(path: &str) {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
-        // (explorer needs the path quoted after the comma, exactly like this)
-        let _ = std::process::Command::new("explorer.exe").raw_arg(format!("/select,\"{path}\"")).spawn();
+        // (explorer needs the path quoted after the comma, exactly like this; and
+        // it's started outside the player's job, so it stays open after the player)
+        let open = |flags: u32| {
+            std::process::Command::new("explorer.exe")
+                .raw_arg(format!("/select,\"{path}\""))
+                .creation_flags(flags)
+                .spawn()
+        };
+        if open(0x0100_0000 /* CREATE_BREAKAWAY_FROM_JOB */).is_err() {
+            let _ = open(0);
+        }
     }
     #[cfg(not(windows))]
     let _ = path;
 }
 
 impl FluentMediaPlayer {
-    /// Save As…: ask for a folder (the save starts once one is picked)
+    /// Save video as…: ask for a folder (the save starts once one is picked)
     pub(crate) fn ask_save_folder(&mut self) {
         if !self.has_file || !is_url(&self.current_file) {
             return;
         }
-        self.save_pending = Some((self.current_file.clone(), self.file_name()));
+        self.save_pending = Some(SavePending { source: self.current_file.clone(), title: self.file_name(), clip: None });
         taskbar::folder_dialog(self.hwnd);
     }
 
-    /// A folder was picked for Save As…
-    pub(crate) fn start_save(&mut self, ctx: &egui::Context, folder: &str) {
-        let Some((url, title)) = self.save_pending.take() else { return };
-        // (one at a time: a save still running is replaced, which cancels it)
-        self.save = Some(SaveJob::start(ctx, &url, title, folder, self.online));
+    /// Save clip as…: ask for a folder for the clip being set up
+    pub(crate) fn ask_clip_folder(&mut self) {
+        let Some(c) = &self.clip else { return };
+        if !self.has_file {
+            return;
+        }
+        self.save_pending = Some(SavePending { source: self.current_file.clone(), title: self.file_name(), clip: Some((c.start, c.end)) });
+        taskbar::folder_dialog(self.hwnd);
     }
+
+    /// A folder was picked for Save video as… / Save clip as…
+    pub(crate) fn start_save(&mut self, ctx: &egui::Context, folder: &str) {
+        let Some(p) = self.save_pending.take() else { return };
+        // (one at a time: a save still running is replaced, which cancels it)
+        self.save = Some(match p.clip {
+            Some((a, b)) => {
+                self.clip = None;
+                let title = format!("{} \u{b7} {}\u{2013}{}", p.title, fmt_tenths(a), fmt_tenths(b));
+                if is_url(&p.source) {
+                    SaveJob::start(ctx, &p.source, title, folder, self.online, Some((a, b)))
+                } else {
+                    SaveJob::cut_local(ctx, &p.source, title, folder, a, b)
+                }
+            }
+            None => SaveJob::start(ctx, &p.source, p.title, folder, self.online, None),
+        });
+    }
+
+    /// Save clip as…: start setting up a clip, from the playhead
+    pub(crate) fn start_clip(&mut self) {
+        if self.has_file && self.duration > 1.0 && self.clip.is_none() {
+            self.clip = Some(ClipUi::new(self.time_pos, self.duration));
+            self.main_menu = false;
+        }
+    }
+}
+
+// ── Save clip as… ─────────────────────────────────────────────────────────────
+// A stretch of the video, marked on the seek bar (which zooms in around it) and
+// in a panel at the top. Saved without re-encoding: fast and lossless, but the
+// clip begins at the keyframe at or just before its start (up to a few seconds
+// early). Links: yt-dlp downloads only that stretch. Files here: ffmpeg cuts it.
+
+/// Waiting for a folder to be picked: what to save
+pub(crate) struct SavePending {
+    /// The link or file
+    source: String,
+    title: String,
+    /// A clip (start, end in seconds), or None for the whole video
+    clip: Option<(f64, f64)>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum ClipEnd {
+    Start,
+    End,
+}
+
+/// The clip being set up
+pub(crate) struct ClipUi {
+    pub(crate) start: f64,
+    pub(crate) end: f64,
+    /// The seek bar shows only the stretch around the clip (Z switches)
+    pub(crate) zoom: bool,
+    /// That stretch (kept still while an end is dragged, re-fitted after)
+    pub(crate) view: (f64, f64),
+    /// Play the clip over and over while setting it up
+    pub(crate) repeat: bool,
+    /// Typing a time: which end, and the text so far
+    pub(crate) editing: Option<(ClipEnd, String)>,
+    /// An end being dragged on the seek bar
+    pub(crate) dragging: Option<ClipEnd>,
+}
+
+/// The time field being typed in (it keeps the keyboard while it's open)
+pub(crate) const CLIP_FIELD: &str = "clip_field";
+
+impl ClipUi {
+    /// A 30-second clip from `at` (or the whole video, if that's shorter)
+    pub(crate) fn new(at: f64, duration: f64) -> Self {
+        let len = 30.0_f64.min(duration);
+        let start = at.clamp(0.0, (duration - len).max(0.0));
+        let mut c = ClipUi { start, end: start + len, zoom: true, view: (0.0, duration), repeat: true, editing: None, dragging: None };
+        c.refit(duration);
+        c
+    }
+
+    pub(crate) fn time(&self, which: ClipEnd) -> f64 {
+        match which {
+            ClipEnd::Start => self.start,
+            ClipEnd::End => self.end,
+        }
+    }
+
+    /// The stretch the seek bar shows: around the clip, or the whole video
+    pub(crate) fn bar_range(&self, duration: f64) -> (f64, f64) {
+        if self.zoom { self.view } else { (0.0, duration) }
+    }
+
+    /// The seek bar shows less than the whole video
+    pub(crate) fn zoomed_in(&self, duration: f64) -> bool {
+        self.zoom && (self.view.1 - self.view.0) < duration - 0.5
+    }
+
+    /// Centre the zoomed stretch on the clip: four times its length, at least a
+    /// minute (or the whole video, when that's barely longer)
+    pub(crate) fn refit(&mut self, duration: f64) {
+        let len = (self.end - self.start).max(1.0);
+        let span = (len * 4.0).max(60.0);
+        if span >= duration * 0.8 {
+            self.view = (0.0, duration);
+            return;
+        }
+        let mid = (self.start + self.end) / 2.0;
+        let a = (mid - span / 2.0).clamp(0.0, duration - span);
+        self.view = (a, a + span);
+    }
+
+    /// Move one end to `t` (Set to now, typing, [ and ]). Moving the start past
+    /// the end (or the end before the start) carries the other end along.
+    pub(crate) fn set(&mut self, which: ClipEnd, t: f64, duration: f64) {
+        let len = (self.end - self.start).max(1.0);
+        let t = t.clamp(0.0, duration);
+        match which {
+            ClipEnd::Start => {
+                self.start = t.min(duration - 0.5).max(0.0);
+                if self.end <= self.start + 0.5 {
+                    self.end = (self.start + len).min(duration);
+                }
+            }
+            ClipEnd::End => {
+                self.end = t.max(0.5);
+                if self.start >= self.end - 0.5 {
+                    self.start = (self.end - len).max(0.0);
+                }
+            }
+        }
+        self.refit(duration);
+    }
+
+    /// Drag one end to `t` (the ends never cross; the view stays put)
+    pub(crate) fn drag(&mut self, which: ClipEnd, t: f64, duration: f64) {
+        match which {
+            ClipEnd::Start => self.start = t.clamp(0.0, self.end - 0.5),
+            ClipEnd::End => self.end = t.clamp(self.start + 0.5, duration),
+        }
+        self.dragging = Some(which);
+    }
+}
+
+/// 750.25 → "12:30.2" (1:02:30.2 past an hour)
+pub(crate) fn fmt_tenths(t: f64) -> String {
+    let tenths = (t.max(0.0) * 10.0).floor() as u64;
+    let (h, m, s, d) = (tenths / 36000, (tenths / 600) % 60, (tenths / 10) % 60, tenths % 10);
+    if h > 0 { format!("{h}:{m:02}:{s:02}.{d}") } else { format!("{m}:{s:02}.{d}") }
+}
+
+/// A typed time: "12:30", "12:30.5", "1:02:30", or seconds ("750.5")
+pub(crate) fn parse_time(text: &str) -> Option<f64> {
+    let parts: Vec<&str> = text.trim().split(':').collect();
+    if parts.is_empty() || parts.len() > 3 {
+        return None;
+    }
+    let mut total = 0.0;
+    for (i, p) in parts.iter().enumerate() {
+        let v: f64 = p.trim().parse().ok().filter(|v: &f64| *v >= 0.0 && v.is_finite())?;
+        // (minutes and seconds after the first part stay under 60)
+        if i > 0 && v >= 60.0 {
+            return None;
+        }
+        total = total * 60.0 + v;
+    }
+    Some(total)
+}
+
+/// For file names: 750, 795 → "12m30s-13m15s"
+fn clip_tag(a: f64, b: f64) -> String {
+    let one = |t: f64| {
+        let t = t.max(0.0).round() as u64;
+        let (h, m, s) = (t / 3600, (t / 60) % 60, t % 60);
+        if h > 0 { format!("{h}h{m:02}m{s:02}s") } else { format!("{m}m{s:02}s") }
+    };
+    format!("{}-{}", one(a), one(b))
+}
+
+/// Containers a clip of a file here keeps (others become .mkv, which holds anything)
+const CLIP_KEEPS: [&str; 14] = ["mp4", "m4v", "mov", "mkv", "webm", "ts", "m2ts", "mts", "mp3", "m4a", "flac", "ogg", "opus", "wav"];
+
+impl SaveJob {
+    /// Cut `start`..`end` out of the file at `path` into `folder` with ffmpeg
+    fn cut_local(ctx: &egui::Context, path: &str, title: String, folder: &str, start: f64, end: f64) -> Self {
+        let Some(ffmpeg) = std::env::current_exe()
+            .ok()
+            .and_then(|e| e.parent().map(|d| d.join("ffmpeg.exe")))
+            .filter(|p| p.is_file())
+        else {
+            return Self::failed(title, "ffmpeg.exe isn't in the player's folder");
+        };
+        let src = Path::new(path);
+        let stem = src.file_stem().map_or_else(|| "clip".to_owned(), |s| s.to_string_lossy().into_owned());
+        let ext = src
+            .extension()
+            .map(|e| e.to_string_lossy().to_ascii_lowercase())
+            .filter(|e| CLIP_KEEPS.contains(&e.as_str()))
+            .unwrap_or_else(|| "mkv".to_owned());
+        // "Name [12m30s-13m15s].mp4", or "... (2).mp4" if that's taken
+        let base = format!("{stem} [{}]", clip_tag(start, end));
+        let mut out = Path::new(folder).join(format!("{base}.{ext}"));
+        let mut n = 2;
+        while out.exists() {
+            out = Path::new(folder).join(format!("{base} ({n}).{ext}"));
+            n += 1;
+        }
+        let mut args: Vec<std::ffi::OsString> = Vec::new();
+        for a in ["-hide_banner", "-nostdin", "-loglevel", "error", "-nostats", "-progress", "pipe:1", "-ss"] {
+            args.push(a.into());
+        }
+        args.push(format!("{start:.3}").into());
+        args.push("-to".into());
+        args.push(format!("{end:.3}").into());
+        args.push("-i".into());
+        args.push(path.into());
+        // The pictures and sound (not cover art, subtitles or data), copied as they are
+        for a in ["-map", "0:V?", "-map", "0:a?", "-c", "copy", "-avoid_negative_ts", "make_zero", "-map_metadata", "0"] {
+            args.push(a.into());
+        }
+        if matches!(ext.as_str(), "mp4" | "m4v" | "mov" | "m4a") {
+            args.push("-movflags".into());
+            args.push("+faststart".into());
+        }
+        args.push("-n".into());
+        args.push(out.clone().into_os_string());
+
+        let stage = Arc::new(std::sync::Mutex::new(SaveStage::Cutting(None)));
+        let run = Arc::new(SaveRun::default());
+        let (st, shared, ctx) = (stage.clone(), run.clone(), ctx.clone());
+        let length = (end - start).max(0.1);
+        std::thread::spawn(move || {
+            let set = |s: SaveStage| {
+                if let Ok(mut slot) = st.lock() {
+                    *slot = s;
+                }
+                ctx.request_repaint();
+            };
+            let result = run_ffmpeg_cut(&ffmpeg, &args, &shared, length, &set);
+            match result {
+                Ok(()) if out.is_file() => set(SaveStage::Done(out.to_string_lossy().into_owned())),
+                other => {
+                    // (a half-written clip is no use)
+                    for _ in 0..5 {
+                        if !out.exists() || std::fs::remove_file(&out).is_ok() {
+                            break;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(300));
+                    }
+                    let why = other.err().unwrap_or_else(|| "ffmpeg didn't write the clip".to_owned());
+                    set(SaveStage::Failed(why));
+                }
+            }
+        });
+        SaveJob { title, stage, ended: None, run }
+    }
+}
+
+/// Run ffmpeg once, reading its progress ("out_time_us=…" lines) as it cuts
+fn run_ffmpeg_cut(exe: &Path, args: &[std::ffi::OsString], run: &SaveRun, length: f64, set: &dyn Fn(SaveStage)) -> Result<(), String> {
+    use std::io::BufRead;
+    use std::sync::atomic::Ordering;
+    let mut cmd = std::process::Command::new(exe);
+    cmd.args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    if run.cancelled() {
+        return Err("Cancelled".to_owned());
+    }
+    let mut child = cmd.spawn().map_err(|_| "Couldn't start ffmpeg.exe".to_owned())?;
+    run.pid.store(child.id(), Ordering::Relaxed);
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        if let Ok(mut g) = run.group.lock() {
+            *g = taskbar::ProcessGroup::new(child.as_raw_handle() as isize);
+        }
+    }
+    if run.cancelled() {
+        run.end();
+    }
+    // (ffmpeg's error messages: the last line says what went wrong)
+    let errors = child.stderr.take().map(|e| {
+        std::thread::spawn(move || {
+            std::io::BufReader::new(e)
+                .lines()
+                .map_while(Result::ok)
+                .filter(|l| !l.trim().is_empty())
+                .last()
+        })
+    });
+    if let Some(out) = child.stdout.take() {
+        for line in std::io::BufReader::new(out).lines().map_while(Result::ok) {
+            if let Some(us) = line.strip_prefix("out_time_us=").and_then(|v| v.trim().parse::<f64>().ok()) {
+                set(SaveStage::Cutting(Some(((us / 1e6) / length).clamp(0.0, 1.0) as f32)));
+            }
+        }
+    }
+    let ok = child.wait().is_ok_and(|s| s.success());
+    let error = errors.and_then(|t| t.join().ok()).flatten();
+    if let Ok(mut g) = run.group.lock() {
+        *g = None;
+    }
+    run.pid.store(0, Ordering::Relaxed);
+    if ok { Ok(()) } else { Err(error.map(|e| e.chars().take(160).collect()).unwrap_or_else(|| "ffmpeg couldn't cut the clip".to_owned())) }
 }

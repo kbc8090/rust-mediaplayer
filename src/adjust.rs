@@ -1429,6 +1429,13 @@ pub fn draw_save_card(ctx: &egui::Context, title: &str, stage: &crate::online::S
         SaveStage::Finishing(true) => ("Saving", "Joining the video and audio\u{2026}".to_owned(), Some(None)),
         SaveStage::Finishing(false) => ("Saving", "Finishing\u{2026}".to_owned(), Some(None)),
         SaveStage::Updating => ("Saving", "It didn't work: updating yt-dlp, then trying again\u{2026}".to_owned(), Some(None)),
+        SaveStage::Cutting(frac) => {
+            let text = match frac {
+                Some(f) => format!("Cutting the clip \u{b7} {}%", (f * 100.0).floor() as u32),
+                None => "Cutting the clip\u{2026}".to_owned(),
+            };
+            ("Saving", text, Some(*frac))
+        }
         SaveStage::Done(path) => {
             let name = Path::new(path).file_name().map_or_else(|| path.clone(), |n| n.to_string_lossy().into_owned());
             ("Saved", name, None)
@@ -1472,7 +1479,7 @@ pub fn draw_save_card(ctx: &egui::Context, title: &str, stage: &crate::online::S
         if done {
             let y = rect.top() + 88.0;
             p.line_segment([pos2(rect.left() + 1.0, y), pos2(rect.right() - 1.0, y)], Stroke::new(1.0_f32, LINE));
-            let br = Rect::from_min_size(pos2(rect.right() - 16.0 - 136.0, rect.bottom() - 12.0 - 30.0), vec2(136.0, 30.0));
+            let br = Rect::from_min_max(pos2(rect.left() + 16.0, rect.bottom() - 12.0 - 30.0), pos2(rect.right() - 16.0, rect.bottom() - 12.0));
             if accent_button(ui, &p, br, "Show in folder", ui.id().with("save_show"), true, accent) {
                 action = SaveCardAction::ShowInFolder;
             }
@@ -1501,6 +1508,154 @@ pub fn draw_save_card(ctx: &egui::Context, title: &str, stage: &crate::online::S
                     ctx.request_repaint();
                 }
             }
+        }
+    });
+    ctx.move_to_top(egui::LayerId::new(egui::Order::Foreground, id));
+    action
+}
+
+// ── Save clip as… panel ───────────────────────────────────────────────────────
+
+pub enum ClipAction {
+    None,
+    Save,
+    Close,
+}
+
+/// The clip panel, top centre: its length, the start and end (click a time to
+/// type one; "Set to now" takes the playhead's), "Play the clip on repeat", and
+/// Cancel / Save clip…
+pub fn draw_clip_panel(ctx: &egui::Context, c: &mut crate::online::ClipUi, duration: f64, now: f64, accent: Color32) -> ClipAction {
+    use crate::online::{fmt_tenths, parse_time, ClipEnd, CLIP_FIELD};
+    let screen = ctx.screen_rect();
+    let w = 500.0_f32.min(screen.width() - 16.0);
+    let h = 40.0 + 12.0 + 40.0 + 12.0 + 30.0 + 14.0;
+    let rect = Rect::from_min_size(pos2(screen.center().x - w / 2.0, screen.top() + PANEL_TOP), vec2(w, h));
+    let mut action = ClipAction::None;
+    let id = egui::Id::new("clip_panel");
+    egui::Area::new(id).order(egui::Order::Foreground).fixed_pos(rect.min).show(ctx, |ui| {
+        ui.allocate_rect(rect, Sense::click_and_drag());
+        let p = ui.painter().clone();
+        panel_frame(&p, rect);
+
+        // Heading, the clip's length, X
+        let cy = rect.top() + 20.0;
+        let g = p.layout_no_wrap("Save a clip".to_owned(), semibold(14.0), TEXT);
+        let after = rect.left() + 16.0 + g.size().x + 10.0;
+        p.galley(pos2(rect.left() + 16.0, cy - g.size().y / 2.0), g, TEXT);
+        let len = c.end - c.start;
+        let len_text = if len >= 60.0 { format!("{}:{:04.1}", (len / 60.0).floor() as u64, len % 60.0) } else { format!("{len:.1} s") };
+        p.text(pos2(after, cy), Align2::LEFT_CENTER, len_text, semibold(12.5), accent);
+        let xr = Rect::from_center_size(pos2(rect.right() - 20.0, cy), vec2(26.0, 26.0));
+        let x = ui.interact(xr, ui.id().with("clip_close"), Sense::click_and_drag());
+        if let Some(f) = state_fill(&x) {
+            p.rect_filled(xr, 4.0, f);
+        }
+        let xc = xr.center();
+        for (a, b) in [((-4.5, -4.5), (4.5, 4.5)), ((-4.5, 4.5), (4.5, -4.5))] {
+            p.line_segment([xc + vec2(a.0, a.1), xc + vec2(b.0, b.1)], Stroke::new(1.2_f32, TEXT));
+        }
+        if activated(&x.on_hover_text("Cancel (Esc)")) {
+            action = ClipAction::Close;
+        }
+        p.line_segment([pos2(rect.left() + 1.0, rect.top() + 40.0), pos2(rect.right() - 1.0, rect.top() + 40.0)], Stroke::new(1.0_f32, LINE));
+
+        // Start and end boxes
+        let top = rect.top() + 52.0;
+        let half = (w - 28.0 - 10.0) / 2.0;
+        for (k, which) in [ClipEnd::Start, ClipEnd::End].into_iter().enumerate() {
+            let bx = Rect::from_min_size(pos2(rect.left() + 14.0 + k as f32 * (half + 10.0), top), vec2(half, 40.0));
+            p.rect_filled(bx, 6.0, Color32::from_black_alpha(55));
+            p.rect_stroke(bx.shrink(0.5), 6.0, Stroke::new(1.0_f32, Color32::from_rgb(58, 58, 60)));
+            let label = if which == ClipEnd::Start { "Start" } else { "End" };
+            p.text(pos2(bx.left() + 10.0, bx.center().y), Align2::LEFT_CENTER, label, FontId::proportional(12.0), DIM);
+
+            // "Set to now" ([ / ])
+            let key = if which == ClipEnd::Start { "[" } else { "]" };
+            let br = Rect::from_min_size(pos2(bx.right() - 6.0 - 98.0, bx.center().y - 13.0), vec2(98.0, 26.0));
+            if cap_sized(ui, &p, br, &format!("Set to now  {key}"), ui.id().with(("clip_now", k)), 12.0) {
+                c.set(which, now, duration);
+                c.editing = None;
+            }
+
+            // The time: click it to type one
+            let vr = Rect::from_min_max(pos2(bx.left() + 46.0, bx.top() + 6.0), pos2(br.left() - 8.0, bx.bottom() - 6.0));
+            let typing_here = c.editing.as_ref().is_some_and(|(e, _)| *e == which);
+            if typing_here {
+                p.rect_filled(vr, 4.0, Color32::from_black_alpha(70));
+                p.with_clip_rect(Rect::from_min_max(pos2(vr.left(), vr.bottom() - 2.0), vr.max)).rect_filled(vr, 4.0, accent);
+                let mut child = ui.child_ui(vr.shrink2(vec2(6.0, 2.0)), egui::Layout::left_to_right(egui::Align::Center));
+                {
+                    let v = child.visuals_mut();
+                    v.selection.bg_fill = accent.gamma_multiply(0.45);
+                    v.text_cursor = Stroke::new(1.5_f32, TEXT);
+                    v.extreme_bg_color = Color32::TRANSPARENT;
+                }
+                let mut done = None;
+                if let Some((_, text)) = c.editing.as_mut() {
+                    let resp = child.add(
+                        egui::TextEdit::singleline(text)
+                            .id(egui::Id::new(CLIP_FIELD))
+                            .frame(false)
+                            .font(semibold(15.0))
+                            .text_color(TEXT)
+                            .desired_width(vr.width() - 12.0),
+                    );
+                    if !resp.has_focus() && !resp.lost_focus() {
+                        resp.request_focus();
+                    }
+                    // Enter, or clicking elsewhere, takes the typed time
+                    if resp.lost_focus() {
+                        done = Some(parse_time(text));
+                    }
+                }
+                if let Some(t) = done {
+                    if let Some(t) = t {
+                        c.set(which, t, duration);
+                    }
+                    c.editing = None;
+                }
+            } else {
+                let vresp = ui.interact(vr, ui.id().with(("clip_time", k)), Sense::click());
+                if vresp.hovered() {
+                    p.rect_filled(vr, 4.0, HOVER);
+                    ctx.set_cursor_icon(egui::CursorIcon::Text);
+                }
+                p.text(pos2(vr.left() + 6.0, vr.center().y), Align2::LEFT_CENTER, fmt_tenths(c.time(which)), semibold(15.0), TEXT);
+                if vresp.clicked() {
+                    c.editing = Some((which, fmt_tenths(c.time(which))));
+                }
+            }
+        }
+
+        // "Play the clip on repeat", Cancel, Save clip…
+        let row = rect.top() + 104.0;
+        let cb = Rect::from_min_size(pos2(rect.left() + 14.0, row), vec2(210.0, 30.0));
+        let cr = ui.interact(cb, ui.id().with("clip_repeat"), Sense::click_and_drag());
+        if let Some(f) = state_fill(&cr) {
+            p.rect_filled(cb, 4.0, f);
+        }
+        let bx = Rect::from_center_size(pos2(cb.left() + 14.0, cb.center().y), vec2(16.0, 16.0));
+        if c.repeat {
+            p.rect_filled(bx, 4.0, accent);
+            p.add(egui::Shape::line(
+                vec![bx.center() + vec2(-4.0, 0.0), bx.center() + vec2(-1.0, 3.0), bx.center() + vec2(4.5, -3.5)],
+                Stroke::new(1.6_f32, Color32::WHITE),
+            ));
+        } else {
+            p.rect_stroke(bx.shrink(0.5), 4.0, Stroke::new(1.0_f32, Color32::from_rgb(150, 150, 150)));
+        }
+        p.text(pos2(bx.right() + 9.0, cb.center().y), Align2::LEFT_CENTER, "Play the clip on repeat", FontId::proportional(12.5), TEXT);
+        if activated(&cr) {
+            c.repeat = !c.repeat;
+        }
+        let save_r = Rect::from_min_size(pos2(rect.right() - 14.0 - 116.0, row), vec2(116.0, 30.0));
+        let cancel_r = save_r.translate(vec2(-124.0, 0.0));
+        if cap_sized(ui, &p, cancel_r, "Cancel", ui.id().with("clip_cancel"), 13.0) {
+            action = ClipAction::Close;
+        }
+        if accent_button(ui, &p, save_r, "Save clip\u{2026}", ui.id().with("clip_save"), c.end > c.start, accent) {
+            action = ClipAction::Save;
         }
     });
     ctx.move_to_top(egui::LayerId::new(egui::Order::Foreground, id));

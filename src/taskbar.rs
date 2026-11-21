@@ -905,8 +905,6 @@ unsafe fn run_folder_dialog(owner: isize) -> Option<String> {
 // yt-dlp.exe starts a second copy of itself and then ffmpeg, so ending yt-dlp
 // alone would leave those running. A Windows "job" holds all of them: ending the
 // job ends every process in it, and Windows ends it too when the player closes.
-// (only used on Windows builds; the cfg_attrs keep Linux checks quiet)
-#[cfg_attr(not(windows), allow(dead_code))]
 #[repr(C)]
 struct JobLimits {
     // JOBOBJECT_BASIC_LIMIT_INFORMATION
@@ -926,12 +924,9 @@ struct JobLimits {
     peak_process_memory: usize,
     peak_job_memory: usize,
 }
-#[cfg_attr(not(windows), allow(dead_code))]
 const JOB_OBJECT_EXTENDED_LIMIT_INFORMATION: i32 = 9;
-#[cfg_attr(not(windows), allow(dead_code))]
 const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: u32 = 0x2000;
 
-#[cfg_attr(not(windows), allow(dead_code))]
 #[link(name = "kernel32")]
 unsafe extern "system" {
     fn CreateJobObjectW(attributes: *const c_void, name: *const u16) -> isize;
@@ -943,6 +938,39 @@ unsafe extern "system" {
 
 /// Processes that end together (see above)
 pub struct ProcessGroup(isize);
+
+const JOB_OBJECT_LIMIT_BREAKAWAY_OK: u32 = 0x0800;
+
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn GetCurrentProcess() -> isize;
+}
+
+/// Put the player itself in a job that Windows ends along with the player:
+/// everything it starts (yt-dlp, the Deno yt-dlp runs, ffmpeg, mpv's own yt-dlp
+/// runs) is in it too, so nothing is left running once the player has closed,
+/// even if it crashes. (Explorer, opened by "Show in folder", is started outside
+/// it.) The job's handle stays open for as long as the player runs.
+pub fn end_children_with_player() {
+    unsafe {
+        let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+        if job == 0 {
+            return;
+        }
+        let mut limits: JobLimits = std::mem::zeroed();
+        limits.limit_flags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_BREAKAWAY_OK;
+        let set = SetInformationJobObject(
+            job,
+            JOB_OBJECT_EXTENDED_LIMIT_INFORMATION,
+            &limits as *const JobLimits as *const c_void,
+            std::mem::size_of::<JobLimits>() as u32,
+        );
+        if set == 0 || AssignProcessToJobObject(job, GetCurrentProcess()) == 0 {
+            CloseHandle(job);
+        }
+        // (otherwise the handle is kept: closing it would end the player)
+    }
+}
 
 impl ProcessGroup {
     /// A group holding `process` (its handle) and everything it starts from now on
