@@ -905,6 +905,8 @@ unsafe fn run_folder_dialog(owner: isize) -> Option<String> {
 // yt-dlp.exe starts a second copy of itself and then ffmpeg, so ending yt-dlp
 // alone would leave those running. A Windows "job" holds all of them: ending the
 // job ends every process in it, and Windows ends it too when the player closes.
+// (only used on Windows builds; the cfg_attrs keep Linux checks quiet)
+#[cfg_attr(not(windows), allow(dead_code))]
 #[repr(C)]
 struct JobLimits {
     // JOBOBJECT_BASIC_LIMIT_INFORMATION
@@ -924,9 +926,12 @@ struct JobLimits {
     peak_process_memory: usize,
     peak_job_memory: usize,
 }
+#[cfg_attr(not(windows), allow(dead_code))]
 const JOB_OBJECT_EXTENDED_LIMIT_INFORMATION: i32 = 9;
+#[cfg_attr(not(windows), allow(dead_code))]
 const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: u32 = 0x2000;
 
+#[cfg_attr(not(windows), allow(dead_code))]
 #[link(name = "kernel32")]
 unsafe extern "system" {
     fn CreateJobObjectW(attributes: *const c_void, name: *const u16) -> isize;
@@ -941,6 +946,7 @@ pub struct ProcessGroup(isize);
 
 impl ProcessGroup {
     /// A group holding `process` (its handle) and everything it starts from now on
+    #[cfg_attr(not(windows), allow(dead_code))]
     pub fn new(process: isize) -> Option<Self> {
         unsafe {
             let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());

@@ -378,8 +378,14 @@ struct FluentMediaPlayer {
     url_load: Option<UrlLoad>,
     /// A link's video title, once mpv has it (shown instead of the link)
     media_title: String,
-    /// A link that couldn't be opened: when, and the message shown
-    link_error: Option<(std::time::Instant, &'static str)>,
+    /// A link that couldn't be opened: when, and the message (heading, why)
+    link_error: Option<(std::time::Instant, &'static str, String)>,
+    /// A link that failed, being tried again once yt-dlp has updated
+    link_retry: Option<LinkRetry>,
+    /// The link yt-dlp has already been updated for (one retry per link)
+    retried_url: Option<String>,
+    /// The link whose preview stream the thumbnails are using
+    link_thumbs: Option<String>,
     /// Save As…: the link and title waiting for a folder to be picked
     save_pending: Option<(String, String)>,
     /// A link being saved (or just saved): the card in the top right
@@ -454,6 +460,13 @@ struct FluentMediaPlayer {
     hq: bool,
     /// Frosted-glass menus (menu)
     glass: bool,
+    /// A right-click on the video opens the main menu (menu)
+    right_click_menu: bool,
+    /// Where the main menu was opened by a right-click (None: from its button)
+    menu_at: Option<Pos2>,
+    /// The window has just come back to the front with Tab still held (Alt+Tab):
+    /// Tab does nothing until it's let go
+    tab_blocked: bool,
     /// Windows 11: Windows draws our rounded corners and border; the colour last
     /// sent to it
     win11_frame: bool,
@@ -623,6 +636,9 @@ impl FluentMediaPlayer {
             url_load: None,
             media_title: String::new(),
             link_error: None,
+            link_retry: None,
+            retried_url: None,
+            link_thumbs: None,
             save_pending: None,
             save: None,
             win_state: saved,
@@ -656,6 +672,9 @@ impl FluentMediaPlayer {
             border: st.border,
             hq: st.hq,
             glass: st.glass,
+            right_click_menu: st.right_click_menu,
+            menu_at: None,
+            tab_blocked: false,
             win11_frame: false,
             border_sent: None,
             adjust: adjust.clone(),
@@ -749,6 +768,7 @@ impl FluentMediaPlayer {
         self.time_pos = 0.0;
         self.eof = false;
         self.chapters = Arc::new(Vec::new());
+        self.link_thumbs = None;
         if is_url(path) {
             self.thumbs.forget();
         } else {
@@ -1035,6 +1055,7 @@ impl FluentMediaPlayer {
             border: self.border,
             hq: self.hq,
             glass: self.glass,
+            right_click_menu: self.right_click_menu,
             online: self.online,
         }
     }
@@ -1292,7 +1313,16 @@ impl eframe::App for FluentMediaPlayer {
         let dt = now.duration_since(self.last_tick).as_secs_f64().min(0.25);
         self.last_tick = now;
         if snap.valid {
-            self.track_url_load(&snap);
+            self.track_url_load(ctx, &snap);
+            // A link's thumbnails: from the small preview stream yt-dlp found
+            if is_url(&self.current_file) && self.link_thumbs.as_deref() != Some(self.current_file.as_str()) {
+                if let Some(li) = snap.link_info.as_ref().filter(|li| li.url == self.current_file) {
+                    if let Some(pv) = &li.preview {
+                        self.thumbs.load_stream(&pv.url, pv.user_agent.clone(), pv.headers.clone());
+                    }
+                    self.link_thumbs = Some(self.current_file.clone());
+                }
+            }
             if is_url(&self.current_file) && snap.path == self.current_file && !snap.media_title.is_empty() {
                 self.media_title = snap.media_title.clone();
             }
@@ -1398,6 +1428,8 @@ impl eframe::App for FluentMediaPlayer {
                 _ => {}
             }
         }
+        // yt-dlp has updated after a link failed: try it again
+        self.poll_link_retry();
         // A folder for Save As…
         if let Some(folder) = taskbar::take_picked_folder() {
             self.start_save(ctx, &folder);
@@ -1591,7 +1623,11 @@ impl eframe::App for FluentMediaPlayer {
             m:     i.key_pressed(egui::Key::M),
             n:     i.key_pressed(egui::Key::N),
             p:     i.key_pressed(egui::Key::P),
-            info:  i.key_pressed(egui::Key::Tab),
+            // (not Alt+Tab, and not the key repeating while held)
+            info:  !i.modifiers.alt && i.events.iter().any(|e| matches!(e,
+                       egui::Event::Key { key: egui::Key::Tab, pressed: true, repeat: false, .. })),
+            focus_back: i.events.iter().any(|e| matches!(e, egui::Event::WindowFocused(true))),
+            tab_down: i.key_down(egui::Key::Tab),
             hw:    i.key_pressed(egui::Key::H),
             esc:   i.key_pressed(egui::Key::Escape),
             open:  i.modifiers.ctrl && i.key_pressed(egui::Key::O),
@@ -1609,6 +1645,18 @@ impl eframe::App for FluentMediaPlayer {
         });
         if self.url_box.is_some() {
             inp.keys_for_typing();
+        }
+        // Alt+Tab back to the player, letting go of Alt a moment before Tab: Windows
+        // hands the window a Tab press as it comes to the front. Ignore Tab from
+        // then until it has been let go.
+        if inp.focus_back {
+            self.tab_blocked = true;
+        }
+        if self.tab_blocked {
+            inp.info = false;
+            if !inp.tab_down {
+                self.tab_blocked = false;
+            }
         }
 
         // ── Controls visibility logic ─────────────────────────────────────────
@@ -1744,6 +1792,16 @@ impl eframe::App for FluentMediaPlayer {
                 if resp.double_clicked() {
                     self.toggle_fullscreen(ctx);
                 }
+                // Right-click → the main menu, where the pointer is (on letting go,
+                // like Windows' own right-click menus)
+                if self.right_click_menu && resp.secondary_clicked() {
+                    if let Some(p) = resp.interact_pointer_pos().or_else(|| ctx.pointer_latest_pos()) {
+                        self.main_menu = true;
+                        self.menu_at = Some(p);
+                        self.menu_sub = None;
+                        self.speed_menu = false;
+                    }
+                }
                 // Drag anywhere on the video → move the window
                 if resp.drag_started() && !self.is_fullscreen && edge.is_none() {
                     ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
@@ -1784,6 +1842,9 @@ impl eframe::App for FluentMediaPlayer {
         }
         if t_top > 0.0 {
             draw_top_bar(self, ctx, t_top);
+        }
+        // (a right-click menu doesn't wait for the title bar to fade in)
+        if t_top > 0.0 || self.menu_at.is_some() {
             draw_main_menu(self, ctx);
         } else {
             self.main_menu = false;
@@ -1841,7 +1902,7 @@ impl eframe::App for FluentMediaPlayer {
                 adjust::UrlBoxAction::None => {}
             }
         }
-        if self.has_file || self.link_error.is_some() {
+        if self.has_file || self.link_error.is_some() || self.link_retry.is_some() {
             draw_link_status(self, ctx);
         }
 
@@ -1968,6 +2029,9 @@ struct InputSnapshot {
     f: bool, d: bool, enter: bool, m: bool, n: bool, p: bool, info: bool, hw: bool, esc: bool, open: bool, rotate: bool, adjust: bool,
     open_url: bool,
     save: bool,
+    /// The window came back to the front this frame, and whether Tab is held
+    focus_back: bool,
+    tab_down: bool,
     /// Text pasted with Ctrl+V this frame
     pasted: Option<String>,
     scroll_y: f32,

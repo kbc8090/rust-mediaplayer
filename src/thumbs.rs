@@ -64,6 +64,10 @@ pub struct Thumbs {
     /// When the pending file was handed over (it's opened ahead of time once it has
     /// been playing for WARM_DELAY)
     pending_since: Option<Instant>,
+    /// For a link's preview stream: the user agent and other HTTP headers the site
+    /// wants (None / empty for files)
+    user_agent: Option<String>,
+    headers: Vec<String>,
 }
 
 impl Thumbs {
@@ -77,12 +81,16 @@ impl Thumbs {
             synced: false,
             requested: None,
             pending_since: None,
+            user_agent: None,
+            headers: Vec::new(),
         }
     }
 
     /// A new file is playing: remember it for the thumbnail player (opened on the
     /// first hover), and let go of the previous one
     pub fn load(&mut self, path: &str) {
+        self.user_agent = None;
+        self.headers.clear();
         self.pending = Some(path.to_owned());
         self.pending_since = Some(Instant::now());
         self.requested = None;
@@ -129,8 +137,17 @@ impl Thumbs {
         }
     }
 
-    /// A link is playing: no thumbnails (they'd need yt-dlp run a second time), so
-    /// let go of the previous file and don't open anything
+    /// A link is playing: its thumbnails come from a small separate stream of the
+    /// same video (240p or so, video only), found by yt-dlp along with the main
+    /// one. Opened like a file; a seek only fetches a little of it.
+    pub fn load_stream(&mut self, url: &str, user_agent: Option<String>, headers: Vec<String>) {
+        self.load(url);
+        self.user_agent = user_agent;
+        self.headers = headers;
+    }
+
+    /// A link is playing whose preview stream isn't known yet (or there isn't
+    /// one): let go of the previous file and don't open anything
     pub fn forget(&mut self) {
         self.pending = None;
         self.pending_since = None;
@@ -161,6 +178,12 @@ impl Thumbs {
         let Some((_, link)) = &self.mpv else { return };
         let Some(path) = self.pending.take() else { return };
         self.pending_since = None;
+        // (headers go one at a time: a user agent has commas in it)
+        link.command("change-list", &["http-header-fields", "clr", ""]);
+        for h in &self.headers {
+            link.command("change-list", &["http-header-fields", "append", h]);
+        }
+        link.set("user-agent", self.user_agent.as_deref().unwrap_or("libmpv"));
         link.set("start", format!("{secs:.2}"));
         link.command("loadfile", &[&path]);
         self.requested = Some(secs);

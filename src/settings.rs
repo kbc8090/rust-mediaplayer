@@ -60,6 +60,8 @@ pub(crate) struct Settings {
     pub(crate) hq: bool,
     /// Frosted-glass menus, panels and tooltips (menu). On by default.
     pub(crate) glass: bool,
+    /// A right-click on the video opens the main menu there (menu). On by default.
+    pub(crate) right_click_menu: bool,
     /// Online video panel (formats asked of yt-dlp)
     pub(crate) online: Online,
 }
@@ -131,6 +133,7 @@ pub(crate) fn settings_text(st: &Settings) -> String {
         format!("accent_border={}", yn(st.border)),
         format!("hq_upscaling={}", yn(st.hq)),
         format!("frosted_glass={}", yn(st.glass)),
+        format!("right_click_menu={}", yn(st.right_click_menu)),
     ]
     .into_iter()
     .chain(st.online.settings_lines())
@@ -165,6 +168,7 @@ pub(crate) fn parse_settings(text: &str) -> Settings {
         border: false,
         hq: false,
         glass: true,
+        right_click_menu: true,
         online: Online::default(),
     };
     for line in text.lines() {
@@ -190,6 +194,7 @@ pub(crate) fn parse_settings(text: &str) -> Settings {
             "accent_border" => st.border = on,
             "hq_upscaling" => st.hq = on,
             "frosted_glass" => st.glass = on,
+            "right_click_menu" => st.right_click_menu = on,
             _ => {
                 st.online.read_setting(key, value);
             }
@@ -237,6 +242,7 @@ pub(crate) fn parse_old_settings(text: &str) -> Settings {
         border,
         hq,
         glass,
+        right_click_menu: true,
         online: Online::default(),
     }
 }

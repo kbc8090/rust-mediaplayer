@@ -47,6 +47,8 @@ pub struct Snapshot {
     pub chapters: Arc<Vec<(f64, String)>>,
     /// Video / audio details, only filled while the info overlay is open
     pub info: Vec<InfoRow>,
+    /// The last link's details from yt-dlp (or why it failed), once known
+    pub link_info: Option<Arc<crate::online::LinkInfo>>,
 }
 
 /// A line of the info overlay
@@ -132,6 +134,10 @@ fn run(mpv: Arc<Mutex<Mpv>>, rx: mpsc::Receiver<Job>, state: Arc<Mutex<Snapshot>
     let mut quick_until: Option<Instant> = None;
     // Software fallback check (see below): which file, since when, and whether done
     let mut fallback_check: (String, Instant, bool) = (String::new(), Instant::now(), false);
+    // yt-dlp's answer about the last link: which link was read, the link being
+    // opened (kept while mpv is idle after a failure), and what was found
+    let (mut link_read, mut last_link) = (String::new(), String::new());
+    let mut link_info: Option<Arc<crate::online::LinkInfo>> = None;
     loop {
         // Wait for work, or refresh the snapshot every 100 ms (25 ms just after a
         // file was opened)
@@ -225,6 +231,7 @@ fn run(mpv: Arc<Mutex<Mpv>>, rx: mpsc::Receiver<Job>, state: Arc<Mutex<Snapshot>
             path: String::new(),
             idle: m.get_property::<bool>("idle-active").unwrap_or(false),
             media_title: m.get_property::<String>("media-title").unwrap_or_default(),
+            link_info: None,
         };
         let key = (
             m.get_property::<String>("path").unwrap_or_default(),
@@ -270,8 +277,38 @@ fn run(mpv: Arc<Mutex<Mpv>>, rx: mpsc::Receiver<Job>, state: Arc<Mutex<Snapshot>
                 fallback_check.2 = true;
             }
         }
+        // A link: once it plays (or mpv gives up on it), read what yt-dlp said
+        // about it, once. (The app clears mpv's copy before opening each link.)
+        if crate::online::is_url(&s.path) {
+            last_link.clone_from(&s.path);
+        } else if !s.path.is_empty() {
+            last_link.clear();
+            link_info = None;
+        }
+        let ready = if crate::online::is_url(&s.path) && (s.duration > 0.0 || s.dwidth > 0) {
+            Some(s.path.clone())
+        } else if s.idle && !last_link.is_empty() {
+            Some(last_link.clone())
+        } else {
+            None
+        };
+        if let Some(url) = ready.filter(|u| *u != link_read) {
+            let text = m.get_property::<String>(crate::online::YTDL_RESULT).unwrap_or_default();
+            link_info = crate::online::parse_link_result(&text).map(|mut info| {
+                info.url.clone_from(&url);
+                Arc::new(info)
+            });
+            link_read = url;
+        }
+        s.link_info = link_info.clone();
         if want_info.load(Ordering::Relaxed) {
             s.info = read_info(&m);
+            if let Some(li) = link_info.as_ref().filter(|li| li.url == s.path && !li.rows.is_empty()) {
+                s.info.push(InfoRow::Section("Online"));
+                for (label, value) in &li.rows {
+                    s.info.push(InfoRow::Item(label, value.clone()));
+                }
+            }
         }
         drop(m);
 

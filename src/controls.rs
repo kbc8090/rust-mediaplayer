@@ -367,6 +367,7 @@ pub(crate) fn draw_top_bar(app: &mut FluentMediaPlayer, ctx: &egui::Context, t: 
             }
             if menu.activated() {
                 app.main_menu = !app.main_menu;
+                app.menu_at = None;
             }
 
             // (text centred on its line box sits a little low next to the icon)
@@ -558,9 +559,9 @@ pub(crate) fn draw_bottom_bar(app: &mut FluentMediaPlayer, ctx: &egui::Context, 
                 p.rect_filled(r, 4.0, Color32::from_rgba_unmultiplied(32, 32, 32, (235.0 * t) as u8));
                 p.text(r.center(), Align2::CENTER_CENTER, txt, font, white);
 
-                // Thumbnail of that moment, above the time (not for links: that
-                // would mean fetching the video a second time)
-                let thumbs_ok = !is_url(&app.current_file);
+                // Thumbnail of that moment, above the time (for a link, once its
+                // small preview stream is known)
+                let thumbs_ok = !is_url(&app.current_file) || app.link_thumbs.as_deref() == Some(app.current_file.as_str());
                 if thumbs_ok {
                     app.thumbs.request(ctx, secs);
                 }

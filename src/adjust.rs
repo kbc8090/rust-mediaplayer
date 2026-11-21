@@ -1219,7 +1219,7 @@ pub fn draw_online(ctx: &egui::Context, ui_state: &mut AdjustUi, o: &mut crate::
         p.text(
             pos2(r.left() + 10.0, r.center().y),
             Align2::LEFT_CENTER,
-            "Links play via yt-dlp, which updates itself.",
+            "yt-dlp updates itself if a link fails to open.",
             FontId::proportional(11.5),
             Color32::from_rgb(150, 150, 150),
         );
@@ -1280,6 +1280,27 @@ pub fn draw_online(ctx: &egui::Context, ui_state: &mut AdjustUi, o: &mut crate::
         ui_state.lang_rect = Rect::NOTHING;
     }
     show_tip(ctx, ui_state, hovered_desc, rect);
+}
+
+/// A button filled with the accent colour, white label (the main action of a
+/// box: Open, Show in folder). Dimmed and inert when not `enabled`.
+#[allow(clippy::too_many_arguments)]
+fn accent_button(ui: &mut egui::Ui, p: &egui::Painter, r: Rect, label: &str, id: egui::Id, enabled: bool, accent: Color32) -> bool {
+    let resp = ui.interact(r, id, Sense::click_and_drag());
+    let inside = ui.ctx().input(|i| i.pointer.latest_pos()).is_some_and(|q| r.contains(q));
+    let fill = if !enabled {
+        accent.gamma_multiply(0.35)
+    } else if resp.is_pointer_button_down_on() && inside {
+        accent.gamma_multiply(0.8)
+    } else if resp.hovered() {
+        accent.gamma_multiply(0.9)
+    } else {
+        accent
+    };
+    p.rect_filled(r, 4.0, fill);
+    let text = if enabled { Color32::WHITE } else { Color32::from_white_alpha(110) };
+    p.text(r.center(), Align2::CENTER_CENTER, label, semibold(13.0), text);
+    enabled && activated(&resp)
 }
 
 // ── The Open URL box ──────────────────────────────────────────────────────────
@@ -1351,21 +1372,8 @@ pub fn draw_url_box(ctx: &egui::Context, b: &mut crate::online::UrlBox, accent: 
         if cap_sized(ui, &p, cancel_r, "Cancel", ui.id().with("url_cancel"), 13.0) {
             action = UrlBoxAction::Cancel;
         }
-        let open = ui.interact(open_r, ui.id().with("url_open"), Sense::click_and_drag());
-        let inside = ctx.input(|i| i.pointer.latest_pos()).is_some_and(|q| open_r.contains(q));
-        let fill = if !valid {
-            accent.gamma_multiply(0.35)
-        } else if open.is_pointer_button_down_on() && inside {
-            accent.gamma_multiply(0.8)
-        } else if open.hovered() {
-            accent.gamma_multiply(0.92)
-        } else {
-            accent
-        };
-        p.rect_filled(open_r, 4.0, fill);
-        let label_col = if valid { Color32::from_rgb(20, 20, 20) } else { Color32::from_rgb(20, 20, 20).gamma_multiply(0.6) };
-        p.text(open_r.center(), Align2::CENTER_CENTER, "Open", semibold(13.0), label_col);
-        if valid && (activated(&open) || enter) {
+        let clicked = accent_button(ui, &p, open_r, "Open", ui.id().with("url_open"), valid, accent);
+        if valid && (clicked || enter) {
             action = UrlBoxAction::Open(b.text.clone());
         }
     });
@@ -1399,7 +1407,9 @@ pub fn draw_save_card(ctx: &egui::Context, title: &str, stage: &crate::online::S
     }
     let screen = ctx.screen_rect();
     let w = 320.0_f32.min(screen.width() - 16.0);
-    let h = 96.0;
+    let done = matches!(stage, SaveStage::Done(_));
+    // (once saved: a separator, then the Show in folder button under it)
+    let h = if done { 138.0 } else { 96.0 };
     let rect = Rect::from_min_size(pos2(screen.right() - 8.0 - w, screen.top() + PANEL_TOP), vec2(w, h));
     let mut action = SaveCardAction::None;
     let (heading, detail, bar): (&str, String, Option<Option<f32>>) = match stage {
@@ -1418,6 +1428,7 @@ pub fn draw_save_card(ctx: &egui::Context, title: &str, stage: &crate::online::S
         }
         SaveStage::Finishing(true) => ("Saving", "Joining the video and audio\u{2026}".to_owned(), Some(None)),
         SaveStage::Finishing(false) => ("Saving", "Finishing\u{2026}".to_owned(), Some(None)),
+        SaveStage::Updating => ("Saving", "It didn't work: updating yt-dlp, then trying again\u{2026}".to_owned(), Some(None)),
         SaveStage::Done(path) => {
             let name = Path::new(path).file_name().map_or_else(|| path.clone(), |n| n.to_string_lossy().into_owned());
             ("Saved", name, None)
@@ -1452,18 +1463,20 @@ pub fn draw_save_card(ctx: &egui::Context, title: &str, stage: &crate::online::S
         let g = elided(&p, title, FontId::proportional(13.0), Color32::from_rgb(222, 222, 222), w - 32.0);
         p.galley(pos2(left, rect.top() + 38.0), g, Color32::from_rgb(222, 222, 222));
 
-        // What's happening / the file's name / why it failed, and "Show in folder"
-        let mut detail_w = w - 32.0;
-        if matches!(stage, SaveStage::Done(_)) {
-            let br = Rect::from_min_size(pos2(rect.right() - 16.0 - 118.0, rect.bottom() - 16.0 - 26.0), vec2(118.0, 26.0));
-            if cap_sized(ui, &p, br, "Show in folder", ui.id().with("save_show"), 12.5) {
+        // What's happening / the file's name / why it failed
+        let col = if matches!(stage, SaveStage::Failed(_)) { Color32::from_rgb(232, 150, 140) } else { DIM };
+        let g = elided(&p, &detail, FontId::proportional(12.0), col, w - 32.0);
+        p.galley(pos2(left, rect.top() + 67.0 - g.size().y / 2.0), g, col);
+
+        // Saved: a separator, then "Show in folder"
+        if done {
+            let y = rect.top() + 88.0;
+            p.line_segment([pos2(rect.left() + 1.0, y), pos2(rect.right() - 1.0, y)], Stroke::new(1.0_f32, LINE));
+            let br = Rect::from_min_size(pos2(rect.right() - 16.0 - 136.0, rect.bottom() - 12.0 - 30.0), vec2(136.0, 30.0));
+            if accent_button(ui, &p, br, "Show in folder", ui.id().with("save_show"), true, accent) {
                 action = SaveCardAction::ShowInFolder;
             }
-            detail_w -= 126.0;
         }
-        let col = if matches!(stage, SaveStage::Failed(_)) { Color32::from_rgb(232, 150, 140) } else { DIM };
-        let g = elided(&p, &detail, FontId::proportional(12.0), col, detail_w);
-        p.galley(pos2(left, rect.bottom() - 29.0 - g.size().y / 2.0), g, col);
 
         // Progress: a bar filling up, or a short piece sliding along while there's
         // nothing to measure (looking up, joining)

@@ -17,11 +17,12 @@ pub(crate) const SHORTCUTS: &[(&[&str], &str)] = &[
     (&["N"], "Next file"),
     (&["Enter"], "Full screen"),
     (&["Double-click"], "Full screen"),
+    (&["Right-click"], "Main menu"),
     (&["Esc"], "Leave full screen / close menu"),
     (&["R"], "Rotate 90\u{b0}"),
     (&["Ctrl+O"], "Open file"),
     (&["Ctrl+U"], "Open URL"),
-    (&["Ctrl+S"], "Save the online video"),
+    (&["Ctrl+S"], "Save video as (online videos)"),
     (&["Ctrl+V"], "Play a copied link"),
     (&["E"], "Picture & Sound"),
     (&["Tab"], "Video info"),
@@ -309,6 +310,7 @@ pub(crate) fn draw_main_menu(app: &mut FluentMediaPlayer, ctx: &egui::Context) {
         app.menu_sub = None;
         app.menu_hover = None;
         app.menu_aim = None;
+        app.menu_at = None;
         return;
     }
     const W: f32 = 272.0;
@@ -324,7 +326,7 @@ pub(crate) fn draw_main_menu(app: &mut FluentMediaPlayer, ctx: &egui::Context) {
         rows.push(if app.save.as_ref().is_some_and(|j| j.running()) {
             MenuRow::Item { key: "cancel_save", label: "Cancel saving", hint: None, mark: Mark::None }
         } else {
-            MenuRow::Item { key: "save", label: "Save As\u{2026}", hint: Some("Ctrl+S"), mark: Mark::None }
+            MenuRow::Item { key: "save", label: "Save video as\u{2026}", hint: Some("Ctrl+S"), mark: Mark::None }
         });
     }
     rows.extend([
@@ -335,6 +337,7 @@ pub(crate) fn draw_main_menu(app: &mut FluentMediaPlayer, ctx: &egui::Context) {
         MenuRow::Item { key: "multi", label: "Allow multiple windows", hint: None, mark: Mark::Check(app.multi) },
         MenuRow::Item { key: "border", label: "Accent color border", hint: None, mark: Mark::Check(app.border) },
         MenuRow::Item { key: "glass", label: "Frosted glass menus", hint: None, mark: Mark::Check(app.glass) },
+        MenuRow::Item { key: "right_click", label: "Right-click for main menu", hint: None, mark: Mark::Check(app.right_click_menu) },
         MenuRow::Sep,
         MenuRow::Item { key: "autoplay", label: "Auto-play next file in folder", hint: None, mark: Mark::Check(app.autoplay) },
         MenuRow::Sub { key: "sort", label: "Sort folder by", hint: sort_label },
@@ -352,17 +355,31 @@ pub(crate) fn draw_main_menu(app: &mut FluentMediaPlayer, ctx: &egui::Context) {
     sub_rows.push(MenuRow::Item { key: "desc", label: desc, hint: None, mark: Mark::Dot(app.sort_desc) });
 
     let screen = ctx.screen_rect();
-    let box_left = MENU_X - BTN_BOX / 2.0;
-    let rect = Rect::from_min_size(
-        pos2(box_left, MENU_Y + BTN_BOX / 2.0 + 4.0),
-        vec2(W, MENU_PAD * 2.0 + rows.iter().map(menu_row_h).sum::<f32>()),
-    );
-    // The submenu sits beside its row (last frame's position of the row), or over
-    // the menu's right side when the window is too narrow
+    let size = vec2(W, MENU_PAD * 2.0 + rows.iter().map(menu_row_h).sum::<f32>());
+    let rect = match app.menu_at {
+        // Opened by a right-click: at the pointer, kept inside the window (opening
+        // upwards / leftwards when there's no room below / to the right)
+        Some(p) => {
+            let x = if p.x + size.x <= screen.right() - 4.0 { p.x } else { p.x - size.x };
+            let y = if p.y + size.y <= screen.bottom() - 4.0 { p.y } else { p.y - size.y };
+            Rect::from_min_size(
+                pos2(
+                    x.clamp(screen.left() + 4.0, (screen.right() - 4.0 - size.x).max(screen.left() + 4.0)),
+                    y.clamp(screen.top() + 4.0, (screen.bottom() - 4.0 - size.y).max(screen.top() + 4.0)),
+                ),
+                size,
+            )
+        }
+        None => Rect::from_min_size(pos2(MENU_X - BTN_BOX / 2.0, MENU_Y + BTN_BOX / 2.0 + 4.0), size),
+    };
+    // The submenu sits beside its row (last frame's position of the row): to the
+    // right, else to the left, else over the menu's right side
     let sub_h = MENU_PAD * 2.0 + sub_rows.iter().map(menu_row_h).sum::<f32>();
     let sub_rect = app.menu_sub.map(|(_, row)| {
         let x = if rect.right() - 2.0 + SUB_W <= screen.right() - 4.0 {
             rect.right() - 2.0
+        } else if rect.left() + 2.0 - SUB_W >= screen.left() + 4.0 {
+            rect.left() + 2.0 - SUB_W
         } else {
             (screen.right() - 4.0 - SUB_W).max(screen.left() + 4.0)
         };
@@ -474,6 +491,7 @@ pub(crate) fn draw_main_menu(app: &mut FluentMediaPlayer, ctx: &egui::Context) {
         Some("multi") => app.multi = !app.multi,
         Some("border") => app.border = !app.border,
         Some("glass") => app.glass = !app.glass,
+        Some("right_click") => app.right_click_menu = !app.right_click_menu,
         Some("snap") => {
             app.snap = !app.snap;
             taskbar::set_snap(app.snap);

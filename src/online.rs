@@ -242,38 +242,267 @@ pub(crate) fn ytdlp_path() -> Option<PathBuf> {
     p.is_file().then_some(p)
 }
 
-/// YouTube changes often and older yt-dlp versions stop working, so once a day,
-/// after a link has opened, yt-dlp updates itself (`yt-dlp -U`, quietly, in the
-/// background). It can only do that if the player's folder can be written to.
-pub(crate) fn update_ytdlp_if_due() {
-    let Some(exe) = ytdlp_path() else { return };
-    let Some(stamp) = settings_path().and_then(|p| p.parent().map(|d| d.join("yt-dlp-checked.txt"))) else {
-        return;
-    };
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs());
-    let last = std::fs::read_to_string(&stamp).ok().and_then(|t| t.trim().parse::<u64>().ok()).unwrap_or(0);
-    if now.saturating_sub(last) < 24 * 60 * 60 {
-        return;
+// ── Updating yt-dlp (only when a link fails) ──────────────────────────────────
+// YouTube changes how its pages work every few weeks, and an older yt-dlp then
+// stops working. Nothing is checked in the background: only when a link fails to
+// open (or save) does yt-dlp update itself (`yt-dlp -U`, from GitHub), and the
+// link is tried once more with the new version.
+
+/// What `yt-dlp -U` did
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum UpdateOutcome {
+    Updated,
+    /// Already the newest version: the problem is the link, not yt-dlp
+    UpToDate,
+    /// Couldn't update (offline, the folder can't be written to, ...)
+    Failed,
+}
+
+/// Run `yt-dlp -U` and wait for it (call on a thread of its own)
+pub(crate) fn update_ytdlp() -> UpdateOutcome {
+    let Some(exe) = ytdlp_path() else { return UpdateOutcome::Failed };
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg("-U")
+        .env("PYTHONIOENCODING", "utf-8")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW: no console flashing up
     }
-    if let Some(dir) = stamp.parent() {
-        let _ = std::fs::create_dir_all(dir);
+    let Ok(out) = cmd.output() else { return UpdateOutcome::Failed };
+    let text = String::from_utf8_lossy(&out.stdout);
+    if text.contains("Updated yt-dlp to") {
+        UpdateOutcome::Updated
+    } else if text.contains("is up to date") {
+        UpdateOutcome::UpToDate
+    } else {
+        UpdateOutcome::Failed
     }
-    let _ = std::fs::write(&stamp, now.to_string());
-    std::thread::spawn(move || {
-        let mut cmd = std::process::Command::new(exe);
-        cmd.arg("-U")
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW: no console flashing up
+}
+
+/// A link that failed being retried: yt-dlp updating, then the link again
+pub(crate) struct LinkRetry {
+    url: String,
+    since: std::time::Instant,
+    /// Why it failed the first time (yt-dlp's error), for the message
+    reason: Option<String>,
+    outcome: Arc<std::sync::Mutex<Option<UpdateOutcome>>>,
+}
+
+// ── What yt-dlp found (or why it failed) ──────────────────────────────────────
+
+/// Where mpv keeps yt-dlp's answer for the last link it opened (its exit status,
+/// its JSON about the video, and its error messages)
+pub(crate) const YTDL_RESULT: &str = "user-data/mpv/ytdl/json-subprocess-result";
+
+/// A link's details from yt-dlp
+#[derive(Debug, Default)]
+pub(crate) struct LinkInfo {
+    /// The link they belong to
+    pub(crate) url: String,
+    /// Why yt-dlp couldn't open it (None: it could)
+    pub(crate) error: Option<String>,
+    /// Extra lines for the info panel (Tab)
+    pub(crate) rows: Vec<(&'static str, String)>,
+    /// A small video-only stream of it, for the seek-bar thumbnails
+    pub(crate) preview: Option<PreviewStream>,
+}
+
+/// A low-resolution video stream the thumbnail player can open directly
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct PreviewStream {
+    pub(crate) url: String,
+    pub(crate) user_agent: Option<String>,
+    /// Other HTTP headers the site wants ("Name: value")
+    pub(crate) headers: Vec<String>,
+}
+
+/// Read mpv's copy of yt-dlp's answer (None if there isn't one)
+pub(crate) fn parse_link_result(text: &str) -> Option<LinkInfo> {
+    use serde_json::Value;
+    let outer: Value = serde_json::from_str(text).ok()?;
+    let stdout = outer["stdout"].as_str().unwrap_or("");
+    if outer["status"].as_i64() != Some(0) || stdout.trim().is_empty() {
+        let stderr = outer["stderr"].as_str().unwrap_or("");
+        let error = error_from_lines(stderr.lines()).unwrap_or_else(|| match outer["error_string"].as_str() {
+            Some("init") => "yt-dlp.exe couldn't be started".to_owned(),
+            _ => "yt-dlp couldn't read this link".to_owned(),
+        });
+        return Some(LinkInfo { error: Some(error), ..Default::default() });
+    }
+    let j: Value = serde_json::from_str(stdout).ok()?;
+    let text = |v: &Value| v.as_str().filter(|s| !s.trim().is_empty()).map(str::to_owned);
+    let mut rows = Vec::new();
+
+    if let Some(site) = text(&j["webpage_url_domain"]).or_else(|| text(&j["extractor_key"])) {
+        rows.push(("Site", site));
+    }
+    if let Some(who) = text(&j["channel"]).or_else(|| text(&j["uploader"])) {
+        rows.push(("Channel", who));
+    }
+    if let Some(d) = text(&j["upload_date"]).and_then(|d| nice_date(&d)) {
+        rows.push(("Uploaded", d));
+    }
+    if j["is_live"].as_bool() == Some(true) {
+        rows.push(("Live", "Yes".to_owned()));
+    }
+    if let Some(v) = j["view_count"].as_u64() {
+        let mut views = thousands(v);
+        if let Some(l) = j["like_count"].as_u64() {
+            views = format!("{views} \u{b7} {} likes", thousands(l));
         }
-        let _ = cmd.status();
-    });
+        rows.push(("Views", views));
+    }
+    // The streams yt-dlp picked (two when the video and audio come separately)
+    let picked: Vec<&Value> = match j["requested_formats"].as_array() {
+        Some(list) => list.iter().collect(),
+        None => vec![&j],
+    };
+    let mut size = 0.0;
+    let mut size_known = true;
+    for f in &picked {
+        let has = |k: &str| text(&f[k]).is_some_and(|c| c != "none");
+        let id = text(&f["format_id"]).unwrap_or_default();
+        if has("vcodec") {
+            let mut parts = vec![id.clone()];
+            if let Some(h) = f["height"].as_u64() {
+                let fps = f["fps"].as_f64().unwrap_or(0.0);
+                parts.push(if fps > 31.0 { format!("{h}p{}", fps.round()) } else { format!("{h}p") });
+            }
+            parts.push(codec_label(&text(&f["vcodec"]).unwrap_or_default()));
+            if let Some(dr) = text(&f["dynamic_range"]).filter(|d| d != "SDR") {
+                parts.push(dr);
+            }
+            if let Some(br) = f["vbr"].as_f64().or_else(|| f["tbr"].as_f64()).filter(|b| *b > 0.0) {
+                parts.push(format!("{:.1} Mb/s", br / 1000.0));
+            }
+            rows.push(("Video stream", parts.join(" \u{b7} ")));
+        }
+        if has("acodec") {
+            let mut parts = vec![id, codec_label(&text(&f["acodec"]).unwrap_or_default())];
+            if let Some(br) = f["abr"].as_f64().filter(|b| *b > 0.0) {
+                parts.push(format!("{} kb/s", br.round()));
+            }
+            if let Some(lang) = text(&f["language"]) {
+                parts.push(language_label(&lang));
+            }
+            rows.push(("Audio stream", parts.join(" \u{b7} ")));
+        }
+        match f["filesize"].as_f64().or_else(|| f["filesize_approx"].as_f64()) {
+            Some(b) => size += b,
+            None => size_known = false,
+        }
+    }
+    if size_known && size > 0.0 {
+        let mb = size / 1_000_000.0;
+        let text = if mb >= 1000.0 { format!("{:.2} GB", mb / 1000.0) } else { format!("{mb:.0} MB") };
+        rows.push(("Size to save", format!("about {text}")));
+    }
+
+    // Thumbnails: a small video-only stream that can be opened straight (not a
+    // playlist of pieces), nearest 240p; H.264 first (cheapest to decode)
+    let preview = if j["is_live"].as_bool() == Some(true) {
+        None
+    } else {
+        j["formats"].as_array().and_then(|formats| {
+            formats
+                .iter()
+                .filter(|f| {
+                    let v = text(&f["vcodec"]).unwrap_or_default();
+                    let a = text(&f["acodec"]).unwrap_or_else(|| "none".to_owned());
+                    let h = f["height"].as_u64().unwrap_or(0);
+                    !v.is_empty() && v != "none" && a == "none" && (120..=480).contains(&h)
+                        && text(&f["protocol"]).is_some_and(|p| p == "https" || p == "http")
+                        && text(&f["url"]).is_some()
+                })
+                .min_by_key(|f| {
+                    let h = f["height"].as_u64().unwrap_or(0) as i64;
+                    let v = text(&f["vcodec"]).unwrap_or_default();
+                    let rank = if v.starts_with("avc") { 0 } else if v.starts_with("vp") { 1 } else { 2 };
+                    ((h - 240).abs(), rank)
+                })
+                .map(|f| {
+                    let mut user_agent = None;
+                    let mut headers = Vec::new();
+                    if let Some(map) = f["http_headers"].as_object() {
+                        for (k, v) in map {
+                            let Some(v) = v.as_str() else { continue };
+                            if k.eq_ignore_ascii_case("user-agent") {
+                                user_agent = Some(v.to_owned());
+                            } else {
+                                headers.push(format!("{k}: {v}"));
+                            }
+                        }
+                    }
+                    PreviewStream { url: text(&f["url"]).unwrap_or_default(), user_agent, headers }
+                })
+        })
+    };
+    Some(LinkInfo { url: String::new(), error: None, rows, preview })
+}
+
+/// "20240312" → "12 Mar 2024"
+fn nice_date(d: &str) -> Option<String> {
+    const MONTHS: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+    if d.len() != 8 || !d.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let month: usize = d[4..6].parse().ok()?;
+    let day: u32 = d[6..8].parse().ok()?;
+    Some(format!("{day} {} {}", MONTHS.get(month.checked_sub(1)?)?, &d[..4]))
+}
+
+/// 1234567 → "1,234,567"
+fn thousands(n: u64) -> String {
+    let digits = n.to_string();
+    let mut out = String::new();
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// yt-dlp's codec names in plain words ("avc1.640028" → "H.264")
+fn codec_label(c: &str) -> String {
+    let c = c.to_ascii_lowercase();
+    let name = if c.starts_with("avc") || c.starts_with("h264") {
+        "H.264"
+    } else if c.starts_with("hev") || c.starts_with("hvc") || c.starts_with("h265") {
+        "HEVC"
+    } else if c.starts_with("vp09") || c.starts_with("vp9") {
+        "VP9"
+    } else if c.starts_with("av01") || c == "av1" {
+        "AV1"
+    } else if c.starts_with("mp4a") || c == "aac" {
+        "AAC"
+    } else if c.starts_with("opus") {
+        "Opus"
+    } else if c.starts_with("ec-3") || c.starts_with("eac3") {
+        "E-AC-3"
+    } else if c.starts_with("ac-3") || c == "ac3" {
+        "AC-3"
+    } else {
+        return c;
+    };
+    name.to_owned()
+}
+
+/// "de" / "en-US" → "German" / "English (en-US)"
+fn language_label(code: &str) -> String {
+    if let Some((_, name)) = LANGUAGES.iter().find(|(c, _)| !c.is_empty() && c.eq_ignore_ascii_case(code)) {
+        return (*name).to_owned();
+    }
+    let base = code.split('-').next().unwrap_or(code);
+    match LANGUAGES.iter().find(|(c, _)| !c.is_empty() && c.eq_ignore_ascii_case(base)) {
+        Some((_, name)) => format!("{name} ({code})"),
+        None => code.to_owned(),
+    }
 }
 
 // ── The Open URL box and a link being opened ─────────────────────────────────
@@ -292,6 +521,8 @@ pub(crate) const URL_FIELD: &str = "url_field";
 pub(crate) struct UrlLoad {
     pub(crate) since: std::time::Instant,
     pub(crate) seen: bool,
+    /// When mpv gave up on it (the message waits a moment for yt-dlp's reason)
+    pub(crate) failed_at: Option<std::time::Instant>,
 }
 
 impl FluentMediaPlayer {
@@ -313,7 +544,11 @@ impl FluentMediaPlayer {
         self.media_title.clear();
         self.link_error = None;
         self.apply_online();
-        self.url_load = Some(UrlLoad { since: std::time::Instant::now(), seen: false });
+        self.link_retry = None;
+        // (mpv's copy of yt-dlp's answer is for the previous link: clear it, so
+        // whatever is there after this one has loaded or failed is about this one)
+        self.link.command("del", &[YTDL_RESULT]);
+        self.url_load = Some(UrlLoad { since: std::time::Instant::now(), seen: false, failed_at: None });
         self.load_entry(url);
     }
 
@@ -329,7 +564,7 @@ impl FluentMediaPlayer {
 
     /// Follow a link being opened: done once mpv is playing it, failed if mpv gave
     /// up on it (yt-dlp couldn't find a video there, no internet, ...)
-    pub(crate) fn track_url_load(&mut self, snap: &Snapshot) {
+    pub(crate) fn track_url_load(&mut self, ctx: &egui::Context, snap: &Snapshot) {
         let Some(load) = self.url_load.as_mut() else { return };
         // (the first moment can still show the previous file: the same link
         // opened again would look loaded already)
@@ -340,56 +575,139 @@ impl FluentMediaPlayer {
             load.seen = true;
             if snap.duration > 0.0 || snap.dwidth > 0 || snap.time_pos > 0.0 {
                 self.url_load = None;
-                update_ytdlp_if_due();
                 return;
             }
         }
-        if load.seen && snap.idle {
-            self.url_load = None;
-            self.has_file = false;
-            let why = if ytdlp_path().is_none() {
-                "yt-dlp.exe isn't in the player's folder"
-            } else {
-                "Couldn't open this link"
-            };
-            self.link_error = Some((std::time::Instant::now(), why));
+        if !(load.seen && snap.idle) {
+            return;
         }
+        // Failed. Wait a moment for yt-dlp's answer, to say why.
+        let info = snap.link_info.as_ref().filter(|i| i.url == self.current_file);
+        let failed_at = *load.failed_at.get_or_insert_with(std::time::Instant::now);
+        if info.is_none() && failed_at.elapsed() < std::time::Duration::from_millis(1500) {
+            return;
+        }
+        let reason = info.and_then(|i| i.error.clone());
+        self.url_load = None;
+        self.has_file = false;
+        let url = self.current_file.clone();
+        if ytdlp_path().is_none() {
+            self.show_link_error("Couldn't open this link", "yt-dlp.exe isn't in the player's folder".to_owned());
+        } else if self.retried_url.as_deref() != Some(url.as_str()) {
+            // First failure for this link: maybe yt-dlp is out of date. Update it
+            // and try again once.
+            self.retried_url = Some(url.clone());
+            let outcome = Arc::new(std::sync::Mutex::new(None));
+            let (slot, ctx) = (outcome.clone(), ctx.clone());
+            std::thread::spawn(move || {
+                let o = update_ytdlp();
+                if let Ok(mut s) = slot.lock() {
+                    *s = Some(o);
+                }
+                ctx.request_repaint();
+            });
+            self.link_retry = Some(LinkRetry { url, since: std::time::Instant::now(), reason, outcome });
+        } else {
+            let why = reason.unwrap_or_else(|| "yt-dlp couldn't play it".to_owned());
+            self.show_link_error("Couldn't open this link", format!("{why} (even with the newest yt-dlp)"));
+        }
+    }
+
+    /// yt-dlp has finished updating after a link failed: try the link again, or
+    /// say why not
+    pub(crate) fn poll_link_retry(&mut self) {
+        let Some(outcome) = self.link_retry.as_ref().and_then(|r| r.outcome.lock().ok().and_then(|mut o| o.take())) else {
+            return;
+        };
+        let Some(retry) = self.link_retry.take() else { return };
+        let why = retry.reason.unwrap_or_else(|| "yt-dlp couldn't play it".to_owned());
+        match outcome {
+            // (unless something else has been opened in the meantime)
+            UpdateOutcome::Updated if self.current_file == retry.url && !self.has_file => self.open_url(&retry.url),
+            UpdateOutcome::Updated => {}
+            UpdateOutcome::UpToDate => {
+                self.show_link_error("Couldn't open this link", format!("{why} (yt-dlp is already the newest version)"));
+            }
+            UpdateOutcome::Failed => {
+                self.show_link_error("Couldn't open this link", format!("{why} (updating yt-dlp didn't work: offline?)"));
+            }
+        }
+    }
+
+    fn show_link_error(&mut self, title: &'static str, detail: String) {
+        self.link_error = Some((std::time::Instant::now(), title, detail));
     }
 }
 
-/// While a link opens: a spinner and "Opening link…" in the middle; if it failed,
-/// a short message there for a few seconds
+/// While a link opens: a spinner and "Opening link…" in the middle. While
+/// yt-dlp updates after a failure: the spinner, why, and what happens next. If it
+/// failed for good: a note saying why, for a few seconds.
 pub(crate) fn draw_link_status(app: &FluentMediaPlayer, ctx: &egui::Context) {
     let screen = ctx.screen_rect();
     let p = ctx.layer_painter(egui::LayerId::new(egui::Order::Middle, egui::Id::new("link_status")));
     let c = screen.center();
     let text_col = Color32::from_rgb(222, 222, 222);
-    if let Some(load) = &app.url_load {
-        let t = load.since.elapsed().as_secs_f32();
+    let dim = Color32::from_rgb(170, 170, 170);
+    let spinner = |since: std::time::Instant| {
         // A ring with a turning accent arc
+        let t = since.elapsed().as_secs_f32();
         let r = 15.0;
-        p.circle_stroke(c - vec2(0.0, 14.0), r, Stroke::new(3.0_f32, Color32::from_rgba_premultiplied(40, 40, 40, 40)));
-        let start = t * 5.0;
+        let at = c - vec2(0.0, 14.0);
+        p.circle_stroke(at, r, Stroke::new(3.0_f32, Color32::from_rgba_premultiplied(40, 40, 40, 40)));
         let pts: Vec<Pos2> = (0..=24)
             .map(|i| {
-                let a = start + i as f32 / 24.0 * 1.6;
-                c - vec2(0.0, 14.0) + r * vec2(a.cos(), a.sin())
+                let a = t * 5.0 + i as f32 / 24.0 * 1.6;
+                at + r * vec2(a.cos(), a.sin())
             })
             .collect();
         p.add(egui::Shape::line(pts, Stroke::new(3.0_f32, app.accent)));
-        p.text(c + vec2(0.0, 22.0), Align2::CENTER_CENTER, "Opening link\u{2026}", FontId::proportional(14.0), text_col);
         ctx.request_repaint();
-    } else if let Some((t0, why)) = app.link_error {
+    };
+    // Lines of text under the spinner / in the note, centred, wrapped if long
+    let lines = |at: Pos2, items: &[(&str, FontId, Color32)]| {
+        let width = (screen.width() - 80.0).clamp(200.0, 520.0);
+        let mut y = at.y;
+        for (t, f, col) in items {
+            let g = p.layout((*t).to_owned(), f.clone(), *col, width);
+            let size = g.size();
+            p.galley(pos2(at.x - size.x / 2.0, y), g, Color32::WHITE);
+            y += size.y + 4.0;
+        }
+    };
+    if let Some(load) = &app.url_load {
+        spinner(load.since);
+        lines(c + vec2(0.0, 14.0), &[("Opening link\u{2026}", FontId::proportional(14.0), text_col)]);
+    } else if let Some(retry) = &app.link_retry {
+        spinner(retry.since);
+        let reason = retry.reason.as_deref().map(|r| format!("It didn't open: {r}"));
+        let mut items = vec![("Updating yt-dlp\u{2026}", FontId::proportional(14.5), text_col)];
+        if let Some(r) = &reason {
+            items.push((r.as_str(), FontId::proportional(12.5), dim));
+        }
+        items.push((
+            "The link didn't open, and yt-dlp may be out of date. It will try the link again with the new version.",
+            FontId::proportional(12.5),
+            dim,
+        ));
+        lines(c + vec2(0.0, 14.0), &items);
+    } else if let Some((t0, title, detail)) = &app.link_error {
         let age = t0.elapsed().as_secs_f32();
-        const SHOW: f32 = 5.0;
+        const SHOW: f32 = 8.0;
         if age < SHOW {
             // A small dark note, below the middle (clear of the home screen's ribbon)
             let a = ((SHOW - age) / 0.4).min(1.0);
-            let g = p.layout_no_wrap(why.to_owned(), FontId::proportional(14.0), text_col.gamma_multiply(a));
-            let pos = pos2(c.x, screen.top() + screen.height() * 0.74);
-            let r = Rect::from_center_size(pos, g.size() + vec2(28.0, 16.0));
-            p.rect_filled(r, r.height() / 2.0, Color32::from_rgb(36, 36, 36).gamma_multiply(0.92 * a));
-            p.galley(r.center() - g.size() / 2.0, g, text_col.gamma_multiply(a));
+            let top = pos2(c.x, screen.top() + screen.height() * 0.70);
+            // (laid out once to measure, then drawn over its backing)
+            let width = (screen.width() - 80.0).clamp(200.0, 520.0);
+            let g1 = p.layout((*title).to_owned(), FontId::proportional(14.0), text_col.gamma_multiply(a), width);
+            let g2 = p.layout(detail.clone(), FontId::proportional(12.5), dim.gamma_multiply(a), width);
+            let w = g1.size().x.max(g2.size().x);
+            let h = g1.size().y + 4.0 + g2.size().y;
+            let r = Rect::from_min_size(pos2(top.x - w / 2.0, top.y), vec2(w, h)).expand2(vec2(16.0, 10.0));
+            p.rect_filled(r, 10.0, Color32::from_rgb(36, 36, 36).gamma_multiply(0.92 * a));
+            let (s1, s2) = (g1.size(), g2.size());
+            p.galley(pos2(top.x - s1.x / 2.0, top.y), g1, Color32::WHITE);
+            p.galley(pos2(top.x - s2.x / 2.0, top.y + s1.y + 4.0), g2, Color32::WHITE);
             ctx.request_repaint();
         }
     }
@@ -419,6 +737,8 @@ pub(crate) enum SaveStage {
     Downloading(SavePart, Option<f32>),
     /// Downloaded: ffmpeg is joining the video and audio (true), or tidying up
     Finishing(bool),
+    /// It failed: yt-dlp is updating, then it tries again
+    Updating,
     /// Saved, at this path
     Done(String),
     /// Didn't work: why
@@ -432,9 +752,54 @@ pub(crate) struct SaveJob {
     stage: Arc<std::sync::Mutex<SaveStage>>,
     /// When it finished (the card stays a few seconds after that)
     pub(crate) ended: Option<std::time::Instant>,
-    /// yt-dlp and what it starts, ended together on cancel
-    group: Option<taskbar::ProcessGroup>,
-    pid: u32,
+    /// Shared with the thread running yt-dlp, to cancel it
+    run: Arc<SaveRun>,
+}
+
+/// The running yt-dlp: its process group (yt-dlp and what it starts, ended
+/// together), its process id (if the group couldn't be made), and "cancelled"
+#[derive(Default)]
+struct SaveRun {
+    group: std::sync::Mutex<Option<taskbar::ProcessGroup>>,
+    pid: std::sync::atomic::AtomicU32,
+    cancelled: std::sync::atomic::AtomicBool,
+}
+
+impl SaveRun {
+    fn cancelled(&self) -> bool {
+        self.cancelled.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// End yt-dlp and everything it started
+    fn end(&self) {
+        if let Some(g) = self.group.lock().ok().and_then(|mut g| g.take()) {
+            g.end();
+            return;
+        }
+        let pid = self.pid.load(std::sync::atomic::Ordering::Relaxed);
+        if pid == 0 {
+            return;
+        }
+        // (no group: end yt-dlp and what it started by process id)
+        let mut cmd = std::process::Command::new("taskkill");
+        cmd.args(["/PID", &pid.to_string(), "/T", "/F"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x0800_0000);
+        }
+        let _ = cmd.status();
+    }
+}
+
+/// How one run of yt-dlp went
+struct Attempt {
+    saved: Option<String>,
+    /// The file's name, for tidying up after a failure
+    file: Option<String>,
+    error: Option<String>,
 }
 
 impl SaveJob {
@@ -451,12 +816,12 @@ impl SaveJob {
             title,
             stage: Arc::new(std::sync::Mutex::new(SaveStage::Failed(why.to_owned()))),
             ended: None,
-            group: None,
-            pid: 0,
+            run: Arc::default(),
         }
     }
 
-    /// Start yt-dlp saving `url` into `folder`, with the formats from `o`
+    /// Start yt-dlp saving `url` into `folder`, with the formats from `o`. If it
+    /// fails, yt-dlp updates itself and it's tried once more.
     fn start(ctx: &egui::Context, url: &str, title: String, folder: &str, o: Online) -> Self {
         let Some(exe) = ytdlp_path() else {
             return Self::failed(title, "yt-dlp.exe isn't in the player's folder");
@@ -466,115 +831,146 @@ impl SaveJob {
             return Self::failed(title, "ffmpeg.exe isn't in the player's folder");
         }
         let audio_only = o.max_height == 0;
-        let mut cmd = std::process::Command::new(&exe);
-        cmd.args(["--no-playlist", "--newline", "--no-mtime", "--encoding", "utf-8"])
-            .args(["-f", &o.format(), "-S", &o.sort()])
-            .args(["--merge-output-format", "mp4/webm/mkv"])
-            .arg("-P")
-            .arg(folder)
-            // (audio gets its own name: as "Title.webm" it would be taken for an
-            // earlier save of the video, and that file used and deleted)
-            .args(["-o", if audio_only { "%(title).150B (audio).%(ext)s" } else { "%(title).150B.%(ext)s" }])
-            .arg("--ffmpeg-location")
-            .arg(&tools)
-            // Progress, the file's name before it downloads (to tidy up after a
-            // cancel), and where it ended up; one line each, easy to read back
-            .args(["--progress", "--progress-template", PROGRESS_TEMPLATE])
-            .args(["--print", "before_dl:RMP-FILE %(filename)s"])
-            .args(["--print", "after_move:RMP-SAVED %(filepath)s", "--no-simulate"]);
+        let mut args: Vec<std::ffi::OsString> = Vec::new();
+        let mut add = |a: &str| args.push(a.into());
+        for a in ["--no-playlist", "--newline", "--no-mtime", "--encoding", "utf-8"] {
+            add(a);
+        }
+        add("-f");
+        add(&o.format());
+        add("-S");
+        add(&o.sort());
+        add("--merge-output-format");
+        add("mp4/webm/mkv");
+        add("-P");
+        add(folder);
+        add("-o");
+        // (audio gets its own name: as "Title.webm" it would be taken for an earlier
+        // save of the video, and that file used and deleted)
+        add(if audio_only { "%(title).150B (audio).%(ext)s" } else { "%(title).150B.%(ext)s" });
+        // Progress, the file's name before it downloads (to tidy up after a cancel),
+        // and where it ended up; one line each, easy to read back
+        for a in ["--progress", "--progress-template", PROGRESS_TEMPLATE] {
+            add(a);
+        }
+        for a in ["--print", "before_dl:RMP-FILE %(filename)s", "--print", "after_move:RMP-SAVED %(filepath)s", "--no-simulate"] {
+            add(a);
+        }
         if audio_only {
-            cmd.arg("-x"); // the sound on its own: .opus or .m4a rather than .webm
+            add("-x"); // the sound on its own: .opus or .m4a rather than .webm
         }
-        cmd.arg("--")
-            .arg(url)
-            .env("PYTHONIOENCODING", "utf-8")
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
-        }
-        let Ok(mut child) = cmd.spawn() else {
-            return Self::failed(title, "Couldn't start yt-dlp.exe");
-        };
-        #[cfg(windows)]
-        let group = {
-            use std::os::windows::io::AsRawHandle;
-            taskbar::ProcessGroup::new(child.as_raw_handle() as isize)
-        };
-        #[cfg(not(windows))]
-        let group = None;
+        add("--ffmpeg-location");
+        args.push(tools.into_os_string());
+        args.push("--".into());
+        args.push(url.into());
 
         let stage = Arc::new(std::sync::Mutex::new(SaveStage::Starting));
-        let (st, ctx) = (stage.clone(), ctx.clone());
-        let (stdout, stderr) = (child.stdout.take(), child.stderr.take());
-        let pid = child.id();
+        let run = Arc::new(SaveRun::default());
+        let (st, shared, ctx) = (stage.clone(), run.clone(), ctx.clone());
         std::thread::spawn(move || {
-            use std::io::BufRead;
-            let errors = stderr.map(|e| std::thread::spawn(move || last_error(e)));
             let set = |s: SaveStage| {
                 if let Ok(mut slot) = st.lock() {
                     *slot = s;
                 }
                 ctx.request_repaint();
             };
-            let (mut file, mut saved) = (None, None);
-            let (mut had_video, mut had_audio) = (false, false);
-            if let Some(out) = stdout {
-                for line in std::io::BufReader::new(out).split(b'\n') {
-                    let Ok(line) = line else { break };
-                    let line = String::from_utf8_lossy(&line);
-                    let line = line.trim_end_matches('\r');
-                    if let Some(rest) = line.strip_prefix("RMP-PROGRESS ") {
-                        if let Some(s) = read_progress(rest, &mut had_video, &mut had_audio) {
-                            set(s);
-                        }
-                    } else if let Some(p) = line.strip_prefix("RMP-FILE ") {
-                        file = Some(p.to_owned());
-                    } else if let Some(p) = line.strip_prefix("RMP-SAVED ") {
-                        saved = Some(p.to_owned());
+            let mut attempt = run_ytdlp(&exe, &args, &shared, &set);
+            let mut note = "";
+            // Failed (not cancelled): maybe yt-dlp is out of date. Update, try again.
+            if attempt.saved.is_none() && !shared.cancelled() {
+                set(SaveStage::Updating);
+                match update_ytdlp() {
+                    UpdateOutcome::Updated if !shared.cancelled() => {
+                        set(SaveStage::Starting);
+                        attempt = run_ytdlp(&exe, &args, &shared, &set);
+                        note = " (even with the newest yt-dlp)";
                     }
+                    UpdateOutcome::Updated => {}
+                    UpdateOutcome::UpToDate => note = " (yt-dlp is already the newest version)",
+                    UpdateOutcome::Failed => note = " (updating yt-dlp didn't work: offline?)",
                 }
             }
-            let ok = child.wait().is_ok_and(|s| s.success());
-            let error = errors.and_then(|t| t.join().ok()).flatten();
-            match saved {
-                Some(path) if ok => set(SaveStage::Done(path)),
-                _ => {
-                    if let Some(f) = &file {
+            match attempt.saved {
+                Some(path) => set(SaveStage::Done(path)),
+                None => {
+                    if let Some(f) = &attempt.file {
                         remove_leftovers(f);
                     }
-                    set(SaveStage::Failed(error.unwrap_or_else(|| "yt-dlp stopped before the video was saved".to_owned())));
+                    let why = attempt.error.unwrap_or_else(|| "yt-dlp stopped before the video was saved".to_owned());
+                    set(SaveStage::Failed(format!("{why}{note}")));
                 }
             }
         });
-        SaveJob { title, stage, ended: None, group, pid }
+        SaveJob { title, stage, ended: None, run }
     }
+}
+
+/// Run yt-dlp once with `args`, passing its progress on through `set`
+fn run_ytdlp(exe: &Path, args: &[std::ffi::OsString], run: &SaveRun, set: &dyn Fn(SaveStage)) -> Attempt {
+    use std::io::BufRead;
+    use std::sync::atomic::Ordering;
+    let mut cmd = std::process::Command::new(exe);
+    cmd.args(args)
+        .env("PYTHONIOENCODING", "utf-8")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    let failed = |why: &str| Attempt { saved: None, file: None, error: Some(why.to_owned()) };
+    if run.cancelled() {
+        return failed("Cancelled");
+    }
+    let Ok(mut child) = cmd.spawn() else { return failed("Couldn't start yt-dlp.exe") };
+    run.pid.store(child.id(), Ordering::Relaxed);
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        if let Ok(mut g) = run.group.lock() {
+            *g = taskbar::ProcessGroup::new(child.as_raw_handle() as isize);
+        }
+    }
+    // (cancelled while it was starting)
+    if run.cancelled() {
+        run.end();
+    }
+    let errors = child.stderr.take().map(|e| std::thread::spawn(move || last_error(e)));
+    let (mut file, mut saved) = (None, None);
+    let (mut had_video, mut had_audio) = (false, false);
+    if let Some(out) = child.stdout.take() {
+        for line in std::io::BufReader::new(out).split(b'\n') {
+            let Ok(line) = line else { break };
+            let line = String::from_utf8_lossy(&line);
+            let line = line.trim_end_matches('\r');
+            if let Some(rest) = line.strip_prefix("RMP-PROGRESS ") {
+                if let Some(s) = read_progress(rest, &mut had_video, &mut had_audio) {
+                    set(s);
+                }
+            } else if let Some(p) = line.strip_prefix("RMP-FILE ") {
+                file = Some(p.to_owned());
+            } else if let Some(p) = line.strip_prefix("RMP-SAVED ") {
+                saved = Some(p.to_owned());
+            }
+        }
+    }
+    let ok = child.wait().is_ok_and(|s| s.success());
+    let error = errors.and_then(|t| t.join().ok()).flatten();
+    if let Ok(mut g) = run.group.lock() {
+        *g = None;
+    }
+    run.pid.store(0, Ordering::Relaxed);
+    Attempt { saved: saved.filter(|_| ok), file, error }
 }
 
 impl Drop for SaveJob {
     /// Closing the card (or the player) while it's saving cancels it
     fn drop(&mut self) {
-        if !self.running() {
-            return;
-        }
-        match &self.group {
-            Some(g) => g.end(),
-            None => {
-                // (no group: end yt-dlp and what it started by process id)
-                let mut cmd = std::process::Command::new("taskkill");
-                cmd.args(["/PID", &self.pid.to_string(), "/T", "/F"])
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null());
-                #[cfg(windows)]
-                {
-                    use std::os::windows::process::CommandExt;
-                    cmd.creation_flags(0x0800_0000);
-                }
-                let _ = cmd.status();
-            }
+        if self.running() {
+            self.run.cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
+            self.run.end();
         }
     }
 }
@@ -616,9 +1012,19 @@ fn read_progress(line: &str, had_video: &mut bool, had_audio: &mut bool) -> Opti
 /// abc123: Video unavailable" becomes "Video unavailable"
 fn last_error(stderr: std::process::ChildStderr) -> Option<String> {
     use std::io::BufRead;
+    let lines: Vec<String> = std::io::BufReader::new(stderr)
+        .split(b'\n')
+        .map_while(Result::ok)
+        .map(|l| String::from_utf8_lossy(&l).into_owned())
+        .collect();
+    error_from_lines(lines.iter().map(String::as_str))
+}
+
+/// The last "ERROR: ..." line among yt-dlp's messages, shortened (see last_error)
+fn error_from_lines<'a>(lines: impl Iterator<Item = &'a str>) -> Option<String> {
     let mut last = None;
-    for line in std::io::BufReader::new(stderr).split(b'\n').map_while(Result::ok) {
-        let line = String::from_utf8_lossy(&line).trim().to_owned();
+    for line in lines {
+        let line = line.trim();
         let Some(mut msg) = line.strip_prefix("ERROR:").map(str::trim) else { continue };
         if msg.starts_with('[') {
             if let Some(i) = msg.find("] ") {
