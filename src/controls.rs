@@ -61,13 +61,13 @@ fn elide(p: &egui::Painter, text: &str, font: FontId, color: Color32, width: f32
     p.layout_job(job)
 }
 
-/// A chapter title in a small dark box `w` wide at `left`, its bottom at `bottom`
+/// A chapter title in a box like a tooltip, `w` wide at `left`, its bottom at `bottom`
 fn chapter_box(p: &egui::Painter, title: &str, left: f32, w: f32, bottom: f32, t: f32) {
-    let white = Color32::WHITE.gamma_multiply(t);
-    let g = elide(p, title, FontId::proportional(12.5), white, w - 16.0);
-    let r = Rect::from_min_max(pos2(left, bottom - g.size().y - 8.0), pos2(left + w, bottom));
-    p.rect_filled(r, 4.0, Color32::from_rgba_unmultiplied(32, 32, 32, (235.0 * t) as u8));
-    p.galley(pos2(r.center().x - g.size().x / 2.0, r.top() + 4.0), g, white);
+    let col = TIP_TEXT.gamma_multiply(t);
+    let g = elide(p, title, FontId::proportional(12.5), col, w - 18.0);
+    let r = Rect::from_min_max(pos2(left, bottom - g.size().y - 10.0), pos2(left + w, bottom));
+    tip_frame(p, r, t);
+    p.galley(pos2(r.center().x - g.size().x / 2.0, r.top() + 5.0), g, col);
 }
 
 /// A button that's greyed out: does nothing, but is still a button (so a
@@ -151,14 +151,22 @@ pub(crate) fn draw_tooltip(ctx: &egui::Context, anchor: Rect, text: &str, above:
         .round();
     let y = if above { anchor.top() - 6.0 - size.y } else { anchor.bottom() + 6.0 }.round();
     let rect = Rect::from_min_size(pos2(x, y), size);
-    let r = 5.0;
-
-    glass::shadow(&p, rect, r, alpha * 0.6);
-    glass::fill(&p, rect, r, Color32::from_rgba_unmultiplied(43, 43, 43, 245), alpha);
-    let edge = glass::edge(Color32::from_white_alpha(20));
-    p.rect_stroke(rect.shrink(0.5), r, Stroke::new(1.0_f32, edge.gamma_multiply(alpha)));
+    tip_frame(&p, rect, alpha);
     p.galley(rect.min + pad, galley, Color32::WHITE);
 }
+
+/// The tooltip look, frosted glass when that's on in the menu: button tips, and
+/// the seek bar's time and chapter boxes
+pub(crate) fn tip_frame(p: &egui::Painter, rect: Rect, alpha: f32) {
+    let r = 5.0;
+    glass::shadow(p, rect, r, alpha * 0.6);
+    glass::fill(p, rect, r, Color32::from_rgba_unmultiplied(43, 43, 43, 245), alpha);
+    let edge = glass::edge(Color32::from_white_alpha(20));
+    p.rect_stroke(rect.shrink(0.5), r, Stroke::new(1.0_f32, edge.gamma_multiply(alpha)));
+}
+
+/// Text colour of tooltips (and the time / chapter boxes)
+const TIP_TEXT: Color32 = Color32::from_rgb(235, 235, 235);
 
 // ── Icons (drawn with shapes so they never depend on font coverage) ───────────
 pub(crate) const SW: f32 = 1.35;
@@ -657,12 +665,13 @@ pub(crate) fn draw_bottom_bar(app: &mut FluentMediaPlayer, ctx: &egui::Context, 
                     Some((ClipEnd::End, _)) => format!("End \u{b7} {}", fmt_tenths(secs)),
                     None => fmt_time(secs),
                 };
-                let font = FontId::proportional(13.0);
-                let w = p.layout_no_wrap(txt.clone(), font.clone(), Color32::WHITE).size().x + 16.0;
+                // (the time in a box like a tooltip)
+                let font = FontId::proportional(12.5);
+                let w = p.layout_no_wrap(txt.clone(), font.clone(), Color32::WHITE).size().x + 18.0;
                 let cx = (k0 + kw * f).clamp(sr.left() + w / 2.0, sr.right() - w / 2.0);
-                let r = Rect::from_center_size(pos2(cx, seek_y - 28.0), vec2(w, 23.0));
-                p.rect_filled(r, 4.0, Color32::from_rgba_unmultiplied(32, 32, 32, (235.0 * t) as u8));
-                p.text(r.center(), Align2::CENTER_CENTER, txt, font, white);
+                let r = Rect::from_center_size(pos2(cx, seek_y - 28.0), vec2(w, 24.0));
+                tip_frame(&p, r, t);
+                p.text(r.center(), Align2::CENTER_CENTER, txt, font, TIP_TEXT.gamma_multiply(t));
 
                 // Thumbnail of that moment, above the time (for a link, once its
                 // small preview stream is known)

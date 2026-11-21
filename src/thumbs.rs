@@ -22,9 +22,9 @@ use std::ffi::c_void;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-/// The thumbnail's width in points (16:9 video: 200 × 112); the height follows
+/// The thumbnail's width in points (16:9 video: 180 × 101); the height follows
 /// the video's shape, up to THUMB_MAX_H (tall video is narrower instead)
-pub const THUMB_W: f32 = 200.0;
+pub const THUMB_W: f32 = 180.0;
 pub const THUMB_MAX_H: f32 = 150.0;
 
 /// How long a new file plays before the thumbnail player opens it as well
