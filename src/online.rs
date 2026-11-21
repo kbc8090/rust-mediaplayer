@@ -309,6 +309,8 @@ pub(crate) struct LinkInfo {
     pub(crate) rows: Vec<(&'static str, String)>,
     /// A small video-only stream of it, for the seek-bar thumbnails
     pub(crate) preview: Option<PreviewStream>,
+    /// A live stream (Twitch, a YouTube live...): no end, so no seeking along a bar
+    pub(crate) live: bool,
 }
 
 /// A low-resolution video stream the thumbnail player can open directly
@@ -346,7 +348,7 @@ pub(crate) fn parse_link_result(text: &str) -> Option<LinkInfo> {
     if let Some(d) = text(&j["upload_date"]).and_then(|d| nice_date(&d)) {
         rows.push(("Uploaded", d));
     }
-    if j["is_live"].as_bool() == Some(true) {
+    if j["is_live"].as_bool() == Some(true) || text(&j["live_status"]).as_deref() == Some("is_live") {
         rows.push(("Live", "Yes".to_owned()));
     }
     if let Some(v) = j["view_count"].as_u64() {
@@ -441,7 +443,8 @@ pub(crate) fn parse_link_result(text: &str) -> Option<LinkInfo> {
                 })
         })
     };
-    Some(LinkInfo { url: String::new(), error: None, rows, preview })
+    let live = j["is_live"].as_bool() == Some(true) || text(&j["live_status"]).as_deref() == Some("is_live");
+    Some(LinkInfo { url: String::new(), error: None, rows, preview, live })
 }
 
 /// "20240312" → "12 Mar 2024"
@@ -1200,7 +1203,7 @@ impl FluentMediaPlayer {
 
     /// Save clip as…: start setting up a clip, from the playhead
     pub(crate) fn start_clip(&mut self) {
-        if self.has_file && self.duration > 1.0 && self.clip.is_none() {
+        if self.has_file && self.duration > 1.0 && !self.live && self.clip.is_none() {
             self.clip = Some(ClipUi::new(self.time_pos, self.duration));
             self.main_menu = false;
         }

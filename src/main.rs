@@ -386,6 +386,9 @@ struct FluentMediaPlayer {
     retried_url: Option<String>,
     /// The link whose preview stream the thumbnails are using
     link_thumbs: Option<String>,
+    /// The link playing is a live stream (yt-dlp says so): the seek bar is full and
+    /// still, and the time shows "● Live" beside it
+    pub(crate) live: bool,
     /// A link has loaded but may not have drawn its first picture yet: the video
     /// stays black until it's playing (else mpv shows the previous video's last
     /// frame for a moment). Since when.
@@ -654,6 +657,7 @@ impl FluentMediaPlayer {
             link_retry: None,
             retried_url: None,
             link_thumbs: None,
+            live: false,
             video_hold: None,
             save_pending: None,
             clip: None,
@@ -790,6 +794,7 @@ impl FluentMediaPlayer {
         self.eof = false;
         self.chapters = Arc::new(Vec::new());
         self.link_thumbs = None;
+        self.live = false;
         self.clip = None;
         if is_url(path) {
             self.thumbs.forget();
@@ -1358,6 +1363,8 @@ impl eframe::App for FluentMediaPlayer {
                     self.link_thumbs = Some(self.current_file.clone());
                 }
             }
+            self.live = is_url(&self.current_file)
+                && snap.link_info.as_ref().is_some_and(|li| li.url == self.current_file && li.live);
             if is_url(&self.current_file) && snap.path == self.current_file && !snap.media_title.is_empty() {
                 self.media_title = snap.media_title.clone();
             }
@@ -1388,7 +1395,9 @@ impl eframe::App for FluentMediaPlayer {
                 } else {
                     self.time_pos = target;
                 }
-                if self.duration > 0.0 {
+                // (a live stream's "duration" is only what's buffered so far, and
+                // moves: the time isn't held to it)
+                if self.duration > 0.0 && !self.live {
                     self.time_pos = self.time_pos.clamp(0.0, self.duration);
                 }
                 self.volume = snap.volume;

@@ -384,7 +384,7 @@ pub(crate) fn draw_main_menu(app: &mut FluentMediaPlayer, ctx: &egui::Context) {
         });
     }
     // Save clip as… for anything playing (a link or a file here)
-    if app.has_file && app.duration > 1.0 {
+    if app.has_file && app.duration > 1.0 && !app.live {
         rows.push(MenuRow::Item { key: "clip", label: "Save clip as\u{2026}", hint: Some("Ctrl+Shift+S"), mark: Mark::None });
     }
     rows.extend([

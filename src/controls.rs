@@ -584,7 +584,10 @@ pub(crate) fn draw_bottom_bar(app: &mut FluentMediaPlayer, ctx: &egui::Context, 
                 }
             }
 
+            // A live stream: nothing to seek along, so the bar is simply full
+            let live = app.live;
             let dragging = end_drag.is_none()
+                && !live
                 && (seek.dragged_by(egui::PointerButton::Primary)
                     || (seek.is_pointer_button_down_on() && ctx.input(|i| i.pointer.primary_down())));
             if dragging {
@@ -596,8 +599,8 @@ pub(crate) fn draw_bottom_bar(app: &mut FluentMediaPlayer, ctx: &egui::Context, 
             } else {
                 app.drag_frac = None;
             }
-            let frac = app.drag_frac.unwrap_or(if duration > 0.0 { to_frac(app.time_pos) } else { 0.0 });
-            let hot = seek.hovered() || dragging || end_drag.is_some();
+            let frac = if live { 1.0 } else { app.drag_frac.unwrap_or(if duration > 0.0 { to_frac(app.time_pos) } else { 0.0 }) };
+            let hot = !live && (seek.hovered() || dragging || end_drag.is_some());
 
             let track_h = if hot { 4.0 } else { 3.0 };
             let (y0, y1) = (seek_y - track_h / 2.0, seek_y + track_h / 2.0);
@@ -607,7 +610,7 @@ pub(crate) fn draw_bottom_bar(app: &mut FluentMediaPlayer, ctx: &egui::Context, 
                 pill(&p, Rect::from_min_max(pos2(sr.left(), y0), pos2(fill_x, y1)), accent);
             }
             // Chapter marks: small gaps in the bar
-            if duration > 0.0 {
+            if duration > 0.0 && !live {
                 let ppp = ctx.pixels_per_point();
                 for &(start, _) in app.chapters.iter() {
                     if start > 0.5 && start < duration - 0.5 && start > v0 && start < v1 {
@@ -646,14 +649,14 @@ pub(crate) fn draw_bottom_bar(app: &mut FluentMediaPlayer, ctx: &egui::Context, 
                         p.galley(r.center() - g.size() / 2.0, g, dim);
                     }
                 }
-            } else {
+            } else if !live {
                 draw_knob(&p, ctx.pixels_per_point(), pos2(fill_x, seek_y), hot, accent, t);
             }
 
             // Hover / drag time preview (dragging a clip end: that end's time)
             let preview = if let Some((_, f)) = end_drag { Some(f) }
                 else if dragging { app.drag_frac }
-                else if seek.hovered() { seek.hover_pos().map(|pp| frac_at(pp.x)) }
+                else if seek.hovered() && !live { seek.hover_pos().map(|pp| frac_at(pp.x)) }
                 else { None };
             if let (Some(f), true) = (preview, duration > 0.0) {
                 let secs = to_secs(f);
@@ -714,9 +717,14 @@ pub(crate) fn draw_bottom_bar(app: &mut FluentMediaPlayer, ctx: &egui::Context, 
             let left = screen.left();
             let right = screen.right();
 
-            let time_text = format!("{} / {}", fmt_time(app.time_pos), fmt_time(app.duration));
+            // (a live stream: how long it's been playing, then a red dot and "Live")
+            let time_text = if live { fmt_time(app.time_pos) } else { format!("{} / {}", fmt_time(app.time_pos), fmt_time(app.duration)) };
             let time_font = FontId::new(14.5, FontFamily::Name("semibold".into()));
-            let time_w = p.layout_no_wrap(time_text.clone(), time_font.clone(), white).size().x;
+            let clock_w = p.layout_no_wrap(time_text.clone(), time_font.clone(), white).size().x;
+            const LIVE_GAP: f32 = 12.0;
+            const LIVE_DOT: f32 = 4.0;
+            let live_g = live.then(|| p.layout_no_wrap("Live".to_owned(), time_font.clone(), white));
+            let time_w = clock_w + live_g.as_ref().map_or(0.0, |g| LIVE_GAP + LIVE_DOT * 2.0 + 6.0 + g.size().x);
             let lay = row_layout(left, right, time_w);
 
             // Play / pause
@@ -746,6 +754,11 @@ pub(crate) fn draw_bottom_bar(app: &mut FluentMediaPlayer, ctx: &egui::Context, 
 
             // Time
             p.text(pos2(lay.time_x, row_y - 1.0), Align2::LEFT_CENTER, time_text, time_font, white);
+            if let Some(g) = live_g {
+                let dot = pos2(lay.time_x + clock_w + LIVE_GAP + LIVE_DOT, row_y);
+                p.circle_filled(dot, LIVE_DOT, Color32::from_rgb(232, 17, 35).gamma_multiply(t));
+                p.galley(pos2(dot.x + LIVE_DOT + 6.0, row_y - 1.0 - g.size().y / 2.0), g, white);
+            }
             // The chapter playing (videos with chapters): "12:41 / 33:07 | Title",
             // cut short to the room before the buttons on the right
             if let Some(title) = chapter_at(&app.chapters, app.time_pos) {
