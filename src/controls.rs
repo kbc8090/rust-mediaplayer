@@ -274,8 +274,6 @@ pub(crate) fn icon_speed(p: &egui::Painter, c: Pos2, col: Color32) {
     adjust::disc(p, c, 1.7 * K, col);
 }
 
-/// Slider thumb: light ring with an accent dot, both circles share one centre that is
-/// snapped to the physical pixel grid so the dot can never look off-centre.
 /// A bar with fully round ends (a pill), drawn with smooth half circles (egui's own
 /// rounded corners are only a few points at this size, and look square)
 pub(crate) fn pill(p: &egui::Painter, rect: Rect, color: Color32) {
@@ -560,9 +558,13 @@ pub(crate) fn draw_bottom_bar(app: &mut FluentMediaPlayer, ctx: &egui::Context, 
                 p.rect_filled(r, 4.0, Color32::from_rgba_unmultiplied(32, 32, 32, (235.0 * t) as u8));
                 p.text(r.center(), Align2::CENTER_CENTER, txt, font, white);
 
-                // Thumbnail of that moment, above the time
-                app.thumbs.request(ctx, secs);
-                if let Some(aspect) = app.thumbs.aspect() {
+                // Thumbnail of that moment, above the time (not for links: that
+                // would mean fetching the video a second time)
+                let thumbs_ok = !is_url(&app.current_file);
+                if thumbs_ok {
+                    app.thumbs.request(ctx, secs);
+                }
+                if let Some(aspect) = app.thumbs.aspect().filter(|_| thumbs_ok) {
                     let tw = (thumbs::THUMB_H * aspect).clamp(64.0, 200.0);
                     let th = (tw / aspect).clamp(40.0, 150.0);
                     let ppp = ctx.pixels_per_point();

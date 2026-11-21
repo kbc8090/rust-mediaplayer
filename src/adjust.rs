@@ -339,6 +339,14 @@ pub struct AdjustUi {
     /// Denoise is on but not used for the current video (larger than 1080p);
     /// set by the app every frame, and mentioned in Denoise's description
     pub denoise_skipped: bool,
+    /// The Online video settings panel (same place as Picture & Sound; one or the
+    /// other) and its audio language list
+    pub online_open: bool,
+    pub online_rect: Rect,
+    pub lang_open: bool,
+    pub lang_rect: Rect,
+    /// Scroll the language list to the chosen language (set when it opens)
+    pub lang_scroll: bool,
 }
 
 impl AdjustUi {
@@ -353,11 +361,18 @@ impl AdjustUi {
             tip_since: std::time::Instant::now(),
             tip_shown: false,
             denoise_skipped: false,
+            online_open: false,
+            online_rect: Rect::NOTHING,
+            lang_open: false,
+            lang_rect: Rect::NOTHING,
+            lang_scroll: false,
         }
     }
 
     pub fn contains(&self, p: Pos2) -> bool {
-        (self.open && self.panel_rect.contains(p)) || (self.eq_open && self.eq_rect.contains(p))
+        (self.open && self.panel_rect.contains(p))
+            || (self.eq_open && self.eq_rect.contains(p))
+            || (self.online_open && (self.online_rect.contains(p) || (self.lang_open && self.lang_rect.contains(p))))
     }
 }
 
@@ -430,8 +445,13 @@ fn panel_frame(p: &egui::Painter, rect: Rect) {
     p.rect_stroke(rect.shrink(0.5), r, Stroke::new(1.0_f32, glass::edge(Color32::from_rgba_premultiplied(30, 30, 30, 30))));
 }
 
-/// Title, optional "Reset" link and an X. Returns (reset clicked, close clicked).
+/// Title, "Reset" link and an X. Returns (reset clicked, close clicked).
 fn header(ui: &mut egui::Ui, p: &egui::Painter, rect: Rect, title: &str, id: &str) -> (bool, bool) {
+    header_with(ui, p, rect, title, id, true)
+}
+
+/// Title, optionally a "Reset" link, and an X. Returns (reset clicked, close clicked).
+fn header_with(ui: &mut egui::Ui, p: &egui::Painter, rect: Rect, title: &str, id: &str, with_reset: bool) -> (bool, bool) {
     let cy = rect.top() + HEAD_H / 2.0;
     p.text(pos2(rect.left() + 16.0, cy), Align2::LEFT_CENTER, title, semibold(14.5), TEXT);
 
@@ -445,21 +465,25 @@ fn header(ui: &mut egui::Ui, p: &egui::Painter, rect: Rect, title: &str, id: &st
         p.line_segment([c + vec2(a.0, a.1), c + vec2(b.0, b.1)], Stroke::new(1.2_f32, TEXT));
     }
 
-    let font = FontId::proportional(12.5);
-    let g = p.layout_no_wrap("Reset".to_owned(), font, DIM);
-    let rr = Rect::from_center_size(pos2(xr.left() - 10.0 - g.size().x / 2.0, cy), g.size() + vec2(10.0, 8.0));
-    let reset = ui.interact(rr, ui.id().with((id, "reset")), Sense::click_and_drag());
-    if let Some(c) = state_fill(&reset) {
-        p.rect_filled(rr, 4.0, c);
+    let mut reset_clicked = false;
+    if with_reset {
+        let font = FontId::proportional(12.5);
+        let g = p.layout_no_wrap("Reset".to_owned(), font, DIM);
+        let rr = Rect::from_center_size(pos2(xr.left() - 10.0 - g.size().x / 2.0, cy), g.size() + vec2(10.0, 8.0));
+        let reset = ui.interact(rr, ui.id().with((id, "reset")), Sense::click_and_drag());
+        if let Some(c) = state_fill(&reset) {
+            p.rect_filled(rr, 4.0, c);
+        }
+        let col = if reset.hovered() { TEXT } else { DIM };
+        p.galley(rr.center() - g.size() / 2.0, g, col);
+        reset_clicked = activated(&reset);
     }
-    let col = if reset.hovered() { TEXT } else { DIM };
-    p.galley(rr.center() - g.size() / 2.0, g, col);
 
     p.line_segment(
         [pos2(rect.left() + 1.0, rect.top() + HEAD_H - 0.5), pos2(rect.right() - 1.0, rect.top() + HEAD_H - 0.5)],
         Stroke::new(1.0_f32, LINE),
     );
-    (activated(&reset), activated(&x))
+    (reset_clicked, activated(&x))
 }
 
 /// A key cap button ("−" / "+") with its label at `size`; returns true when clicked
@@ -838,9 +862,13 @@ pub fn draw_panel(ctx: &egui::Context, ui_state: &mut AdjustUi, a: &mut Adjust, 
     if open_eq {
         ui_state.eq_open = !ui_state.eq_open;
     }
-    // A row's description appears after the pointer has been on that row for a
-    // moment, then stays while the pointer is anywhere on the row (moving or not).
-    // Moving to another row while one is showing switches straight to the new one.
+    show_tip(ctx, ui_state, hovered_desc, rect);
+}
+
+/// A row's description appears after the pointer has been on that row for a
+/// moment, then stays while the pointer is anywhere on the row (moving or not).
+/// Moving to another row while one is showing switches straight to the new one.
+fn show_tip(ctx: &egui::Context, ui_state: &mut AdjustUi, hovered_desc: Option<(Rect, &'static str)>, rect: Rect) {
     const TIP_DELAY: f32 = 0.35;
     match hovered_desc {
         Some((row, desc)) => {
@@ -1006,4 +1034,462 @@ fn kelvin_rgb(k: f32) -> [f32; 3] {
         0.543_206_8 * (kelvin - 10.0).ln() - 1.196_254_1
     };
     [r.clamp(0.0, 1.0), g.clamp(0.0, 1.0), b.clamp(0.0, 1.0)]
+}
+
+// ── The "Online video settings" panel ─────────────────────────────────────────
+
+/// 2–3 choices side by side, ending at `right`; the chosen one raised, with an
+/// accent edge along its bottom like the selected tab. Returns the one clicked.
+#[allow(clippy::too_many_arguments)]
+fn segmented(ui: &mut egui::Ui, p: &egui::Painter, right: f32, cy: f32, labels: &[&str], chosen: usize, id: &str, accent: Color32) -> Option<usize> {
+    const PAD: f32 = 9.0;
+    let widths: Vec<f32> = labels
+        .iter()
+        .map(|l| p.layout_no_wrap((*l).to_owned(), semibold(12.0), TEXT).size().x + PAD * 2.0)
+        .collect();
+    let total = widths.iter().sum::<f32>() + 2.0 * (labels.len() as f32 - 1.0) + 4.0;
+    let outer = Rect::from_min_size(pos2(right - total, cy - 12.0), vec2(total, 24.0));
+    p.rect_filled(outer, 5.0, Color32::from_rgb(52, 52, 54));
+    let mut x = outer.left() + 2.0;
+    let mut clicked = None;
+    for (i, (label, w)) in labels.iter().zip(&widths).enumerate() {
+        let r = Rect::from_min_size(pos2(x, outer.top() + 2.0), vec2(*w, 20.0));
+        let resp = ui.interact(r, ui.id().with((id, i)), Sense::click_and_drag());
+        if i == chosen {
+            let lower = Rect::from_min_max(pos2(r.left() - 1.0, r.center().y), pos2(r.right() + 1.0, r.bottom() + 1.0));
+            p.with_clip_rect(lower).rect_filled(r, 4.0, accent);
+            p.rect_filled(Rect::from_min_max(r.min, pos2(r.right(), r.bottom() - 2.0)), 4.0, Color32::from_rgb(84, 84, 86));
+            p.text(r.center() - vec2(0.0, 1.0), Align2::CENTER_CENTER, *label, semibold(12.0), TEXT);
+        } else {
+            if let Some(c) = state_fill(&resp) {
+                p.rect_filled(r, 4.0, c);
+            }
+            p.text(r.center(), Align2::CENTER_CENTER, *label, FontId::proportional(12.0), Color32::from_rgb(200, 200, 200));
+        }
+        if activated(&resp) {
+            clicked = Some(i);
+        }
+        x += w + 2.0;
+    }
+    clicked
+}
+
+/// The Online video settings panel: which formats to ask yt-dlp for when a link
+/// is opened (top left, where Picture & Sound goes; one or the other)
+pub fn draw_online(ctx: &egui::Context, ui_state: &mut AdjustUi, o: &mut crate::online::Online, accent: Color32) {
+    use crate::online::{AudioCodec, Online, VideoCodec, LANGUAGES};
+    if !ui_state.online_open {
+        ui_state.online_rect = Rect::NOTHING;
+        ui_state.lang_open = false;
+        return;
+    }
+    const NOTE_H: f32 = 34.0;
+    let screen = ctx.screen_rect();
+    let w = PANEL_W.min(screen.width() - 16.0);
+    let h = HEAD_H + 6.0 + ROW_H * 6.0 + 9.0 + NOTE_H;
+    let rect = Rect::from_min_size(pos2(screen.left() + 8.0, screen.top() + PANEL_TOP), vec2(w, h));
+    ui_state.online_rect = rect;
+
+    let mut hovered_desc: Option<(Rect, &'static str)> = None;
+    let mut lang_row = Rect::NOTHING;
+    let id = egui::Id::new("online_panel");
+    egui::Area::new(id).order(egui::Order::Foreground).fixed_pos(rect.min).show(ctx, |ui| {
+        ui.allocate_rect(rect, Sense::click_and_drag());
+        let p = ui.painter().clone();
+        panel_frame(&p, rect);
+        let (reset, close) = header(ui, &p, rect, "Online video settings", "online");
+        if close {
+            ui_state.online_open = false;
+        }
+        if reset {
+            *o = Online::default();
+        }
+        let mut top = rect.top() + HEAD_H + 6.0;
+        let mut next_row = |hgt: f32| {
+            let r = Rect::from_min_size(pos2(rect.left() + 6.0, top), vec2(w - 12.0, hgt));
+            top += hgt;
+            r
+        };
+        let name = |p: &egui::Painter, r: Rect, text: &str| {
+            p.text(pos2(r.left() + 10.0, r.center().y), Align2::LEFT_CENTER, text, FontId::proportional(NAME_SIZE), TEXT);
+        };
+        let hover_row = |ui: &egui::Ui, p: &egui::Painter, r: Rect| {
+            let over = ui.rect_contains_pointer(r);
+            if over {
+                p.rect_filled(r, 4.0, HOVER);
+            }
+            over
+        };
+
+        // Video format
+        let r = next_row(ROW_H);
+        if hover_row(ui, &p, r) {
+            hovered_desc = Some((r, "Which kind of video to ask for when a site offers several. VP9 and H.264 are decoded by the graphics card on most PCs; AV1 only on newer ones, and it's heavy for older PCs."));
+        }
+        name(&p, r, "Video format");
+        let chosen = match o.codec {
+            VideoCodec::H264 => 0,
+            VideoCodec::Vp9 => 1,
+            VideoCodec::Av1 => 2,
+        };
+        if let Some(i) = segmented(ui, &p, r.right() - 6.0, r.center().y, &["H.264", "VP9", "AV1"], chosen, "codec", accent) {
+            o.codec = [VideoCodec::H264, VideoCodec::Vp9, VideoCodec::Av1][i];
+        }
+
+        // Max quality
+        let r = next_row(ROW_H);
+        if hover_row(ui, &p, r) {
+            hovered_desc = Some((r, "The largest picture to play. Smaller uses less internet and computer power. \"Audio only\" plays just the sound."));
+        }
+        name(&p, r, "Max quality");
+        let plus = Rect::from_center_size(pos2(r.right() - 19.0, r.center().y), vec2(26.0, 22.0));
+        let minus = plus.translate(vec2(-112.0, 0.0));
+        let col = if o.max_height != Online::default().max_height { accent } else { Color32::from_rgb(189, 189, 189) };
+        p.text(pos2((minus.right() + plus.left()) / 2.0, r.center().y), Align2::CENTER_CENTER, o.quality_label(), FontId::proportional(VALUE_SIZE), col);
+        if cap_sized(ui, &p, minus, "\u{2212}", ui.id().with("quality_minus"), 14.5) {
+            o.step_quality(-1);
+        }
+        if cap_sized(ui, &p, plus, "+", ui.id().with("quality_plus"), 14.5) {
+            o.step_quality(1);
+        }
+
+        // Switches
+        for (label, desc, key) in [
+            ("50/60 fps", "Prefer the smoother 50 or 60 fps version of a video when there is one.", 0),
+            ("HDR", "Prefer HDR versions. Only worth it on an HDR display; on a normal one HDR video tends to look washed out.", 1),
+        ] {
+            let r = next_row(ROW_H);
+            let resp = ui.interact(r, ui.id().with(("online_switch", key)), Sense::click_and_drag());
+            if let Some(c) = state_fill(&resp) {
+                p.rect_filled(r, 4.0, c);
+            }
+            if resp.hovered() {
+                hovered_desc = Some((r, desc));
+            }
+            name(&p, r, label);
+            let on = if key == 0 { o.hfr } else { o.hdr };
+            switch(&p, Rect::from_center_size(pos2(r.right() - 28.0, r.center().y), vec2(38.0, 19.0)), on, accent);
+            if activated(&resp) {
+                if key == 0 {
+                    o.hfr = !o.hfr;
+                } else {
+                    o.hdr = !o.hdr;
+                }
+            }
+        }
+
+        let r = next_row(9.0);
+        p.line_segment([pos2(r.left() + 4.0, r.center().y), pos2(r.right() - 4.0, r.center().y)], Stroke::new(1.0_f32, LINE));
+
+        // Audio format
+        let r = next_row(ROW_H);
+        if hover_row(ui, &p, r) {
+            hovered_desc = Some((r, "Which kind of sound to ask for. On YouTube, Opus is usually the better quality."));
+        }
+        name(&p, r, "Audio format");
+        let chosen = if o.audio == AudioCodec::Aac { 0 } else { 1 };
+        if let Some(i) = segmented(ui, &p, r.right() - 6.0, r.center().y, &["AAC", "Opus"], chosen, "audio", accent) {
+            o.audio = if i == 0 { AudioCodec::Aac } else { AudioCodec::Opus };
+        }
+
+        // Audio language (opens a list beside the panel)
+        let r = next_row(ROW_H);
+        lang_row = r;
+        let resp = ui.interact(r, ui.id().with("lang_row"), Sense::click_and_drag());
+        if ui_state.lang_open {
+            p.rect_filled(r, 4.0, HOVER);
+        } else if let Some(c) = state_fill(&resp) {
+            p.rect_filled(r, 4.0, c);
+        }
+        if resp.hovered() && !ui_state.lang_open {
+            hovered_desc = Some((r, "For videos with sound in several languages (dubbed versions). Default plays the video's own."));
+        }
+        name(&p, r, "Audio language");
+        let c = pos2(r.right() - 14.0, r.center().y);
+        p.text(pos2(r.right() - 26.0, r.center().y), Align2::RIGHT_CENTER, o.language_name(), FontId::proportional(VALUE_SIZE), Color32::from_rgb(220, 220, 220));
+        p.line_segment([c + vec2(-2.5, -4.5), c + vec2(2.0, 0.0)], Stroke::new(1.3_f32, TEXT));
+        p.line_segment([c + vec2(2.0, 0.0), c + vec2(-2.5, 4.5)], Stroke::new(1.3_f32, TEXT));
+        if activated(&resp) {
+            ui_state.lang_open = !ui_state.lang_open;
+            ui_state.lang_scroll = ui_state.lang_open;
+        }
+
+        // Note
+        let r = next_row(NOTE_H);
+        p.text(
+            pos2(r.left() + 10.0, r.center().y),
+            Align2::LEFT_CENTER,
+            "Links play via yt-dlp, which updates itself.",
+            FontId::proportional(11.5),
+            Color32::from_rgb(150, 150, 150),
+        );
+    });
+
+    // The language list, beside the panel next to its row
+    if ui_state.lang_open {
+        const ITEM_H: f32 = 24.0;
+        // Whole rows only (at most 12), so the list never ends on half a name
+        let rows = (((screen.height() - 22.0) / ITEM_H).floor() as usize).clamp(4, 12).min(LANGUAGES.len());
+        let list_h = rows as f32 * ITEM_H + 6.0;
+        let lw = 190.0;
+        let x = (rect.right() + 6.0).min(screen.right() - lw - 8.0);
+        let y = (lang_row.top() - 3.0).clamp(screen.top() + 8.0, (screen.bottom() - 8.0 - list_h).max(screen.top() + 8.0));
+        let lr = Rect::from_min_size(pos2(x, y), vec2(lw, list_h));
+        ui_state.lang_rect = lr;
+        // A press outside the list (other than on its row, which toggles it) closes it
+        let outside = ctx.input(|i| {
+            i.pointer.any_pressed() && i.pointer.press_origin().is_some_and(|q| !lr.contains(q) && !lang_row.contains(q))
+        });
+        if outside {
+            ui_state.lang_open = false;
+        } else {
+            let lid = egui::Id::new("online_lang_list");
+            egui::Area::new(lid).order(egui::Order::Foreground).fixed_pos(lr.min).show(ctx, |ui| {
+                ui.allocate_rect(lr, Sense::click_and_drag());
+                let p = ui.painter().clone();
+                panel_frame(&p, lr);
+                let inner = lr.shrink(3.0);
+                let mut child = ui.child_ui(inner, egui::Layout::top_down(egui::Align::Min));
+                egui::ScrollArea::vertical().max_height(inner.height()).show(&mut child, |ui| {
+                    ui.spacing_mut().item_spacing = vec2(0.0, 0.0);
+                    for (code, lang) in LANGUAGES {
+                        let (r, _) = ui.allocate_exact_size(vec2(inner.width() - 8.0, ITEM_H), Sense::hover());
+                        let resp = ui.interact(r, ui.id().with(("lang", code)), Sense::click_and_drag());
+                        let p = ui.painter().clone();
+                        if let Some(c) = state_fill(&resp) {
+                            p.rect_filled(r, 4.0, c);
+                        }
+                        if o.language == code {
+                            disc(&p, pos2(r.left() + 12.0, r.center().y), 2.5, TEXT);
+                            if ui_state.lang_scroll {
+                                ui.scroll_to_rect(r, Some(egui::Align::Center));
+                            }
+                        }
+                        p.text(pos2(r.left() + 24.0, r.center().y), Align2::LEFT_CENTER, lang, FontId::proportional(13.0), TEXT);
+                        if activated(&resp) {
+                            o.language = code;
+                            ui_state.lang_open = false;
+                        }
+                    }
+                    ui_state.lang_scroll = false;
+                });
+            });
+            ctx.move_to_top(egui::LayerId::new(egui::Order::Foreground, lid));
+        }
+    } else {
+        ui_state.lang_rect = Rect::NOTHING;
+    }
+    show_tip(ctx, ui_state, hovered_desc, rect);
+}
+
+// ── The Open URL box ──────────────────────────────────────────────────────────
+
+pub enum UrlBoxAction {
+    None,
+    Open(String),
+    Cancel,
+}
+
+/// The Open URL box in the middle of the window: a text field (filled in from the
+/// clipboard when it holds a link), Cancel and Open. Enter opens.
+pub fn draw_url_box(ctx: &egui::Context, b: &mut crate::online::UrlBox, accent: Color32) -> UrlBoxAction {
+    let screen = ctx.screen_rect();
+    let w = 440.0_f32.min(screen.width() - 24.0);
+    let h = HEAD_H + 134.0;
+    let rect = Rect::from_center_size(screen.center(), vec2(w, h));
+    let mut action = UrlBoxAction::None;
+    let id = egui::Id::new("url_box");
+    egui::Area::new(id).order(egui::Order::Foreground).fixed_pos(rect.min).show(ctx, |ui| {
+        ui.allocate_rect(rect, Sense::click_and_drag());
+        let p = ui.painter().clone();
+        panel_frame(&p, rect);
+        let (_, close) = header_with(ui, &p, rect, "Open URL", "url", false);
+        if close {
+            action = UrlBoxAction::Cancel;
+        }
+
+        // The text field: dark box, accent line along the bottom (Windows 11 style)
+        let field = Rect::from_min_size(pos2(rect.left() + 16.0, rect.top() + HEAD_H + 14.0), vec2(w - 32.0, 34.0));
+        p.rect_filled(field, 4.0, Color32::from_black_alpha(70));
+        p.rect_stroke(field.shrink(0.5), 4.0, Stroke::new(1.0_f32, Color32::from_rgb(64, 64, 64)));
+        p.with_clip_rect(Rect::from_min_max(pos2(field.left(), field.bottom() - 2.0), field.max))
+            .rect_filled(field, 4.0, accent);
+        let inner = Rect::from_min_max(pos2(field.left() + 10.0, field.top()), pos2(field.right() - 10.0, field.bottom() - 2.0));
+        let mut child = ui.child_ui(inner, egui::Layout::left_to_right(egui::Align::Center));
+        {
+            let v = child.visuals_mut();
+            v.selection.bg_fill = accent.gamma_multiply(0.45);
+            v.selection.stroke = Stroke::new(1.0_f32, TEXT);
+            v.text_cursor = Stroke::new(1.5_f32, TEXT);
+            v.extreme_bg_color = Color32::TRANSPARENT;
+        }
+        let edit = egui::TextEdit::singleline(&mut b.text)
+            .id(egui::Id::new(crate::online::URL_FIELD))
+            .frame(false)
+            .font(FontId::proportional(13.5))
+            .text_color(TEXT)
+            .hint_text(egui::RichText::new("https://\u{2026}").color(DIM))
+            .desired_width(inner.width());
+        let resp = child.add(edit);
+        if b.focus {
+            resp.request_focus();
+            b.focus = false;
+        }
+        let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+        p.text(
+            pos2(field.left() + 2.0, field.bottom() + 16.0),
+            Align2::LEFT_CENTER,
+            "A YouTube link, or one from any other site yt-dlp supports.",
+            FontId::proportional(12.0),
+            DIM,
+        );
+
+        // Cancel / Open (Open is dimmed until the text is a link)
+        let valid = crate::online::normalize_url(&b.text).is_some();
+        let open_r = Rect::from_min_size(pos2(rect.right() - 16.0 - 84.0, rect.bottom() - 16.0 - 30.0), vec2(84.0, 30.0));
+        let cancel_r = open_r.translate(vec2(-92.0, 0.0));
+        if cap_sized(ui, &p, cancel_r, "Cancel", ui.id().with("url_cancel"), 13.0) {
+            action = UrlBoxAction::Cancel;
+        }
+        let open = ui.interact(open_r, ui.id().with("url_open"), Sense::click_and_drag());
+        let inside = ctx.input(|i| i.pointer.latest_pos()).is_some_and(|q| open_r.contains(q));
+        let fill = if !valid {
+            accent.gamma_multiply(0.35)
+        } else if open.is_pointer_button_down_on() && inside {
+            accent.gamma_multiply(0.8)
+        } else if open.hovered() {
+            accent.gamma_multiply(0.92)
+        } else {
+            accent
+        };
+        p.rect_filled(open_r, 4.0, fill);
+        let label_col = if valid { Color32::from_rgb(20, 20, 20) } else { Color32::from_rgb(20, 20, 20).gamma_multiply(0.6) };
+        p.text(open_r.center(), Align2::CENTER_CENTER, "Open", semibold(13.0), label_col);
+        if valid && (activated(&open) || enter) {
+            action = UrlBoxAction::Open(b.text.clone());
+        }
+    });
+    ctx.move_to_top(egui::LayerId::new(egui::Order::Foreground, id));
+    action
+}
+
+// ── The save card (Save As… in progress) ──────────────────────────────────────
+
+pub enum SaveCardAction {
+    None,
+    /// The X: cancel a save that's running, or just close the card
+    Close,
+    ShowInFolder,
+}
+
+/// One line of text cut to `width` with "…"
+fn elided(p: &egui::Painter, text: &str, font: FontId, color: Color32, width: f32) -> std::sync::Arc<egui::Galley> {
+    let mut job = egui::text::LayoutJob::simple_singleline(text.to_owned(), font, color);
+    job.wrap = egui::text::TextWrapping { max_width: width, max_rows: 1, break_anywhere: true, overflow_character: Some('\u{2026}') };
+    p.layout_job(job)
+}
+
+/// A small card in the top right while a link is being saved: what's happening,
+/// the video's title, and a progress bar; once saved, "Show in folder". `alpha`
+/// fades it with the title bar (it only stays put when there's news).
+pub fn draw_save_card(ctx: &egui::Context, title: &str, stage: &crate::online::SaveStage, alpha: f32, accent: Color32) -> SaveCardAction {
+    use crate::online::{SavePart, SaveStage};
+    if alpha <= 0.02 {
+        return SaveCardAction::None;
+    }
+    let screen = ctx.screen_rect();
+    let w = 320.0_f32.min(screen.width() - 16.0);
+    let h = 96.0;
+    let rect = Rect::from_min_size(pos2(screen.right() - 8.0 - w, screen.top() + PANEL_TOP), vec2(w, h));
+    let mut action = SaveCardAction::None;
+    let (heading, detail, bar): (&str, String, Option<Option<f32>>) = match stage {
+        SaveStage::Starting => ("Saving", "Looking up the video\u{2026}".to_owned(), Some(None)),
+        SaveStage::Downloading(part, frac) => {
+            let what = match part {
+                SavePart::Video => "Downloading the video",
+                SavePart::Audio => "Downloading the audio",
+                SavePart::Both => "Downloading",
+            };
+            let text = match frac {
+                Some(f) => format!("{what} \u{b7} {}%", (f * 100.0).floor() as u32),
+                None => format!("{what}\u{2026}"),
+            };
+            ("Saving", text, Some(*frac))
+        }
+        SaveStage::Finishing(true) => ("Saving", "Joining the video and audio\u{2026}".to_owned(), Some(None)),
+        SaveStage::Finishing(false) => ("Saving", "Finishing\u{2026}".to_owned(), Some(None)),
+        SaveStage::Done(path) => {
+            let name = Path::new(path).file_name().map_or_else(|| path.clone(), |n| n.to_string_lossy().into_owned());
+            ("Saved", name, None)
+        }
+        SaveStage::Failed(why) => ("Couldn't save", why.clone(), None),
+    };
+    let id = egui::Id::new("save_card");
+    egui::Area::new(id).order(egui::Order::Foreground).fixed_pos(rect.min).show(ctx, |ui| {
+        ui.set_opacity(alpha);
+        ui.allocate_rect(rect, Sense::click_and_drag());
+        let p = ui.painter().clone();
+        panel_frame(&p, rect);
+        let left = rect.left() + 16.0;
+
+        // Heading and the X
+        p.text(pos2(left, rect.top() + 22.0), Align2::LEFT_CENTER, heading, semibold(13.5), TEXT);
+        let xr = Rect::from_center_size(pos2(rect.right() - 20.0, rect.top() + 21.0), vec2(26.0, 26.0));
+        let x = ui.interact(xr, ui.id().with("save_close"), Sense::click_and_drag());
+        if let Some(c) = state_fill(&x) {
+            p.rect_filled(xr, 4.0, c);
+        }
+        let c = xr.center();
+        for (a, b) in [((-4.5, -4.5), (4.5, 4.5)), ((-4.5, 4.5), (4.5, -4.5))] {
+            p.line_segment([c + vec2(a.0, a.1), c + vec2(b.0, b.1)], Stroke::new(1.2_f32, TEXT));
+        }
+        let tip = if matches!(stage, SaveStage::Done(_) | SaveStage::Failed(_)) { "Close" } else { "Cancel saving" };
+        if activated(&x.on_hover_text(tip)) {
+            action = SaveCardAction::Close;
+        }
+
+        // The video's title
+        let g = elided(&p, title, FontId::proportional(13.0), Color32::from_rgb(222, 222, 222), w - 32.0);
+        p.galley(pos2(left, rect.top() + 38.0), g, Color32::from_rgb(222, 222, 222));
+
+        // What's happening / the file's name / why it failed, and "Show in folder"
+        let mut detail_w = w - 32.0;
+        if matches!(stage, SaveStage::Done(_)) {
+            let br = Rect::from_min_size(pos2(rect.right() - 16.0 - 118.0, rect.bottom() - 16.0 - 26.0), vec2(118.0, 26.0));
+            if cap_sized(ui, &p, br, "Show in folder", ui.id().with("save_show"), 12.5) {
+                action = SaveCardAction::ShowInFolder;
+            }
+            detail_w -= 126.0;
+        }
+        let col = if matches!(stage, SaveStage::Failed(_)) { Color32::from_rgb(232, 150, 140) } else { DIM };
+        let g = elided(&p, &detail, FontId::proportional(12.0), col, detail_w);
+        p.galley(pos2(left, rect.bottom() - 29.0 - g.size().y / 2.0), g, col);
+
+        // Progress: a bar filling up, or a short piece sliding along while there's
+        // nothing to measure (looking up, joining)
+        if let Some(frac) = bar {
+            let track = Rect::from_min_max(pos2(left, rect.bottom() - 12.0), pos2(rect.right() - 16.0, rect.bottom() - 9.0));
+            crate::controls::pill(&p, track, Color32::from_rgb(70, 70, 72));
+            match frac {
+                Some(f) => {
+                    if f > 0.0 {
+                        let r = Rect::from_min_max(track.min, pos2(track.left() + track.width() * f, track.bottom()));
+                        crate::controls::pill(&p, r.intersect(track), accent);
+                    }
+                }
+                None => {
+                    let t = ctx.input(|i| i.time) as f32;
+                    let seg = track.width() * 0.28;
+                    let x0 = track.left() - seg + (t * 0.8).fract() * (track.width() + seg);
+                    let r = Rect::from_min_max(pos2(x0.max(track.left()), track.top()), pos2((x0 + seg).min(track.right()), track.bottom()));
+                    if r.width() > 1.0 {
+                        crate::controls::pill(&p, r, accent);
+                    }
+                    ctx.request_repaint();
+                }
+            }
+        }
+    });
+    ctx.move_to_top(egui::LayerId::new(egui::Order::Foreground, id));
+    action
 }

@@ -187,6 +187,44 @@ unsafe extern "system" {
     fn SendMessageW(hwnd: isize, msg: u32, wparam: usize, lparam: isize) -> isize;
 }
 
+#[link(name = "user32")]
+unsafe extern "system" {
+    fn OpenClipboard(hwnd: isize) -> i32;
+    fn CloseClipboard() -> i32;
+    fn GetClipboardData(format: u32) -> isize;
+}
+
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn GlobalLock(mem: isize) -> *const u16;
+    fn GlobalUnlock(mem: isize) -> i32;
+}
+
+/// The text on the clipboard, if there is any
+pub fn clipboard_text() -> Option<String> {
+    const CF_UNICODETEXT: u32 = 13;
+    unsafe {
+        if OpenClipboard(0) == 0 {
+            return None;
+        }
+        let mut text = None;
+        let mem = GetClipboardData(CF_UNICODETEXT);
+        if mem != 0 {
+            let ptr = GlobalLock(mem);
+            if !ptr.is_null() {
+                let mut n = 0;
+                while n < 1 << 20 && *ptr.add(n) != 0 {
+                    n += 1;
+                }
+                text = Some(String::from_utf16_lossy(std::slice::from_raw_parts(ptr, n)));
+                GlobalUnlock(mem);
+            }
+        }
+        CloseClipboard();
+        text
+    }
+}
+
 #[link(name = "kernel32")]
 unsafe extern "system" {
     fn CreateMutexW(attributes: *const c_void, initial_owner: i32, name: *const u16) -> isize;
@@ -724,6 +762,221 @@ unsafe fn run_open_dialog(owner: isize, initial_dir: Option<String>) -> Option<S
     }
     let len = file.iter().position(|&c| c == 0).unwrap_or(file.len());
     Some(String::from_utf16_lossy(&file[..len]))
+}
+
+// ── Folder picker (Save As…) ──────────────────────────────────────────────────
+/// {DC1C5A9C-E88A-4DDE-A5A1-60F82A20AEF7}
+const CLSID_FILE_OPEN_DIALOG: Guid = Guid {
+    data1: 0xDC1C_5A9C,
+    data2: 0xE88A,
+    data3: 0x4DDE,
+    data4: [0xA5, 0xA1, 0x60, 0xF8, 0x2A, 0x20, 0xAE, 0xF7],
+};
+/// {D57C7288-D4AD-4768-BE02-9D969532D960}
+const IID_IFILE_OPEN_DIALOG: Guid = Guid {
+    data1: 0xD57C_7288,
+    data2: 0xD4AD,
+    data3: 0x4768,
+    data4: [0xBE, 0x02, 0x9D, 0x96, 0x95, 0x32, 0xD9, 0x60],
+};
+/// {43826D1E-E718-42EE-BC55-A1E261C37BFE}
+const IID_ISHELL_ITEM: Guid = Guid {
+    data1: 0x4382_6D1E,
+    data2: 0xE718,
+    data3: 0x42EE,
+    data4: [0xBC, 0x55, 0xA1, 0xE2, 0x61, 0xC3, 0x7B, 0xFE],
+};
+// IFileDialog vtable slots (IUnknown 0-2, IModalWindow::Show 3, IFileDialog 4-26)
+const VT_RELEASE: usize = 2;
+const VT_SHOW: usize = 3;
+const VT_SET_OPTIONS: usize = 9;
+const VT_GET_OPTIONS: usize = 10;
+const VT_SET_DEFAULT_FOLDER: usize = 11;
+const VT_SET_TITLE: usize = 17;
+const VT_SET_OK_BUTTON_LABEL: usize = 18;
+const VT_GET_RESULT: usize = 20;
+// IShellItem (IUnknown 0-2, BindToHandler 3, GetParent 4, GetDisplayName 5)
+const VT_GET_DISPLAY_NAME: usize = 5;
+const FOS_PICKFOLDERS: u32 = 0x20;
+const FOS_FORCEFILESYSTEM: u32 = 0x40;
+const SIGDN_FILESYSPATH: u32 = 0x8005_8000;
+
+#[link(name = "ole32")]
+unsafe extern "system" {
+    fn CoTaskMemFree(mem: *mut c_void);
+}
+
+#[link(name = "shell32")]
+unsafe extern "system" {
+    fn SHCreateItemFromParsingName(path: *const u16, bind: *mut c_void, iid: *const Guid, out: *mut *mut c_void) -> i32;
+}
+
+static PICKED_FOLDER: Mutex<Option<String>> = Mutex::new(None);
+
+/// The folder picked in the folder dialog, once it has closed
+pub fn take_picked_folder() -> Option<String> {
+    PICKED_FOLDER.lock().ok().and_then(|mut p| p.take())
+}
+
+/// Show Windows' folder picker ("Save here") without blocking the player, like
+/// the open dialog. Windows remembers the last folder used; the first time it
+/// starts in Videos. The choice is collected with `take_picked_folder`.
+pub fn folder_dialog(owner: isize) {
+    if DIALOG_OPEN.swap(true, Ordering::Relaxed) {
+        return; // a dialog is already showing
+    }
+    DIALOG_OWNER.store(owner, Ordering::Relaxed);
+    std::thread::spawn(move || {
+        let picked = unsafe { run_folder_dialog(owner) };
+        if let Some(p) = picked {
+            if let Ok(mut slot) = PICKED_FOLDER.lock() {
+                *slot = Some(p);
+            }
+        }
+        DIALOG_OPEN.store(false, Ordering::Relaxed);
+        wake(DIALOG_OWNER.load(Ordering::Relaxed));
+    });
+}
+
+unsafe fn run_folder_dialog(owner: isize) -> Option<String> {
+    CoInitializeEx(std::ptr::null_mut(), 0x2 /* COINIT_APARTMENTTHREADED */);
+    let mut dialog: *mut c_void = std::ptr::null_mut();
+    let hr = CoCreateInstance(&CLSID_FILE_OPEN_DIALOG, std::ptr::null_mut(), 0x1 /* CLSCTX_INPROC_SERVER */, &IID_IFILE_OPEN_DIALOG, &mut dialog);
+    if hr < 0 || dialog.is_null() {
+        return None;
+    }
+    let release: extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(method(dialog, VT_RELEASE));
+
+    let get_options: extern "system" fn(*mut c_void, *mut u32) -> i32 = std::mem::transmute(method(dialog, VT_GET_OPTIONS));
+    let set_options: extern "system" fn(*mut c_void, u32) -> i32 = std::mem::transmute(method(dialog, VT_SET_OPTIONS));
+    let mut options = 0u32;
+    get_options(dialog, &mut options);
+    set_options(dialog, options | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM);
+
+    let set_title: extern "system" fn(*mut c_void, *const u16) -> i32 = std::mem::transmute(method(dialog, VT_SET_TITLE));
+    let set_ok: extern "system" fn(*mut c_void, *const u16) -> i32 = std::mem::transmute(method(dialog, VT_SET_OK_BUTTON_LABEL));
+    let title = wide("Choose where to save the video");
+    let ok = wide("Save here");
+    set_title(dialog, title.as_ptr());
+    set_ok(dialog, ok.as_ptr());
+
+    // Videos, until Windows has a last-used folder of its own to start in
+    if let Some(home) = std::env::var_os("USERPROFILE") {
+        let videos = std::path::Path::new(&home).join("Videos");
+        if videos.is_dir() {
+            let path = wide(&videos.to_string_lossy());
+            let mut item: *mut c_void = std::ptr::null_mut();
+            if SHCreateItemFromParsingName(path.as_ptr(), std::ptr::null_mut(), &IID_ISHELL_ITEM, &mut item) >= 0 && !item.is_null() {
+                let set_default: extern "system" fn(*mut c_void, *mut c_void) -> i32 =
+                    std::mem::transmute(method(dialog, VT_SET_DEFAULT_FOLDER));
+                set_default(dialog, item);
+                let item_release: extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(method(item, VT_RELEASE));
+                item_release(item);
+            }
+        }
+    }
+
+    let show: extern "system" fn(*mut c_void, isize) -> i32 = std::mem::transmute(method(dialog, VT_SHOW));
+    let mut picked = None;
+    if show(dialog, owner) >= 0 {
+        let get_result: extern "system" fn(*mut c_void, *mut *mut c_void) -> i32 = std::mem::transmute(method(dialog, VT_GET_RESULT));
+        let mut item: *mut c_void = std::ptr::null_mut();
+        if get_result(dialog, &mut item) >= 0 && !item.is_null() {
+            let display_name: extern "system" fn(*mut c_void, u32, *mut *mut u16) -> i32 =
+                std::mem::transmute(method(item, VT_GET_DISPLAY_NAME));
+            let mut name: *mut u16 = std::ptr::null_mut();
+            if display_name(item, SIGDN_FILESYSPATH, &mut name) >= 0 && !name.is_null() {
+                let mut n = 0;
+                while n < 32768 && *name.add(n) != 0 {
+                    n += 1;
+                }
+                picked = Some(String::from_utf16_lossy(std::slice::from_raw_parts(name, n)));
+                CoTaskMemFree(name as *mut c_void);
+            }
+            let item_release: extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(method(item, VT_RELEASE));
+            item_release(item);
+        }
+    }
+    release(dialog);
+    picked
+}
+
+// ── Process group (saving a video) ────────────────────────────────────────────
+// yt-dlp.exe starts a second copy of itself and then ffmpeg, so ending yt-dlp
+// alone would leave those running. A Windows "job" holds all of them: ending the
+// job ends every process in it, and Windows ends it too when the player closes.
+#[repr(C)]
+struct JobLimits {
+    // JOBOBJECT_BASIC_LIMIT_INFORMATION
+    per_process_user_time: i64,
+    per_job_user_time: i64,
+    limit_flags: u32,
+    min_working_set: usize,
+    max_working_set: usize,
+    active_process_limit: u32,
+    affinity: usize,
+    priority_class: u32,
+    scheduling_class: u32,
+    // IO_COUNTERS
+    io: [u64; 6],
+    process_memory_limit: usize,
+    job_memory_limit: usize,
+    peak_process_memory: usize,
+    peak_job_memory: usize,
+}
+const JOB_OBJECT_EXTENDED_LIMIT_INFORMATION: i32 = 9;
+const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: u32 = 0x2000;
+
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn CreateJobObjectW(attributes: *const c_void, name: *const u16) -> isize;
+    fn SetInformationJobObject(job: isize, class: i32, info: *const c_void, len: u32) -> i32;
+    fn AssignProcessToJobObject(job: isize, process: isize) -> i32;
+    fn TerminateJobObject(job: isize, exit_code: u32) -> i32;
+    fn CloseHandle(handle: isize) -> i32;
+}
+
+/// Processes that end together (see above)
+pub struct ProcessGroup(isize);
+
+impl ProcessGroup {
+    /// A group holding `process` (its handle) and everything it starts from now on
+    pub fn new(process: isize) -> Option<Self> {
+        unsafe {
+            let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+            if job == 0 {
+                return None;
+            }
+            let mut limits: JobLimits = std::mem::zeroed();
+            limits.limit_flags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            SetInformationJobObject(
+                job,
+                JOB_OBJECT_EXTENDED_LIMIT_INFORMATION,
+                &limits as *const JobLimits as *const c_void,
+                std::mem::size_of::<JobLimits>() as u32,
+            );
+            if AssignProcessToJobObject(job, process) == 0 {
+                CloseHandle(job);
+                return None;
+            }
+            Some(Self(job))
+        }
+    }
+
+    /// End every process in the group now
+    pub fn end(&self) {
+        unsafe {
+            TerminateJobObject(self.0, 1);
+        }
+    }
+}
+
+impl Drop for ProcessGroup {
+    fn drop(&mut self) {
+        unsafe {
+            CloseHandle(self.0);
+        }
+    }
 }
 
 /// The thumbnail button that was clicked since the last call, if any

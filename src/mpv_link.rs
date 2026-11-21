@@ -39,6 +39,10 @@ pub struct Snapshot {
     pub fps: f64,
     /// The file these details belong to (as passed to loadfile)
     pub path: String,
+    /// No file loaded (also after a file / link failed to open)
+    pub idle: bool,
+    /// The title mpv knows the file by (a link's video title, once yt-dlp found it)
+    pub media_title: String,
     /// Chapters (start time in seconds, title), empty if the file has none
     pub chapters: Arc<Vec<(f64, String)>>,
     /// Video / audio details, only filled while the info overlay is open
@@ -219,6 +223,8 @@ fn run(mpv: Arc<Mutex<Mpv>>, rx: mpsc::Receiver<Job>, state: Arc<Mutex<Snapshot>
             chapters: chapters.clone(),
             info: Vec::new(),
             path: String::new(),
+            idle: m.get_property::<bool>("idle-active").unwrap_or(false),
+            media_title: m.get_property::<String>("media-title").unwrap_or_default(),
         };
         let key = (
             m.get_property::<String>("path").unwrap_or_default(),

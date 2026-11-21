@@ -13,10 +13,12 @@ mod settings;
 mod files;
 mod controls;
 mod menus;
+mod online;
 use settings::*;
 use files::*;
 use controls::*;
 use menus::*;
+use online::*;
 
 use mpv_link::{yn, InfoRow, MpvLink};
 
@@ -52,6 +54,7 @@ unsafe extern "system" {
     fn K32GetProcessMemoryInfo(process: isize, counters: *mut MemCounters, size: u32) -> i32;
     fn GetProcessTimes(process: isize, created: *mut u64, exited: *mut u64, kernel: *mut u64, user: *mut u64) -> i32;
     fn MultiByteToWideChar(code_page: u32, flags: u32, src: *const u8, src_len: i32, dst: *mut u16, dst_len: i32) -> i32;
+    fn LoadLibraryW(name: *const u16) -> isize;
 }
 
 #[link(name = "user32")]
@@ -367,6 +370,20 @@ struct FluentMediaPlayer {
     settings_last: Settings,
     settings_saved: Settings,
     settings_changed: std::time::Instant,
+    /// Online video panel choices (formats asked of yt-dlp)
+    online: Online,
+    /// The Open URL box, while it's open
+    url_box: Option<UrlBox>,
+    /// A link being opened (spinner until it plays)
+    url_load: Option<UrlLoad>,
+    /// A link's video title, once mpv has it (shown instead of the link)
+    media_title: String,
+    /// A link that couldn't be opened: when, and the message shown
+    link_error: Option<(std::time::Instant, &'static str)>,
+    /// Save As…: the link and title waiting for a folder to be picked
+    save_pending: Option<(String, String)>,
+    /// A link being saved (or just saved): the card in the top right
+    save: Option<SaveJob>,
     /// Current and last-written window geometry
     win_state: WinState,
     win_saved: WinState,
@@ -482,7 +499,7 @@ impl FluentMediaPlayer {
         let startup_file = std::env::args_os()
             .skip(1)
             .map(PathBuf::from)
-            .find(|p| p.is_file())
+            .find(|p| p.is_file() || is_url(&p.to_string_lossy()))
             .map(|p| p.to_string_lossy().into_owned());
 
         // video-timing-offset = 0 stops mpv from blocking the UI thread inside
@@ -601,6 +618,13 @@ impl FluentMediaPlayer {
             settings_last: st,
             settings_saved: st,
             settings_changed: std::time::Instant::now(),
+            online: st.online,
+            url_box: None,
+            url_load: None,
+            media_title: String::new(),
+            link_error: None,
+            save_pending: None,
+            save: None,
             win_state: saved,
             win_saved: saved,
             win_changed: std::time::Instant::now(),
@@ -646,6 +670,13 @@ impl FluentMediaPlayer {
             last_af: None,
         };
         app.apply_adjust_all();
+        // Links: mpv's built-in yt-dlp support, using the yt-dlp.exe shipped beside
+        // the player (otherwise mpv looks for one on the PATH)
+        app.link.set("ytdl", "yes");
+        if let Some(p) = ytdlp_path() {
+            app.link.command("change-list", &["script-opts", "append", &format!("ytdl_hook-ytdl_path={}", p.display())]);
+        }
+        app.apply_online();
         app
     }
 
@@ -653,7 +684,9 @@ impl FluentMediaPlayer {
     /// previous / next go through its entries; otherwise through the files of the
     /// same kind (videos / music / pictures) in the file's folder.
     fn open_file(&mut self, path: &str) {
-        if is_playlist_file(path) {
+        if is_url(path) {
+            self.open_url(path);
+        } else if is_playlist_file(path) {
             let entries = read_playlist(Path::new(path));
             let Some(first) = entries.first().map(|p| p.to_string_lossy().into_owned()) else { return };
             self.playlist = Some(PathBuf::from(path));
@@ -691,6 +724,11 @@ impl FluentMediaPlayer {
     fn load_entry(&mut self, path: &str) {
         self.current_file = path.to_owned();
         self.has_file = true;
+        self.media_title.clear();
+        if !is_url(path) {
+            self.url_load = None;
+            self.link_error = None;
+        }
         if self.rotation != 0 || self.mirror {
             self.rotation = 0;
             self.mirror = false;
@@ -711,13 +749,17 @@ impl FluentMediaPlayer {
         self.time_pos = 0.0;
         self.eof = false;
         self.chapters = Arc::new(Vec::new());
-        self.thumbs.load(path);
+        if is_url(path) {
+            self.thumbs.forget();
+        } else {
+            self.thumbs.load(path);
+        }
         self.touch();
     }
 
     /// Open a file handed to us from outside (open dialog, a second launch)
     fn open_external(&mut self, path: String) {
-        if !Path::new(&path).is_file() {
+        if !Path::new(&path).is_file() && !is_url(&path) {
             return;
         }
         if self.render_ctx_initialized {
@@ -731,7 +773,7 @@ impl FluentMediaPlayer {
     fn set_sort(&mut self, by: SortBy, desc: bool) {
         self.sort_by = by;
         self.sort_desc = desc;
-        if self.playlist.is_none() && self.has_file {
+        if self.playlist.is_none() && self.has_file && !is_url(&self.current_file) {
             let current = self.current_file.clone();
             self.start_folder_scan(&current);
         }
@@ -933,7 +975,7 @@ impl FluentMediaPlayer {
         let dir = Path::new(&self.current_file)
             .parent()
             .map(|d| d.to_string_lossy().into_owned())
-            .filter(|d| !d.is_empty());
+            .filter(|d| !d.is_empty() && !is_url(&self.current_file));
         taskbar::open_file_dialog(self.hwnd, dir);
     }
 
@@ -993,6 +1035,7 @@ impl FluentMediaPlayer {
             border: self.border,
             hq: self.hq,
             glass: self.glass,
+            online: self.online,
         }
     }
 
@@ -1008,6 +1051,9 @@ impl FluentMediaPlayer {
         if self.adjust != self.adjust_saved {
             self.adjust.save(&adjust_path());
         }
+        // A save still running is cancelled (and its half-downloaded pieces left
+        // for yt-dlp to carry on from if the same video is saved there again)
+        self.save = None;
         terminate_now()
     }
 
@@ -1205,6 +1251,9 @@ impl FluentMediaPlayer {
     }
 
     fn file_name(&self) -> String {
+        if is_url(&self.current_file) {
+            return if self.media_title.is_empty() { short_url(&self.current_file) } else { self.media_title.clone() };
+        }
         std::path::Path::new(&self.current_file)
             .file_name()
             .and_then(|s| s.to_str())
@@ -1218,9 +1267,13 @@ impl eframe::App for FluentMediaPlayer {
         // No button ever keeps keyboard focus. egui moves focus between buttons with
         // Tab (our info key), and a focused button also "clicks" on Space / Enter,
         // so Tab then Space would have paused *and* pressed some button.
+        // (The Open URL box's text field is the exception while the box is open.)
+        let typing = self.url_box.is_some().then(|| egui::Id::new(URL_FIELD));
         ctx.memory_mut(|m| {
             if let Some(id) = m.focused() {
-                m.surrender_focus(id);
+                if Some(id) != typing {
+                    m.surrender_focus(id);
+                }
             }
         });
         // ── Folder list from the background scan ──────────────────────────────
@@ -1239,6 +1292,10 @@ impl eframe::App for FluentMediaPlayer {
         let dt = now.duration_since(self.last_tick).as_secs_f64().min(0.25);
         self.last_tick = now;
         if snap.valid {
+            self.track_url_load(&snap);
+            if is_url(&self.current_file) && snap.path == self.current_file && !snap.media_title.is_empty() {
+                self.media_title = snap.media_title.clone();
+            }
             self.duration = snap.duration;
             self.video_fps = snap.fps;
             self.update_smooth();
@@ -1340,6 +1397,10 @@ impl eframe::App for FluentMediaPlayer {
                 MediaKey::Previous => self.play_adjacent(-1),
                 _ => {}
             }
+        }
+        // A folder for Save As…
+        if let Some(folder) = taskbar::take_picked_folder() {
+            self.start_save(ctx, &folder);
         }
         // A file from the open dialog, or from a second launch of the player
         if let Some(path) = taskbar::take_picked_file() {
@@ -1515,7 +1576,7 @@ impl eframe::App for FluentMediaPlayer {
 
         // ── Read all input first (no viewport commands inside the closure) ────
         let screen = ctx.screen_rect();
-        let inp = ctx.input(|i| InputSnapshot {
+        let mut inp = ctx.input(|i| InputSnapshot {
             dropped: i.raw.dropped_files.iter()
                 .filter_map(|f| f.path.as_ref().map(|p| p.to_string_lossy().into_owned()))
                 .collect(),
@@ -1534,6 +1595,9 @@ impl eframe::App for FluentMediaPlayer {
             hw:    i.key_pressed(egui::Key::H),
             esc:   i.key_pressed(egui::Key::Escape),
             open:  i.modifiers.ctrl && i.key_pressed(egui::Key::O),
+            open_url: i.modifiers.ctrl && i.key_pressed(egui::Key::U),
+            save: i.modifiers.ctrl && i.key_pressed(egui::Key::S),
+            pasted: i.events.iter().find_map(|e| if let egui::Event::Paste(t) = e { Some(t.clone()) } else { None }),
             rotate: !i.modifiers.ctrl && i.key_pressed(egui::Key::R),
             adjust: !i.modifiers.ctrl && i.key_pressed(egui::Key::E),
             scroll_y: i.raw_scroll_delta.y,
@@ -1543,6 +1607,9 @@ impl eframe::App for FluentMediaPlayer {
                 || i.events.iter().any(|e| matches!(e, egui::Event::Key { pressed: true, .. })),
             pointer: i.pointer.hover_pos(),
         });
+        if self.url_box.is_some() {
+            inp.keys_for_typing();
+        }
 
         // ── Controls visibility logic ─────────────────────────────────────────
         if inp.moved || inp.active || inp.scroll_y != 0.0 {
@@ -1605,8 +1672,17 @@ impl eframe::App for FluentMediaPlayer {
         if inp.info  { self.show_info = !self.show_info; }
         if inp.hw    { self.toggle_hw_decode(); }
         if inp.open  { self.main_menu = false; self.show_open_dialog(); }
+        if inp.open_url { self.show_url_box(); }
+        if inp.save { self.ask_save_folder(); }
+        // Ctrl+V on the player with a link on the clipboard plays it straight away
+        if let Some(url) = inp.pasted.as_deref().and_then(normalize_url) {
+            self.open_url(&url);
+        }
         if inp.rotate { self.rotate_90(); }
-        if inp.adjust { self.adjust_ui.open = !self.adjust_ui.open; }
+        if inp.adjust {
+            self.adjust_ui.open = !self.adjust_ui.open;
+            self.adjust_ui.online_open = false;
+        }
 
         // Mouse wheel anywhere in the window = volume, 5 % per notch
         // (egui reports one wheel notch as 50 points). Not over the Picture & sound
@@ -1625,15 +1701,18 @@ impl eframe::App for FluentMediaPlayer {
         if inp.d     { self.frame_step(false); }
         if inp.enter { self.toggle_fullscreen(ctx); }
         if inp.esc {
-            if self.show_keys {
+            if self.url_box.is_some() {
+                self.url_box = None;
+            } else if self.show_keys {
                 self.show_keys = false;
             } else if self.speed_menu {
                 self.speed_menu = false;
             } else if self.main_menu {
                 self.main_menu = false;
-            } else if self.adjust_ui.open || self.adjust_ui.eq_open {
+            } else if self.adjust_ui.open || self.adjust_ui.eq_open || self.adjust_ui.online_open {
                 self.adjust_ui.open = false;
                 self.adjust_ui.eq_open = false;
+                self.adjust_ui.online_open = false;
             } else if self.show_info {
                 self.show_info = false;
             } else if self.is_fullscreen {
@@ -1727,6 +1806,8 @@ impl eframe::App for FluentMediaPlayer {
             self.speed_menu = false;
             self.adjust_ui.open = false;
             self.adjust_ui.eq_open = false;
+            self.adjust_ui.online_open = false;
+            self.url_box = None;
         }
 
         // Picture & sound panel and the equalizer
@@ -1742,6 +1823,56 @@ impl eframe::App for FluentMediaPlayer {
             self.apply_adjust_changes(&before, before_norm);
         }
         draw_shortcuts(self, ctx);
+
+        // Online video settings panel, the Open URL box, and a link opening / failed
+        let online_before = self.online;
+        adjust::draw_online(ctx, &mut self.adjust_ui, &mut self.online, self.accent);
+        if self.online != online_before {
+            self.apply_online();
+        }
+        if let Some(b) = self.url_box.as_mut() {
+            match adjust::draw_url_box(ctx, b, self.accent) {
+                adjust::UrlBoxAction::Open(text) => {
+                    if let Some(url) = normalize_url(&text) {
+                        self.open_url(&url);
+                    }
+                }
+                adjust::UrlBoxAction::Cancel => self.url_box = None,
+                adjust::UrlBoxAction::None => {}
+            }
+        }
+        if self.has_file || self.link_error.is_some() {
+            draw_link_status(self, ctx);
+        }
+
+        // The save card: with the title bar while saving; on its own for a few
+        // seconds once it has saved (or failed), then it goes
+        if let Some(job) = self.save.as_mut() {
+            const NEWS_SECS: f32 = 8.0;
+            let stage = job.stage();
+            if matches!(stage, SaveStage::Done(_) | SaveStage::Failed(_)) && job.ended.is_none() {
+                job.ended = Some(std::time::Instant::now());
+            }
+            let news = job.ended.map_or(0.0, |t0| ((NEWS_SECS - t0.elapsed().as_secs_f32()) / 0.4).clamp(0.0, 1.0));
+            if job.ended.is_some() {
+                ctx.request_repaint_after(std::time::Duration::from_millis(50));
+            }
+            let alpha = if job.ended.is_some() { news } else { t_top };
+            match adjust::draw_save_card(ctx, &job.title, &stage, alpha, self.accent) {
+                // (closing it while it's saving cancels: see SaveJob's drop)
+                adjust::SaveCardAction::Close => self.save = None,
+                adjust::SaveCardAction::ShowInFolder => {
+                    if let SaveStage::Done(path) = &stage {
+                        show_in_folder(path);
+                    }
+                }
+                adjust::SaveCardAction::None => {
+                    if job.ended.is_some() && news <= 0.0 {
+                        self.save = None;
+                    }
+                }
+            }
+        }
 
         // Resize cursor wins over any other cursor set this frame
         if let Some((_, icon)) = edge {
@@ -1835,10 +1966,40 @@ struct InputSnapshot {
     dropped: Vec<String>,
     space: bool, right: bool, left: bool, up: bool, down: bool,
     f: bool, d: bool, enter: bool, m: bool, n: bool, p: bool, info: bool, hw: bool, esc: bool, open: bool, rotate: bool, adjust: bool,
+    open_url: bool,
+    save: bool,
+    /// Text pasted with Ctrl+V this frame
+    pasted: Option<String>,
     scroll_y: f32,
     pressed: bool,
     moved: bool, active: bool,
     pointer: Option<Pos2>,
+}
+
+impl InputSnapshot {
+    /// While typing in the Open URL box, the keys are the text field's, not the
+    /// player's (Esc still closes the box)
+    fn keys_for_typing(&mut self) {
+        self.space = false;
+        self.right = false;
+        self.left = false;
+        self.up = false;
+        self.down = false;
+        self.f = false;
+        self.d = false;
+        self.enter = false;
+        self.m = false;
+        self.n = false;
+        self.p = false;
+        self.info = false;
+        self.hw = false;
+        self.open = false;
+        self.rotate = false;
+        self.adjust = false;
+        self.open_url = false;
+        self.save = false;
+        self.pasted = None;
+    }
 }
 
 // ── Fonts: Golos Text (built in), then Segoe UI / egui's defaults as fallback ─
@@ -2044,6 +2205,35 @@ fn fmt_time(secs: f64) -> String {
     if h > 0 { format!("{h}:{m:02}:{s:02}") } else { format!("{m}:{s:02}") }
 }
 
+/// Load libmpv's DLL from the player's folder. If it can't be loaded, say why in
+/// a message box and return false (the player then closes).
+fn libmpv_loads() -> bool {
+    let name = option_env!("MPV_DLL_NAME").unwrap_or("libmpv-2.dll");
+    if unsafe { LoadLibraryW(wide(name).as_ptr()) } != 0 {
+        return true;
+    }
+    let there = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|d| d.join(name)))
+        .is_some_and(|p| p.is_file());
+    let text = if there {
+        format!(
+            "{name} is in the player's folder but Windows couldn't load it. It may be damaged, \
+             or be a build for a different kind of PC.\n\nDownload the player again, and keep \
+             {name} in the same folder as RustMediaPlayer.exe."
+        )
+    } else {
+        format!(
+            "{name} is missing.\n\nRust Media Player plays videos with libmpv, which comes as \
+             {name} in the same download as the player. Put it back in the same folder as \
+             RustMediaPlayer.exe and start the player again."
+        )
+    };
+    let (text, title) = (wide(&text), wide("Rust Media Player"));
+    unsafe { MessageBoxW(0, text.as_ptr(), title.as_ptr(), 0x10 /* MB_ICONERROR */) };
+    false
+}
+
 fn main() -> eframe::Result<()> {
     // If anything ever panics, say so (and keep a log) instead of vanishing silently
     std::panic::set_hook(Box::new(|info| {
@@ -2059,12 +2249,18 @@ fn main() -> eframe::Result<()> {
         unsafe { MessageBoxW(0, text.as_ptr(), title.as_ptr(), 0x10 /* MB_ICONERROR */); }
     }));
 
+    // libmpv is delay-loaded (see build.rs): load it now, before anything uses it,
+    // so a missing DLL gets a clear message rather than a crash
+    if !libmpv_loads() {
+        return Ok(());
+    }
+
     // Single window: if the player is already running, hand it the file (it plays
     // it in place of the current one) and leave
     let arg_file = std::env::args_os()
         .skip(1)
         .map(PathBuf::from)
-        .find(|p| p.is_file())
+        .find(|p| p.is_file() || is_url(&p.to_string_lossy()))
         .map(|p| p.to_string_lossy().into_owned());
     // (unless multiple windows are allowed in the menu)
     if taskbar::forward_to_running_instance(arg_file.as_deref(), !load_settings().multi) {

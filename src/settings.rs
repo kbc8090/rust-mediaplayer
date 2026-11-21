@@ -60,6 +60,8 @@ pub(crate) struct Settings {
     pub(crate) hq: bool,
     /// Frosted-glass menus, panels and tooltips (menu). On by default.
     pub(crate) glass: bool,
+    /// Online video panel (formats asked of yt-dlp)
+    pub(crate) online: Online,
 }
 
 /// Order of the files that previous / next step through, like Explorer's "Sort by"
@@ -130,6 +132,9 @@ pub(crate) fn settings_text(st: &Settings) -> String {
         format!("hq_upscaling={}", yn(st.hq)),
         format!("frosted_glass={}", yn(st.glass)),
     ]
+    .into_iter()
+    .chain(st.online.settings_lines())
+    .collect::<Vec<_>>()
     .join("\n")
         + "\n"
 }
@@ -160,6 +165,7 @@ pub(crate) fn parse_settings(text: &str) -> Settings {
         border: false,
         hq: false,
         glass: true,
+        online: Online::default(),
     };
     for line in text.lines() {
         let Some((key, value)) = line.split_once('=') else { continue };
@@ -184,7 +190,9 @@ pub(crate) fn parse_settings(text: &str) -> Settings {
             "accent_border" => st.border = on,
             "hq_upscaling" => st.hq = on,
             "frosted_glass" => st.glass = on,
-            _ => {}
+            _ => {
+                st.online.read_setting(key, value);
+            }
         }
     }
     st
@@ -229,6 +237,7 @@ pub(crate) fn parse_old_settings(text: &str) -> Settings {
         border,
         hq,
         glass,
+        online: Online::default(),
     }
 }
 

@@ -129,6 +129,17 @@ impl Thumbs {
         }
     }
 
+    /// A link is playing: no thumbnails (they'd need yt-dlp run a second time), so
+    /// let go of the previous file and don't open anything
+    pub fn forget(&mut self) {
+        self.pending = None;
+        self.pending_since = None;
+        self.requested = None;
+        if let Some((_, link)) = &self.mpv {
+            link.command("stop", &[]);
+        }
+    }
+
     /// Call every frame with the playing position. Once thumbnails have been used and
     /// the current file has been playing for a moment, open it in the thumbnail
     /// player too (at that position), so the first hover only needs a seek.

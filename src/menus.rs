@@ -20,6 +20,9 @@ pub(crate) const SHORTCUTS: &[(&[&str], &str)] = &[
     (&["Esc"], "Leave full screen / close menu"),
     (&["R"], "Rotate 90\u{b0}"),
     (&["Ctrl+O"], "Open file"),
+    (&["Ctrl+U"], "Open URL"),
+    (&["Ctrl+S"], "Save the online video"),
+    (&["Ctrl+V"], "Play a copied link"),
     (&["E"], "Picture & Sound"),
     (&["Tab"], "Video info"),
     (&["H"], "Next decoding method"),
@@ -312,10 +315,22 @@ pub(crate) fn draw_main_menu(app: &mut FluentMediaPlayer, ctx: &egui::Context) {
     const SUB_W: f32 = 190.0;
 
     let sort_label = SORT_CHOICES.iter().find(|(by, _)| *by == app.sort_by).map_or("Name", |(_, l)| *l);
-    let rows = vec![
+    let mut rows = vec![
         MenuRow::Item { key: "open", label: "Open file\u{2026}", hint: Some("Ctrl+O"), mark: Mark::None },
+        MenuRow::Item { key: "open_url", label: "Open URL\u{2026}", hint: Some("Ctrl+U"), mark: Mark::None },
+    ];
+    // Save As… while an online video is playing (Cancel saving while one saves)
+    if app.has_file && is_url(&app.current_file) {
+        rows.push(if app.save.as_ref().is_some_and(|j| j.running()) {
+            MenuRow::Item { key: "cancel_save", label: "Cancel saving", hint: None, mark: Mark::None }
+        } else {
+            MenuRow::Item { key: "save", label: "Save As\u{2026}", hint: Some("Ctrl+S"), mark: Mark::None }
+        });
+    }
+    rows.extend([
         MenuRow::Sep,
         MenuRow::Item { key: "adjust", label: "Picture & Sound", hint: Some("E"), mark: Mark::None },
+        MenuRow::Item { key: "online", label: "Online video settings", hint: None, mark: Mark::None },
         MenuRow::Item { key: "snap", label: "Snap to screen edges", hint: None, mark: Mark::Check(app.snap) },
         MenuRow::Item { key: "multi", label: "Allow multiple windows", hint: None, mark: Mark::Check(app.multi) },
         MenuRow::Item { key: "border", label: "Accent color border", hint: None, mark: Mark::Check(app.border) },
@@ -326,7 +341,7 @@ pub(crate) fn draw_main_menu(app: &mut FluentMediaPlayer, ctx: &egui::Context) {
         MenuRow::Sep,
         MenuRow::Item { key: "keys", label: "Keyboard shortcuts", hint: None, mark: Mark::None },
         MenuRow::Item { key: "quit", label: "Quit", hint: Some("Alt+F4"), mark: Mark::None },
-    ];
+    ]);
     let (asc, desc) = order_labels(app.sort_by);
     let mut sub_rows: Vec<MenuRow> = SORT_CHOICES
         .iter()
@@ -444,7 +459,18 @@ pub(crate) fn draw_main_menu(app: &mut FluentMediaPlayer, ctx: &egui::Context) {
         Some("keys") => app.show_keys = true,
         Some("quit") => app.quit(),
         Some("autoplay") => app.autoplay = !app.autoplay,
-        Some("adjust") => app.adjust_ui.open = true,
+        Some("open_url") => app.show_url_box(),
+        Some("save") => app.ask_save_folder(),
+        Some("cancel_save") => app.save = None,
+        Some("adjust") => {
+            app.adjust_ui.open = true;
+            app.adjust_ui.online_open = false;
+        }
+        Some("online") => {
+            app.adjust_ui.online_open = true;
+            app.adjust_ui.open = false;
+            app.adjust_ui.eq_open = false;
+        }
         Some("multi") => app.multi = !app.multi,
         Some("border") => app.border = !app.border,
         Some("glass") => app.glass = !app.glass,
