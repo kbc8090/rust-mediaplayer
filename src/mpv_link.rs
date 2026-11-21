@@ -176,6 +176,12 @@ fn run(mpv: Arc<Mutex<Mpv>>, rx: mpsc::Receiver<Job>, state: Arc<Mutex<Snapshot>
                 Job::Command(name, args) => {
                     if name == "loadfile" {
                         quick_until = Some(Instant::now() + Duration::from_millis(1500));
+                        // Forget yt-dlp's answer about the last link: opening the same
+                        // link again (or the retry after updating yt-dlp) must read the
+                        // new answer, not keep the old one. (A video that played before
+                        // and has since gone private kept its old "no error".)
+                        link_read.clear();
+                        link_info = None;
                         // A previous file may have needed software threads (see below);
                         // a hardware decoder gets its single thread back
                         if m.get_property::<String>("hwdec").is_ok_and(|h| h != "no") {
