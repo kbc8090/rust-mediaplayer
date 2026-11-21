@@ -602,6 +602,9 @@ impl FluentMediaPlayer {
         let url = self.current_file.clone();
         if ytdlp_path().is_none() {
             self.show_link_error("Couldn't open this link", "yt-dlp.exe isn't in the player's folder".to_owned());
+        } else if reason.as_deref().is_some_and(update_wont_help) {
+            // (private, removed, a bad link...: updating yt-dlp wouldn't change that)
+            self.show_link_error("Couldn't open this link", reason.unwrap_or_default());
         } else if self.retried_url.as_deref() != Some(url.as_str()) {
             // First failure for this link: maybe yt-dlp is out of date. Update it
             // and try again once.
@@ -926,7 +929,8 @@ impl SaveJob {
             let mut attempt = run_ytdlp(&exe, &args, &shared, &set);
             let mut note = "";
             // Failed (not cancelled): maybe yt-dlp is out of date. Update, try again.
-            if attempt.saved.is_none() && !shared.cancelled() {
+            // (Not when the error is about the video itself: private, removed...)
+            if attempt.saved.is_none() && !shared.cancelled() && !attempt.error.as_deref().is_some_and(update_wont_help) {
                 set(SaveStage::Updating);
                 match update_ytdlp() {
                     UpdateOutcome::Updated if !shared.cancelled() => {
@@ -1081,6 +1085,49 @@ fn last_error(stderr: std::process::ChildStderr) -> Option<String> {
         .map(|l| String::from_utf8_lossy(&l).into_owned())
         .collect();
     error_from_lines(lines.iter().map(String::as_str))
+}
+
+/// Is yt-dlp's error about the video itself (private, removed, blocked, needs a
+/// sign-in, a bad link...)? Then a newer yt-dlp wouldn't help, so it isn't
+/// updated: the reason is shown straight away.
+pub(crate) fn update_wont_help(error: &str) -> bool {
+    const ABOUT_THE_VIDEO: &[&str] = &[
+        "private video",
+        "video is private",
+        "video unavailable",
+        "is unavailable",
+        "has been removed",
+        "been terminated",
+        "no longer available",
+        "does not exist",
+        "not found",
+        "404",
+        "410",
+        "copyright",
+        "sign in",
+        "log in",
+        "login",
+        "logged-in",
+        "cookies",
+        "members-only",
+        "members only",
+        "join this channel",
+        "age-restricted",
+        "confirm your age",
+        "inappropriate",
+        "premieres in",
+        "live event will begin",
+        "is offline",
+        "geo restriction",
+        "your country",
+        "not a valid url",
+        "unsupported url",
+        "unable to resolve",
+        "getaddrinfo",
+        "name or service not known",
+    ];
+    let e = error.to_lowercase();
+    ABOUT_THE_VIDEO.iter().any(|k| e.contains(k))
 }
 
 /// The last "ERROR: ..." line among yt-dlp's messages, shortened (see last_error)
