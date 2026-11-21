@@ -878,6 +878,11 @@ impl SaveJob {
         if let Some((a, b)) = clip {
             add("--download-sections");
             add(&format!("*{a:.2}-{b:.2}"));
+            // The clip starts at the keyframe before its start, so its first
+            // moments have negative times; players then show the wrong length and
+            // jump ahead when it starts. This moves the clip's start to 0:00.
+            add("--downloader-args");
+            add("ffmpeg_o:-avoid_negative_ts make_zero");
             tag = format!(" [{}]", clip_tag(a, b));
         }
         add("-o");
