@@ -17,8 +17,12 @@ jobs:
     runs-on: ubuntu-latest
     continue-on-error: true
     env:
-      FFMPEG_VERSION: n8.1.3
-      FFMPEG_RECIPE: "2"   # bump this after changing the configure line below
+      # A commit from FFmpeg's main branch (27 Oct 2026). The 8.1.3 release hung
+      # when downloading a clip from YouTube (stuck as soon as it had to jump
+      # ahead in the stream), while full builds made from this commit work.
+      # To update: any commit hash or tag from github.com/FFmpeg/FFmpeg.
+      FFMPEG_VERSION: 11337618b235c8cfe529e44fe8559d9689024690
+      FFMPEG_RECIPE: "3"   # bump this after changing the configure line below
     steps:
       - name: Restore ffmpeg.exe from Cache
         id: cache
@@ -32,8 +36,10 @@ jobs:
         run: |
           sudo apt-get update -q
           sudo apt-get install -y -q gcc-mingw-w64-x86-64
-          git clone -q --depth 1 --branch "$FFMPEG_VERSION" https://github.com/FFmpeg/FFmpeg.git ffmpeg-src
+          git init -q ffmpeg-src
           cd ffmpeg-src
+          git fetch -q --depth 1 https://github.com/FFmpeg/FFmpeg.git "$FFMPEG_VERSION"
+          git checkout -q FETCH_HEAD
           # Cross-compiled for 64-bit Windows, one self-contained .exe. Stream copy
           # only: reads the usual containers (mp4/m4a/mov, webm/mkv, ts, avi, wmv,
           # mpg, flv, mp3, ogg/opus, flac, wav; HLS streams) and writes mp4/m4a,
@@ -42,12 +48,12 @@ jobs:
           # clip's stretch of an online video.
           ./configure \
             --target-os=mingw32 --arch=x86_64 --cross-prefix=x86_64-w64-mingw32- \
-            --enable-w32threads --extra-ldflags=-static --disable-x86asm \
+            --disable-w32threads --enable-pthreads --extra-ldflags=-static --disable-x86asm \
             --disable-everything --disable-autodetect --disable-doc --disable-debug \
             --disable-ffplay --disable-ffprobe --disable-avdevice \
             --enable-small \
             --enable-network --enable-schannel \
-            --enable-protocol=file,pipe,http,https,tls,tcp,crypto,hls \
+            --enable-protocol=file,pipe,http,https,tls,tcp,crypto \
             --enable-demuxer=mov,matroska,mpegts,aac,mp3,ogg,flac,wav,flv,ac3,eac3,avi,asf,mpegps,hls \
             --enable-muxer=mp4,mov,ipod,matroska,webm,mp3,ogg,opus,adts,flac,wav,mpegts \
             --enable-parser=aac,ac3,av1,flac,h264,hevc,mpegaudio,mpegvideo,opus,vorbis,vp8,vp9 \
@@ -234,8 +240,69 @@ jobs:
           name: ffmpeg-mini
           path: target/bundle
 
+      # Clips download the way this test does: over HTTPS, jumping ahead in the
+      # file. A local HTTPS server (self-signed certificate) with a minute-long WAV
+      # file stands in for YouTube; ffmpeg has 30 seconds to copy 2 s from 0:40.
+      - name: Test the Small ffmpeg Downloading a Clip
+        id: fftest
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $ff = "$env:GITHUB_WORKSPACE\target\bundle\ffmpeg.exe"
+          if (-not (Test-Path $ff)) { Write-Error "No small ffmpeg.exe to test"; exit 1 }
+          $dir = "$env:RUNNER_TEMP\fftest"
+          New-Item -ItemType Directory -Force -Path $dir | Out-Null
+          Set-Location $dir
+          & "C:\Program Files\Git\usr\bin\openssl.exe" req -x509 -newkey rsa:2048 -nodes -keyout key.pem -out cert.pem -days 1 -subj "/CN=localhost" 2>$null
+          Set-Content -Path serve.py -Encoding ascii -Value @'
+          import http.server, ssl, os, re, wave
+          with wave.open("t.wav", "wb") as w:
+              w.setnchannels(1); w.setsampwidth(2); w.setframerate(8000)
+              w.writeframes(b"\0\0" * 8000 * 60)
+          class H(http.server.SimpleHTTPRequestHandler):
+              protocol_version = "HTTP/1.1"
+              def log_message(self, *a): pass
+              def do_GET(self):
+                  path = self.translate_path(self.path); size = os.path.getsize(path)
+                  m = re.match(r"bytes=(\d*)-(\d*)", self.headers.get("Range", ""))
+                  a, b = 0, size - 1
+                  if m:
+                      a = int(m.group(1) or 0); b = int(m.group(2)) if m.group(2) else size - 1
+                      self.send_response(206); self.send_header("Content-Range", f"bytes {a}-{b}/{size}")
+                  else:
+                      self.send_response(200)
+                  self.send_header("Accept-Ranges", "bytes"); self.send_header("Content-Length", str(b - a + 1))
+                  self.send_header("Content-Type", "audio/wav"); self.end_headers()
+                  with open(path, "rb") as f:
+                      f.seek(a); left = b - a + 1
+                      try:
+                          while left > 0:
+                              c = f.read(min(65536, left)); self.wfile.write(c); left -= len(c)
+                      except OSError:
+                          pass
+          ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER); ctx.load_cert_chain("cert.pem", "key.pem")
+          srv = http.server.ThreadingHTTPServer(("127.0.0.1", 8443), H)
+          srv.socket = ctx.wrap_socket(srv.socket, server_side=True)
+          srv.serve_forever()
+          '@
+          $server = Start-Process python -ArgumentList "serve.py" -WorkingDirectory $dir -PassThru -WindowStyle Hidden
+          Start-Sleep -Seconds 3
+          $test = Start-Process $ff -ArgumentList "-hide_banner -v error -y -ss 40 -t 2 -i https://127.0.0.1:8443/t.wav -c copy out.wav" -WorkingDirectory $dir -PassThru -NoNewWindow
+          $null = $test.Handle   # (keeps the exit code readable)
+          $finished = $test.WaitForExit(30000)
+          Stop-Process -Id $server.Id -Force -ErrorAction SilentlyContinue
+          if (-not $finished) {
+            Stop-Process -Id $test.Id -Force -ErrorAction SilentlyContinue
+            Write-Error "The small ffmpeg got stuck downloading over HTTPS"
+            exit 1
+          }
+          if ($test.ExitCode -ne 0 -or -not (Test-Path out.wav)) { Write-Error "The small ffmpeg couldn't download over HTTPS"; exit 1 }
+          Write-Host ("Clip download test passed ({0:N0} bytes)" -f (Get-Item out.wav).Length)
+
       - name: Check ffmpeg.exe
         shell: pwsh
+        env:
+          CLIP_TEST: ${{ steps.fftest.outcome }}
         run: |
           $ff = "target\bundle\ffmpeg.exe"
           $works = $false
@@ -243,12 +310,13 @@ jobs:
             $runs = ((& $ff -hide_banner -version 2>$null | Select-Object -First 1) -match '^ffmpeg version')
             # (clips of online videos need it to download over HTTPS)
             $https = (& $ff -hide_banner -protocols 2>$null | Where-Object { $_.Trim() -eq 'https' }).Count -gt 0
-            $works = $runs -and $https
+            $works = $runs -and $https -and ($env:CLIP_TEST -eq 'success')
             if ($runs -and -not $https) { Write-Warning "The small ffmpeg.exe was built without HTTPS" }
+            if ($runs -and $https -and $env:CLIP_TEST -ne 'success') { Write-Warning "The small ffmpeg.exe failed the clip download test" }
           }
           if (-not $works) {
             # Fallback: yt-dlp's own full Windows build (about 130 MB)
-            Write-Warning "The small ffmpeg.exe is missing, doesn't run or can't do HTTPS; bundling a full ffmpeg build instead"
+            Write-Warning "The small ffmpeg.exe is missing, doesn't run, or can't download clips; bundling a full ffmpeg build instead"
             $zip = "$env:RUNNER_TEMP\ffmpeg-full.zip"
             curl.exe -fsSL --retry 5 --retry-delay 10 -o $zip "https://github.com/yt-dlp/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip"
             if ($LASTEXITCODE -ne 0) { Write-Error "Could not download ffmpeg"; exit 1 }
