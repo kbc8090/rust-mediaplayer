@@ -241,8 +241,9 @@ jobs:
           path: target/bundle
 
       # Clips download the way this test does: over HTTPS, jumping ahead in the
-      # file. A local HTTPS server (self-signed certificate) with a minute-long WAV
-      # file stands in for YouTube; ffmpeg has 30 seconds to copy 2 s from 0:40.
+      # file. A local HTTPS server with a minute-long WAV file stands in for
+      # YouTube; ffmpeg has 30 seconds to copy 2 s from 0:40. (Its certificate is
+      # homemade, so certificate checking, on by default, is off for the test.)
       - name: Test the Small ffmpeg Downloading a Clip
         id: fftest
         continue-on-error: true
@@ -287,7 +288,7 @@ jobs:
           '@
           $server = Start-Process python -ArgumentList "serve.py" -WorkingDirectory $dir -PassThru -WindowStyle Hidden
           Start-Sleep -Seconds 3
-          $test = Start-Process $ff -ArgumentList "-hide_banner -v error -y -ss 40 -t 2 -i https://127.0.0.1:8443/t.wav -c copy out.wav" -WorkingDirectory $dir -PassThru -NoNewWindow
+          $test = Start-Process $ff -ArgumentList "-hide_banner -v error -y -tls_verify 0 -ss 40 -t 2 -i https://127.0.0.1:8443/t.wav -c copy out.wav" -WorkingDirectory $dir -PassThru -NoNewWindow
           $null = $test.Handle   # (keeps the exit code readable)
           $finished = $test.WaitForExit(30000)
           Stop-Process -Id $server.Id -Force -ErrorAction SilentlyContinue
