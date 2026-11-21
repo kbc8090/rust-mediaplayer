@@ -1351,10 +1351,25 @@ pub fn draw_url_box(ctx: &egui::Context, b: &mut crate::online::UrlBox, accent: 
             .text_color(TEXT)
             .hint_text(egui::RichText::new("https://\u{2026}").color(DIM))
             .desired_width(inner.width());
+        // (the selection before this frame: a right-click in the field clears it,
+        // and the right-click menu needs it)
+        let field_id = egui::Id::new(crate::online::URL_FIELD);
+        let before = egui::widgets::text_edit::TextEditState::load(ctx, field_id).and_then(|s| s.cursor.char_range());
         let resp = child.add(edit);
         if b.focus {
             resp.request_focus();
             b.focus = false;
+        }
+        // Right-click in the field: Cut / Copy / Paste / Delete / Select all
+        if resp.hovered() && ctx.input(|i| i.pointer.button_pressed(egui::PointerButton::Secondary)) {
+            let sel = before.map_or((0, 0), |r| {
+                let (a, c) = (r.primary.index, r.secondary.index);
+                (a.min(c), a.max(c))
+            });
+            set_selection(ctx, field_id, sel);
+            let at = ctx.input(|i| i.pointer.latest_pos()).unwrap_or(resp.rect.center());
+            let can_paste = crate::taskbar::clipboard_text().is_some_and(|t| !t.is_empty());
+            b.menu = Some((at, can_paste, sel));
         }
         let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
         p.text(
@@ -1378,7 +1393,54 @@ pub fn draw_url_box(ctx: &egui::Context, b: &mut crate::online::UrlBox, accent: 
         }
     });
     ctx.move_to_top(egui::LayerId::new(egui::Order::Foreground, id));
+
+    // The field's right-click menu
+    if let Some((at, can_paste, (lo, hi))) = b.menu {
+        let chars = b.text.chars().count();
+        let (lo, hi) = (lo.min(chars), hi.min(chars));
+        if let Some(pick) = crate::menus::draw_text_menu(ctx, at, hi > lo, can_paste, chars > 0) {
+            let byte = |c: usize| b.text.char_indices().nth(c).map_or(b.text.len(), |(i, _)| i);
+            let (blo, bhi) = (byte(lo), byte(hi));
+            let selected = b.text[blo..bhi].to_owned();
+            let caret = match pick {
+                "cut" => {
+                    ctx.output_mut(|o| o.copied_text = selected);
+                    b.text.replace_range(blo..bhi, "");
+                    Some((lo, lo))
+                }
+                "copy" => {
+                    ctx.output_mut(|o| o.copied_text = selected);
+                    Some((lo, hi))
+                }
+                "paste" => {
+                    let clip = crate::taskbar::clipboard_text().unwrap_or_default().replace(['\r', '\n'], "");
+                    let n = clip.chars().count();
+                    b.text.replace_range(blo..bhi, &clip);
+                    Some((lo + n, lo + n))
+                }
+                "delete" => {
+                    b.text.replace_range(blo..bhi, "");
+                    Some((lo, lo))
+                }
+                "select_all" => Some((0, chars)),
+                _ => None, // (closed by a click elsewhere)
+            };
+            if let Some(sel) = caret {
+                set_selection(ctx, egui::Id::new(crate::online::URL_FIELD), sel);
+            }
+            b.menu = None;
+            b.focus = true;
+        }
+    }
     action
+}
+
+/// Put a text field's selection (start, end, in characters) back / somewhere new
+fn set_selection(ctx: &egui::Context, id: egui::Id, (a, c): (usize, usize)) {
+    use egui::text::{CCursor, CCursorRange};
+    let mut state = egui::widgets::text_edit::TextEditState::load(ctx, id).unwrap_or_default();
+    state.cursor.set_char_range(Some(CCursorRange::two(CCursor::new(a), CCursor::new(c))));
+    state.store(ctx, id);
 }
 
 // ── The save card (Save As… in progress) ──────────────────────────────────────

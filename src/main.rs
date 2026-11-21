@@ -213,10 +213,11 @@ const VOL_W: f32 = 90.0;
 const VOL_GAP: f32 = 7.0;
 const WIN_BTN_W: f32 = 46.0;
 const WIN_BTN_H: f32 = 34.0;
-/// Resize strip along the window edge over the window buttons (the top edge above
-/// all three, the right edge beside Close), like Windows' own windows. The buttons
-/// work everywhere else. (Not when maximised: then the buttons reach the corner.)
-const BTN_EDGE: f32 = 5.0;
+/// Resize strip along the top edge over the window buttons, like Windows' own
+/// windows. Thin, and none beside Close, so a quick move to the top-right corner
+/// still lands on Close (it used to start a resize there instead). The buttons
+/// work everywhere else. (Not when maximised: then the buttons reach the edge.)
+const BTN_EDGE: f32 = 3.0;
 /// What the Deinterlace switch sets: mpv's "auto" deinterlaces only frames the file
 /// marks as interlaced. "yes" ran a CPU deinterlacer on every frame of every video,
 /// progressive ones included, doubling the frame count. (mpv doesn't make "auto" its
@@ -252,10 +253,9 @@ const HIDE_AFTER: f32 = 2.5;
 /// Time for a fullscreen switch to settle, during which the overlays are held
 const FS_SETTLE: f32 = 0.45;
 /// Volume / seek pop-up position (top left, below the menu button and lined up with
-/// the filename), and the info overlay (I) below where the pop-up appears
+/// the filename)
 const OSD_LEFT: f32 = TITLE_X;
 const OSD_TOP: f32 = MENU_Y + BTN_BOX / 2.0 + 11.0;
-const INFO_TOP: f32 = OSD_TOP + 42.0 + 10.0;
 /// Picture quality. Since mpv 0.37 its defaults are already its old "high quality"
 /// settings (good downscaling, dithering, gamma-correct scaling); the remaining
 /// difference in its "high-quality" profile is the upscaler used when the video
@@ -386,6 +386,10 @@ struct FluentMediaPlayer {
     retried_url: Option<String>,
     /// The link whose preview stream the thumbnails are using
     link_thumbs: Option<String>,
+    /// A link has loaded but may not have drawn its first picture yet: the video
+    /// stays black until it's playing (else mpv shows the previous video's last
+    /// frame for a moment). Since when.
+    pub(crate) video_hold: Option<std::time::Instant>,
     /// Save video as… / Save clip as…: what to save, waiting for a folder
     save_pending: Option<SavePending>,
     /// Save clip as…: the clip being set up (panel at the top, ends on the seek bar)
@@ -650,6 +654,7 @@ impl FluentMediaPlayer {
             link_retry: None,
             retried_url: None,
             link_thumbs: None,
+            video_hold: None,
             save_pending: None,
             clip: None,
             os_title: String::new(),
@@ -1339,6 +1344,11 @@ impl eframe::App for FluentMediaPlayer {
         self.last_tick = now;
         if snap.valid {
             self.track_url_load(ctx, &snap);
+            if let Some(t0) = self.video_hold {
+                if (snap.path == self.current_file && snap.time_pos > 0.05) || t0.elapsed().as_secs_f32() > 1.5 {
+                    self.video_hold = None;
+                }
+            }
             // A link's thumbnails: from the small preview stream yt-dlp found
             if is_url(&self.current_file) && self.link_thumbs.as_deref() != Some(self.current_file.as_str()) {
                 if let Some(li) = snap.link_info.as_ref().filter(|li| li.url == self.current_file) {
@@ -1762,7 +1772,15 @@ impl eframe::App for FluentMediaPlayer {
         if inp.m     { let m = !self.muted; self.set_mute(m); self.volume_osd = Some(std::time::Instant::now()); self.seek_osd = None; }
         if inp.n     { self.play_adjacent(1); }
         if inp.p     { self.play_adjacent(-1); }
-        if inp.info  { self.show_info = !self.show_info; }
+        if inp.info {
+            self.show_info = !self.show_info;
+            // (it opens where Picture & Sound / Online video settings do)
+            if self.show_info {
+                self.adjust_ui.open = false;
+                self.adjust_ui.eq_open = false;
+                self.adjust_ui.online_open = false;
+            }
+        }
         if inp.hw    { self.toggle_hw_decode(); }
         if inp.open  { self.main_menu = false; self.show_open_dialog(); }
         if inp.open_url { self.show_url_box(); }
@@ -1787,6 +1805,9 @@ impl eframe::App for FluentMediaPlayer {
         if inp.rotate { self.rotate_90(); }
         if inp.adjust {
             self.adjust_ui.open = !self.adjust_ui.open;
+            if self.adjust_ui.open {
+                self.show_info = false;
+            }
             self.adjust_ui.online_open = false;
         }
 
@@ -1807,7 +1828,9 @@ impl eframe::App for FluentMediaPlayer {
         if inp.d     { self.frame_step(false); }
         if inp.enter { self.toggle_fullscreen(ctx); }
         if inp.esc {
-            if self.url_box.is_some() {
+            if let Some(b) = self.url_box.as_mut().filter(|b| b.menu.is_some()) {
+                b.menu = None;
+            } else if self.url_box.is_some() {
                 self.url_box = None;
             } else if let Some(c) = self.clip.as_mut().filter(|c| c.editing.is_some()) {
                 c.editing = None; // (stop typing, keep the old time)
@@ -1865,7 +1888,7 @@ impl eframe::App for FluentMediaPlayer {
 
                 if !self.has_file {
                     splash::draw(ui.painter(), rect, self.accent);
-                } else if self.render_ctx_initialized && self.url_load.is_none() {
+                } else if self.render_ctx_initialized && self.url_load.is_none() && self.video_hold.is_none() {
                     // (while a link is opening, just black: not the last frame of
                     // whatever played before)
                     ui.painter().add(egui::PaintCallback {
@@ -2207,6 +2230,21 @@ fn install_fonts(ctx: &egui::Context) -> CaptionFont {
             fam.insert(0, "segoe".into());
         }
     }
+    // Emoji and symbols in titles and file names (🟢, ★, ✓, …): Windows' own emoji
+    // and symbol fonts, after Segoe UI. (egui draws text in one colour, so emoji
+    // come out as white shapes rather than in colour; egui's built-in emoji font is
+    // too old for newer ones, which were drawn blank.)
+    let mut at = 1;
+    for (name, path) in [("segoe_emoji", r"C:\Windows\Fonts\seguiemj.ttf"), ("segoe_symbol", r"C:\Windows\Fonts\seguisym.ttf")] {
+        if let Ok(bytes) = std::fs::read(path) {
+            fonts.font_data.insert(name.into(), egui::FontData::from_owned(bytes));
+            if let Some(fam) = fonts.families.get_mut(&FontFamily::Proportional) {
+                let i = at.min(fam.len());
+                fam.insert(i, name.into());
+                at = i + 1;
+            }
+        }
+    }
 
     // Golos Text (Paratype; free under the SIL Open Font License, whose notice is
     // stored inside the font files) is built into the .exe and used for all text.
@@ -2260,14 +2298,11 @@ fn hit_edge(p: Pos2, screen: Rect) -> Option<(egui::viewport::ResizeDirection, e
     // Over the minimize / maximize / close buttons only a thin strip along the edge
     // resizes, so the buttons stay easy to hit
     if p.y < WIN_BTN_H && p.x > screen.right() - WIN_BTN_W * 3.0 {
-        if (dt < BTN_EDGE && dr < CORNER) || (dr < BTN_EDGE && dt < CORNER) {
+        if dt < BTN_EDGE && dr < CORNER {
             return Some((D::NorthEast, C::ResizeNeSw));
         }
         if dt < BTN_EDGE {
             return Some((D::North, C::ResizeVertical));
-        }
-        if dr < BTN_EDGE {
-            return Some((D::East, C::ResizeHorizontal));
         }
         return None;
     }

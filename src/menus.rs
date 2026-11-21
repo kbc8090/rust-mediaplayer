@@ -142,6 +142,8 @@ pub(crate) enum MenuRow {
     Sub { key: &'static str, label: &'static str, hint: &'static str },
     /// Centred heading
     Title(&'static str),
+    /// An item that can't be used right now (greyed out, does nothing)
+    Off { label: &'static str, hint: Option<&'static str> },
     Sep,
 }
 
@@ -246,6 +248,13 @@ pub(crate) fn draw_menu_rows(
             MenuRow::Title(label) => {
                 p.text(pos2(rect.center().x, cy), Align2::CENTER_CENTER, *label, small.clone(), dim);
             }
+            MenuRow::Off { label, hint } => {
+                let faint = Color32::from_rgb(110, 110, 110);
+                p.text(pos2(text_x, cy), Align2::LEFT_CENTER, *label, font.clone(), faint);
+                if let Some(hint) = hint {
+                    p.text(pos2(rect.right() - MENU_PAD - 10.0, cy), Align2::RIGHT_CENTER, *hint, small.clone(), faint);
+                }
+            }
             MenuRow::Item { key, label, hint, mark } => {
                 let resp = ui.interact(ir, ui.id().with(*key), Sense::click_and_drag());
                 // The current choice (speed menu): tinted with the accent colour
@@ -299,6 +308,43 @@ pub(crate) fn draw_menu_rows(
         top += h;
     }
     (picked, hovered, subs)
+}
+
+/// A text field's right-click menu at `at`: Cut, Copy, Paste, Delete, Select all
+/// (greyed out when there's nothing to cut / paste / select). Returns the item
+/// picked, or "close" for a press outside it.
+pub(crate) fn draw_text_menu(ctx: &egui::Context, at: Pos2, selected: bool, can_paste: bool, has_text: bool) -> Option<&'static str> {
+    let item = |on: bool, key: &'static str, label: &'static str, hint: &'static str| {
+        if on {
+            MenuRow::Item { key, label, hint: Some(hint), mark: Mark::None }
+        } else {
+            MenuRow::Off { label, hint: Some(hint) }
+        }
+    };
+    let rows = [
+        item(selected, "cut", "Cut", "Ctrl+X"),
+        item(selected, "copy", "Copy", "Ctrl+C"),
+        item(can_paste, "paste", "Paste", "Ctrl+V"),
+        item(selected, "delete", "Delete", "Del"),
+        MenuRow::Sep,
+        item(has_text, "select_all", "Select all", "Ctrl+A"),
+    ];
+    let screen = ctx.screen_rect();
+    let size = vec2(200.0, MENU_PAD * 2.0 + rows.iter().map(menu_row_h).sum::<f32>());
+    let x = if at.x + size.x <= screen.right() - 4.0 { at.x } else { at.x - size.x };
+    let y = if at.y + size.y <= screen.bottom() - 4.0 { at.y } else { at.y - size.y };
+    let rect = Rect::from_min_size(pos2(x.max(screen.left() + 4.0), y.max(screen.top() + 4.0)), size);
+    let outside = ctx.input(|i| i.pointer.any_pressed() && i.pointer.press_origin().is_some_and(|o| !rect.contains(o)));
+    if outside {
+        return Some("close");
+    }
+    let id = egui::Id::new("text_menu");
+    let mut picked = None;
+    egui::Area::new(id).order(egui::Order::Foreground).fixed_pos(rect.min).show(ctx, |ui| {
+        picked = draw_menu_rows(ui, rect, &rows, None, None, MenuSize::NORMAL).0;
+    });
+    ctx.move_to_top(egui::LayerId::new(egui::Order::Foreground, id));
+    picked
 }
 
 /// Is `p` inside the triangle a, b, c (either winding)?
@@ -489,10 +535,12 @@ pub(crate) fn draw_main_menu(app: &mut FluentMediaPlayer, ctx: &egui::Context) {
         Some("cancel_save") => app.save = None,
         Some("adjust") => {
             app.adjust_ui.open = true;
+            app.show_info = false;
             app.adjust_ui.online_open = false;
         }
         Some("online") => {
             app.adjust_ui.online_open = true;
+            app.show_info = false;
             app.adjust_ui.open = false;
             app.adjust_ui.eq_open = false;
         }
@@ -606,8 +654,9 @@ pub(crate) fn draw_info_overlay(ctx: &egui::Context, rows: &[InfoRow], alpha: f3
         })
         .sum();
     let screen = ctx.screen_rect();
+    // (top left, where Picture & Sound opens: one or the other)
     let rect = Rect::from_min_size(
-        pos2(screen.left() + OSD_LEFT, screen.top() + INFO_TOP),
+        pos2(screen.left() + 8.0, screen.top() + adjust::PANEL_TOP),
         vec2(width, PAD_Y * 2.0 + content_h + FOOT_H),
     );
     glass::shadow(&p, rect, 8.0, alpha);

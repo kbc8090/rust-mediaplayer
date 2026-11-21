@@ -434,9 +434,6 @@ pub(crate) fn draw_top_bar(app: &mut FluentMediaPlayer, ctx: &egui::Context, t: 
                     let mut hit_r = r;
                     if !maximized {
                         hit_r.min.y += BTN_EDGE;
-                        if k == 2 {
-                            hit_r.max.x -= BTN_EDGE;
-                        }
                     }
                     // click_and_drag: a button must also "own" drags that start on it,
                     // otherwise egui hands the drag to the draggable title strip behind

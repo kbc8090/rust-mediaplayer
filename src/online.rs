@@ -512,6 +512,9 @@ pub(crate) struct UrlBox {
     pub(crate) text: String,
     /// Give the text field the keyboard (when the box has just opened)
     pub(crate) focus: bool,
+    /// The field's right-click menu: where, whether there's text to paste, and
+    /// the selection (start, end, in characters) it was opened on
+    pub(crate) menu: Option<(egui::Pos2, bool, (usize, usize))>,
 }
 
 /// The Open URL box's text field (it keeps the keyboard; nothing else does)
@@ -529,7 +532,7 @@ impl FluentMediaPlayer {
     /// Open the Open URL box, filled in with the clipboard if it holds a link
     pub(crate) fn show_url_box(&mut self) {
         let text = taskbar::clipboard_text().and_then(|t| normalize_url(&t)).unwrap_or_default();
-        self.url_box = Some(UrlBox { text, focus: true });
+        self.url_box = Some(UrlBox { text, focus: true, menu: None });
         self.main_menu = false;
     }
 
@@ -577,6 +580,7 @@ impl FluentMediaPlayer {
             // still being looked up, which looked like the link had loaded)
             if snap.duration > 0.0 || snap.time_pos > 0.0 {
                 self.url_load = None;
+                self.video_hold = Some(std::time::Instant::now());
                 return;
             }
         }
