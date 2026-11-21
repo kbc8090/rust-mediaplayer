@@ -158,12 +158,17 @@ pub(crate) fn draw_tooltip(ctx: &egui::Context, anchor: Rect, text: &str, above:
 /// The tooltip look, frosted glass when that's on in the menu: button tips, and
 /// the seek bar's time and chapter boxes
 pub(crate) fn tip_frame(p: &egui::Painter, rect: Rect, alpha: f32) {
-    let r = 5.0;
+    let r = TIP_R;
     glass::shadow(p, rect, r, alpha * 0.6);
     glass::fill(p, rect, r, Color32::from_rgba_unmultiplied(43, 43, 43, 245), alpha);
     let edge = glass::edge(Color32::from_white_alpha(20));
     p.rect_stroke(rect.shrink(0.5), r, Stroke::new(1.0_f32, edge.gamma_multiply(alpha)));
 }
+
+/// Corner radius of tooltips and the time / chapter boxes, and of the seek-bar
+/// thumbnail so they all match
+const TIP_R: f32 = 5.0;
+const THUMB_R: f32 = TIP_R;
 
 /// Text colour of tooltips (and the time / chapter boxes)
 const TIP_TEXT: Color32 = Color32::from_rgb(235, 235, 235);
@@ -710,10 +715,10 @@ pub(crate) fn draw_bottom_bar(app: &mut FluentMediaPlayer, ctx: &egui::Context, 
                     let tr = Rect::from_min_size(pos2(snap(tx), snap(r.top() - 6.0 - th)), vec2(snap(tw), snap(th)));
                     let tp = ctx.layer_painter(egui::LayerId::new(egui::Order::Tooltip, egui::Id::new("thumb")));
                     for (e, a) in [(1.0, 60.0), (2.5, 30.0), (4.0, 14.0)] {
-                        tp.rect_filled(tr.expand(e), 4.0 + e, Color32::from_black_alpha((a * t) as u8));
+                        tp.rect_filled(tr.expand(e), THUMB_R + e, Color32::from_black_alpha((a * t) as u8));
                     }
-                    app.thumbs.paint(&tp, tr, 2.0);
-                    tp.rect_stroke(tr.expand(0.5), 2.5, Stroke::new(1.0_f32, { let a = (70.0 * t) as u8; Color32::from_rgba_premultiplied(a, a, a, a) }));
+                    app.thumbs.paint(&tp, tr, THUMB_R);
+                    tp.rect_stroke(tr.expand(0.5), THUMB_R + 0.5, Stroke::new(1.0_f32, { let a = (70.0 * t) as u8; Color32::from_rgba_premultiplied(a, a, a, a) }));
                     if let Some(title) = &chapter {
                         chapter_box(&tp, title, tr.left(), tr.width(), tr.top() - 5.0, t);
                     }

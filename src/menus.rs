@@ -63,10 +63,9 @@ pub(crate) fn draw_shortcuts(app: &mut FluentMediaPlayer, ctx: &egui::Context) {
         .order(egui::Order::Foreground)
         .fixed_pos(screen.min)
         .show(ctx, |ui| {
-            // Dim the player behind, and keep its clicks / drags away from the video
+            // Keep the player's clicks / drags away from the video behind
             ui.allocate_rect(screen, Sense::click_and_drag());
             let p = ui.painter().clone();
-            p.rect_filled(screen, 0.0, Color32::from_black_alpha(110));
             let r = 8.0;
             glass::shadow(&p, rect, r, 1.0);
             glass::fill(&p, rect, r, Color32::from_rgb(44, 44, 44), 1.0);
