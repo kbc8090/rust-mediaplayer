@@ -337,9 +337,12 @@ pub(crate) fn pill(p: &egui::Painter, rect: Rect, color: Color32) {
     p.add(egui::Shape::convex_polygon(pts, color, Stroke::NONE));
 }
 
-pub(crate) fn draw_knob(p: &egui::Painter, ppp: f32, centre: Pos2, hot: bool, accent: Color32, t: f32) {
+/// (`gliding`: the knob is on the move by itself, the seek bar during playback. Its
+/// x isn't rounded to whole pixels then: rounded, it would hop a pixel at a time
+/// while the bar's fill beside it glides.)
+pub(crate) fn draw_knob(p: &egui::Painter, ppp: f32, centre: Pos2, hot: bool, accent: Color32, t: f32, gliding: bool) {
     let snap = |v: f32| (v * ppp).round() / ppp;
-    let c = pos2(snap(centre.x), snap(centre.y));
+    let c = pos2(if gliding { centre.x } else { snap(centre.x) }, snap(centre.y));
     let (ring, dot) = if hot { (7.5, 4.6) } else { (6.5, 3.9) };
     adjust::disc(p, pos2(c.x, c.y + 1.0), ring + 0.8, Color32::from_black_alpha((80.0 * t) as u8));
     adjust::disc(p, c, ring, KNOB_RING.gamma_multiply(t));
@@ -650,7 +653,19 @@ pub(crate) fn draw_bottom_bar(app: &mut FluentMediaPlayer, ctx: &egui::Context, 
                     }
                 }
             } else if !live {
-                draw_knob(&p, ctx.pixels_per_point(), pos2(fill_x, seek_y), hot, accent, t);
+                let gliding = app.is_playing && !app.eof && !dragging;
+                draw_knob(&p, ctx.pixels_per_point(), pos2(fill_x, seek_y), hot, accent, t, gliding);
+            }
+
+            // While it plays, redraw at the screen's refresh rate so the bar glides.
+            // (Otherwise the window is only redrawn when mpv has a new video frame:
+            // a 24 or 30 fps video moved the bar in 24 / 30 steps a second, on a
+            // 60 Hz screen at uneven intervals, which a quickly moving bar shows as
+            // jitter. The extra redraws only copy the last video picture: cheap.
+            // Vsync holds it to the screen's rate; the 7 ms is a cap in case a
+            // driver ignores vsync.)
+            if app.is_playing && !app.eof && duration > 0.0 && !live && t > 0.0 {
+                ctx.request_repaint_after(std::time::Duration::from_millis(7));
             }
 
             // Hover / drag time preview (dragging a clip end: that end's time)
@@ -805,7 +820,7 @@ pub(crate) fn draw_bottom_bar(app: &mut FluentMediaPlayer, ctx: &egui::Context, 
                 Stroke::new(1.0_f32, VOL_TRACK.gamma_multiply(t * 0.8)),
             );
             pill(&p, Rect::from_min_max(pos2(vl, row_y - 1.5), pos2(vl + vw * vf, row_y + 1.5)), accent);
-            draw_knob(&p, ctx.pixels_per_point(), pos2(vl + vw * vf, row_y), vhot, accent, t);
+            draw_knob(&p, ctx.pixels_per_point(), pos2(vl + vw * vf, row_y), vhot, accent, t, false);
             }
 
             // Right-hand buttons
