@@ -1552,6 +1552,14 @@ impl eframe::App for FluentMediaPlayer {
         if !settling {
             self.fs_settle = None;
         }
+        // Fullscreen ended from outside the app (Win+Down, snapping, a monitor
+        // change...): the window no longer covers its monitor. Leave fullscreen mode
+        // too, or the window would keep refusing to be dragged or resized.
+        if self.is_fullscreen && !settling && self.hwnd != 0 && !taskbar::still_fullscreen(self.hwnd) {
+            self.is_fullscreen = false;
+            self.show_controls = true;
+            taskbar::forget_fullscreen(self.hwnd);
+        }
         if self.is_fullscreen && self.has_file {
             // Fullscreen: the controls show while the pointer is over the bottom of
             // the screen, the filename / menu only while it's over the top. Right after

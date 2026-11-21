@@ -368,6 +368,46 @@ unsafe fn enter_fullscreen_now(hwnd: isize) {
     }
 }
 
+/// While the app is in fullscreen: does the window still cover its monitor?
+/// Something outside the app can move or resize it, for example Win+Down,
+/// Win+arrow snapping, Show Desktop, or Windows rearranging windows when a monitor
+/// wakes up or changes. The app then has to drop its fullscreen state, or it keeps
+/// refusing to be dragged or resized. Minimised counts as still fullscreen
+/// (restoring brings it back as it was), and so does anything that can't be checked.
+pub fn still_fullscreen(hwnd: isize) -> bool {
+    unsafe {
+        if IsIconic(hwnd) != 0 {
+            return true;
+        }
+        let mut w = RectI::default();
+        let mut info = MonitorInfo {
+            size: std::mem::size_of::<MonitorInfo>() as u32,
+            monitor: RectI::default(),
+            work: RectI::default(),
+            flags: 0,
+        };
+        let monitor = MonitorFromWindow(hwnd, 2); // MONITOR_DEFAULTTONEAREST
+        if monitor == 0 || GetWindowRect(hwnd, &mut w) == 0 || GetMonitorInfoW(monitor, &mut info) == 0 {
+            return true;
+        }
+        let m = info.monitor;
+        w.left <= m.left && w.top <= m.top && w.right >= m.right && w.bottom >= m.bottom
+    }
+}
+
+/// Fullscreen was ended from outside the app (see `still_fullscreen`): the window
+/// is already wherever Windows put it, so just forget the size to go back to and
+/// put the rounded corners back
+pub fn forget_fullscreen(hwnd: isize) {
+    if let Ok(mut r) = FS_RESTORE.lock() {
+        *r = None;
+    }
+    FS_WAS_MAX.store(false, Ordering::Relaxed);
+    if ROUNDED.load(Ordering::Relaxed) {
+        set_corners(hwnd, true);
+    }
+}
+
 unsafe fn exit_fullscreen_now(hwnd: isize) {
     if ROUNDED.load(Ordering::Relaxed) {
         set_corners(hwnd, true);
