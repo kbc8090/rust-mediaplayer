@@ -285,7 +285,9 @@ fn run(mpv: Arc<Mutex<Mpv>>, rx: mpsc::Receiver<Job>, state: Arc<Mutex<Snapshot>
             last_link.clear();
             link_info = None;
         }
-        let ready = if crate::online::is_url(&s.path) && (s.duration > 0.0 || s.dwidth > 0) {
+        // (playing: it has a length or a position. Not the picture size, which is
+        // still the previous video's while a link is being looked up.)
+        let ready = if crate::online::is_url(&s.path) && (s.duration > 0.0 || s.time_pos > 0.0) {
             Some(s.path.clone())
         } else if s.idle && !last_link.is_empty() {
             Some(last_link.clone())
@@ -294,11 +296,17 @@ fn run(mpv: Arc<Mutex<Mpv>>, rx: mpsc::Receiver<Job>, state: Arc<Mutex<Snapshot>
         };
         if let Some(url) = ready.filter(|u| *u != link_read) {
             let text = m.get_property::<String>(crate::online::YTDL_RESULT).unwrap_or_default();
-            link_info = crate::online::parse_link_result(&text).map(|mut info| {
-                info.url.clone_from(&url);
-                Arc::new(info)
-            });
-            link_read = url;
+            let parsed = crate::online::parse_link_result(&text);
+            // Nothing there yet: try again next time. (Unless mpv gave up, or it
+            // has been playing a while: a direct link to a media file never goes
+            // through yt-dlp, so there's nothing to wait for.)
+            if parsed.is_some() || s.idle || s.time_pos > 5.0 {
+                link_info = parsed.map(|mut info| {
+                    info.url.clone_from(&url);
+                    Arc::new(info)
+                });
+                link_read = url;
+            }
         }
         s.link_info = link_info.clone();
         if want_info.load(Ordering::Relaxed) {

@@ -1400,7 +1400,7 @@ fn elided(p: &egui::Painter, text: &str, font: FontId, color: Color32, width: f3
 /// A small card in the top right while a link is being saved: what's happening,
 /// the video's title, and a progress bar; once saved, "Show in folder". `alpha`
 /// fades it with the title bar (it only stays put when there's news).
-pub fn draw_save_card(ctx: &egui::Context, title: &str, stage: &crate::online::SaveStage, alpha: f32, accent: Color32) -> SaveCardAction {
+pub fn draw_save_card(ctx: &egui::Context, title: &str, stage: &crate::online::SaveStage, note: Option<String>, alpha: f32, accent: Color32) -> SaveCardAction {
     use crate::online::{SavePart, SaveStage};
     if alpha <= 0.02 {
         return SaveCardAction::None;
@@ -1415,6 +1415,10 @@ pub fn draw_save_card(ctx: &egui::Context, title: &str, stage: &crate::online::S
     let mut action = SaveCardAction::None;
     let (heading, detail, bar): (&str, String, Option<Option<f32>>) = match stage {
         SaveStage::Starting => ("Saving", "Looking up the video\u{2026}".to_owned(), Some(None)),
+        // (no percentage: how much so far and for how long, if known)
+        SaveStage::Downloading(SavePart::Both, None) if note.is_some() => {
+            ("Saving", format!("Downloading\u{2026} \u{b7} {}", note.clone().unwrap_or_default()), Some(None))
+        }
         SaveStage::Downloading(part, frac) => {
             let what = match part {
                 SavePart::Video => "Downloading the video",

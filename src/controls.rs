@@ -48,6 +48,12 @@ pub(crate) fn hit(ui: &mut egui::Ui, centre: Pos2, id: &str, tip: &str, t: f32) 
     hit_at(ui, centre, id, tip, t, true)
 }
 
+/// A button that's greyed out: does nothing, but is still a button (so a
+/// right-click on it doesn't count as the blank bar)
+pub(crate) fn inert(ui: &mut egui::Ui, centre: Pos2, id: &str) {
+    let _ = ui.interact(Rect::from_center_size(centre, vec2(BTN_STEP, 34.0)), ui.id().with(id), Sense::click());
+}
+
 /// `hit` with the tooltip above (`above`) or below the button
 pub(crate) fn hit_at(ui: &mut egui::Ui, centre: Pos2, id: &str, tip: &str, t: f32, above: bool) -> egui::Response {
     let r = ui.interact(
@@ -371,7 +377,8 @@ pub(crate) fn draw_top_bar(app: &mut FluentMediaPlayer, ctx: &egui::Context, t: 
             for dy in [-4.5, 0.0, 4.5] {
                 p.line_segment([pos2(mc.x - 7.0, mc.y + dy), pos2(mc.x + 7.0, mc.y + dy)], Stroke::new(SW, white));
             }
-            if menu.activated() {
+            // (a right-click on the menu button opens it too, as a left click does)
+            if menu.activated() || menu.secondary_clicked() {
                 app.main_menu = !app.main_menu;
                 app.menu_at = None;
             }
@@ -677,11 +684,19 @@ pub(crate) fn draw_bottom_bar(app: &mut FluentMediaPlayer, ctx: &egui::Context, 
             // Previous / next file in the same folder (dimmed when there isn't one)
             let dim = white.gamma_multiply(0.4);
             let c = pos2(lay.prev, row_y);
-            if app.has_prev() && hit(ui, c, "prev", "Previous file (P)", t).activated() { app.play_adjacent(-1); }
+            if app.has_prev() {
+                if hit(ui, c, "prev", "Previous file (P)", t).activated() { app.play_adjacent(-1); }
+            } else {
+                inert(ui, c, "prev");
+            }
             icon_prev(&p, c, if app.has_prev() { white } else { dim });
 
             let c = pos2(lay.next, row_y);
-            if app.has_next() && hit(ui, c, "next", "Next file (N)", t).activated() { app.play_adjacent(1); }
+            if app.has_next() {
+                if hit(ui, c, "next", "Next file (N)", t).activated() { app.play_adjacent(1); }
+            } else {
+                inert(ui, c, "next");
+            }
             icon_next(&p, c, if app.has_next() { white } else { dim });
 
             // Time

@@ -573,7 +573,9 @@ impl FluentMediaPlayer {
         }
         if snap.path == self.current_file {
             load.seen = true;
-            if snap.duration > 0.0 || snap.dwidth > 0 || snap.time_pos > 0.0 {
+            // (not the picture size: mpv keeps the previous video's while a link is
+            // still being looked up, which looked like the link had loaded)
+            if snap.duration > 0.0 || snap.time_pos > 0.0 {
                 self.url_load = None;
                 return;
             }
@@ -751,6 +753,8 @@ pub(crate) enum SaveStage {
 /// Dropping one that's still running cancels it.
 pub(crate) struct SaveJob {
     pub(crate) title: String,
+    /// When it started (the card shows how long it has been going)
+    started: std::time::Instant,
     stage: Arc<std::sync::Mutex<SaveStage>>,
     /// When it finished (the card stays a few seconds after that)
     pub(crate) ended: Option<std::time::Instant>,
@@ -765,6 +769,11 @@ struct SaveRun {
     group: std::sync::Mutex<Option<taskbar::ProcessGroup>>,
     pid: std::sync::atomic::AtomicU32,
     cancelled: std::sync::atomic::AtomicBool,
+    /// How big the file being downloaded has got (a clip's download, done by
+    /// ffmpeg, reports no progress of its own: this shows it's moving)
+    bytes: std::sync::atomic::AtomicU64,
+    /// yt-dlp is running (the size watcher stops when it isn't)
+    live: std::sync::atomic::AtomicBool,
 }
 
 impl SaveRun {
@@ -813,9 +822,22 @@ impl SaveJob {
         !matches!(self.stage(), SaveStage::Done(_) | SaveStage::Failed(_))
     }
 
+    /// While downloading without a percentage: how much so far, and for how
+    /// long ("2.6 MB · 0:12"), so a slow download doesn't look stuck
+    pub(crate) fn progress_note(&self) -> Option<String> {
+        if !matches!(self.stage(), SaveStage::Starting | SaveStage::Downloading(_, None)) {
+            return None;
+        }
+        let secs = self.started.elapsed().as_secs();
+        let time = format!("{}:{:02}", secs / 60, secs % 60);
+        let bytes = self.run.bytes.load(std::sync::atomic::Ordering::Relaxed);
+        Some(if bytes > 0 { format!("{:.1} MB \u{b7} {time}", bytes as f64 / 1_000_000.0) } else { time })
+    }
+
     fn failed(title: String, why: &str) -> Self {
         SaveJob {
             title,
+            started: std::time::Instant::now(),
             stage: Arc::new(std::sync::Mutex::new(SaveStage::Failed(why.to_owned()))),
             ended: None,
             run: Arc::default(),
@@ -912,12 +934,12 @@ impl SaveJob {
                 }
             }
         });
-        SaveJob { title, stage, ended: None, run }
+        SaveJob { title, started: std::time::Instant::now(), stage, ended: None, run }
     }
 }
 
 /// Run yt-dlp once with `args`, passing its progress on through `set`
-fn run_ytdlp(exe: &Path, args: &[std::ffi::OsString], run: &SaveRun, set: &dyn Fn(SaveStage)) -> Attempt {
+fn run_ytdlp(exe: &Path, args: &[std::ffi::OsString], run: &Arc<SaveRun>, set: &dyn Fn(SaveStage)) -> Attempt {
     use std::io::BufRead;
     use std::sync::atomic::Ordering;
     let mut cmd = std::process::Command::new(exe);
@@ -962,14 +984,26 @@ fn run_ytdlp(exe: &Path, args: &[std::ffi::OsString], run: &SaveRun, set: &dyn F
                 }
             } else if let Some(p) = line.strip_prefix("RMP-FILE ") {
                 file = Some(p.to_owned());
-                // (found the video; downloading starts. Clips report no progress.)
+                // (found the video; downloading starts. Clips report no progress:
+                // watch the file grow instead, "<name>.part" while ffmpeg writes it)
                 set(SaveStage::Downloading(SavePart::Both, None));
+                run.live.store(true, Ordering::Relaxed);
+                let (watch, part) = (run.clone(), PathBuf::from(format!("{p}.part")));
+                std::thread::spawn(move || {
+                    while watch.live.load(Ordering::Relaxed) {
+                        if let Ok(md) = std::fs::metadata(&part) {
+                            watch.bytes.store(md.len(), Ordering::Relaxed);
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(400));
+                    }
+                });
             } else if let Some(p) = line.strip_prefix("RMP-SAVED ") {
                 saved = Some(p.to_owned());
             }
         }
     }
     let ok = child.wait().is_ok_and(|s| s.success());
+    run.live.store(false, Ordering::Relaxed);
     let error = errors.and_then(|t| t.join().ok()).flatten();
     if let Ok(mut g) = run.group.lock() {
         *g = None;
@@ -1383,7 +1417,7 @@ impl SaveJob {
                 }
             }
         });
-        SaveJob { title, stage, ended: None, run }
+        SaveJob { title, started: std::time::Instant::now(), stage, ended: None, run }
     }
 }
 

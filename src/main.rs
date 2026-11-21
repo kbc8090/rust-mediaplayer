@@ -1865,7 +1865,9 @@ impl eframe::App for FluentMediaPlayer {
 
                 if !self.has_file {
                     splash::draw(ui.painter(), rect, self.accent);
-                } else if self.render_ctx_initialized {
+                } else if self.render_ctx_initialized && self.url_load.is_none() {
+                    // (while a link is opening, just black: not the last frame of
+                    // whatever played before)
                     ui.painter().add(egui::PaintCallback {
                         rect,
                         callback: Arc::new(egui_glow::CallbackFn::new(move |info, painter| {
@@ -2014,7 +2016,7 @@ impl eframe::App for FluentMediaPlayer {
             }
             // (stays up the whole time it's saving, whatever the bars are doing)
             let alpha = if job.ended.is_some() { news } else { 1.0 };
-            match adjust::draw_save_card(ctx, &job.title, &stage, alpha, self.accent) {
+            match adjust::draw_save_card(ctx, &job.title, &stage, job.progress_note(), alpha, self.accent) {
                 // (closing it while it's saving cancels: see SaveJob's drop)
                 adjust::SaveCardAction::Close => self.save = None,
                 adjust::SaveCardAction::ShowInFolder => {
