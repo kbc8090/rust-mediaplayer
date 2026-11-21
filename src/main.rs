@@ -394,6 +394,11 @@ struct FluentMediaPlayer {
     os_title: String,
     /// A right-button press that will open the main menu where it's let go
     right_press: bool,
+    /// The pointer is over a blank part of the window (the video, or a bar away
+    /// from its buttons and seek bar): this frame so far, and last frame. Only
+    /// there does a right-click open the menu.
+    pub(crate) blank_hover: bool,
+    blank_hover_prev: bool,
     /// A link being saved (or just saved): the card in the top right
     save: Option<SaveJob>,
     /// Current and last-written window geometry
@@ -649,6 +654,8 @@ impl FluentMediaPlayer {
             clip: None,
             os_title: String::new(),
             right_press: false,
+            blank_hover: false,
+            blank_hover_prev: false,
             save: None,
             win_state: saved,
             win_saved: saved,
@@ -1295,6 +1302,7 @@ impl FluentMediaPlayer {
 
 impl eframe::App for FluentMediaPlayer {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        self.blank_hover_prev = std::mem::take(&mut self.blank_hover);
         // No button ever keeps keyboard focus. egui moves focus between buttons with
         // Tab (our info key), and a focused button also "clicks" on Space / Enter,
         // so Tab then Space would have paused *and* pressed some button.
@@ -1841,6 +1849,9 @@ impl eframe::App for FluentMediaPlayer {
             .show(ctx, |ui| {
                 let rect = ui.max_rect();
                 let resp = ui.allocate_rect(rect, Sense::click_and_drag());
+                if resp.hovered() {
+                    self.blank_hover = true;
+                }
 
                 // Double-click → toggle fullscreen
                 if resp.double_clicked() {
@@ -1905,20 +1916,16 @@ impl eframe::App for FluentMediaPlayer {
         // Right-click on the video, or on the title / control bars over it: the
         // main menu, where the button is let go (like Windows' own right-click
         // menus; holding it and moving first works too)
-        let (r_down, r_up, origin, at) = ctx.input(|i| {
+        let (r_down, r_up, at) = ctx.input(|i| {
             (
                 i.pointer.button_pressed(egui::PointerButton::Secondary),
                 i.pointer.button_released(egui::PointerButton::Secondary),
-                i.pointer.press_origin(),
                 i.pointer.latest_pos(),
             )
         });
         if r_down {
-            let bars = [egui::Id::new("top_bar"), egui::Id::new("bottom_bar")];
-            self.right_press = self.right_click_menu
-                && origin
-                    .and_then(|o| ctx.layer_id_at(o))
-                    .is_some_and(|l| l.order == egui::Order::Background || bars.contains(&l.id));
+            // (only on a blank part: not on buttons, the seek bar, sliders, panels)
+            self.right_press = self.right_click_menu && (self.blank_hover || self.blank_hover_prev);
         }
         if r_up && std::mem::take(&mut self.right_press) {
             if let Some(p) = at {
@@ -2005,7 +2012,8 @@ impl eframe::App for FluentMediaPlayer {
             if job.ended.is_some() {
                 ctx.request_repaint_after(std::time::Duration::from_millis(50));
             }
-            let alpha = if job.ended.is_some() { news } else { t_top };
+            // (stays up the whole time it's saving, whatever the bars are doing)
+            let alpha = if job.ended.is_some() { news } else { 1.0 };
             match adjust::draw_save_card(ctx, &job.title, &stage, alpha, self.accent) {
                 // (closing it while it's saving cancels: see SaveJob's drop)
                 adjust::SaveCardAction::Close => self.save = None,

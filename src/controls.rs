@@ -331,6 +331,9 @@ pub(crate) fn draw_top_bar(app: &mut FluentMediaPlayer, ctx: &egui::Context, t: 
             // handle the double-click itself (the video underneath can't see it)
             if fullscreen {
                 let bg = ui.interact(bar, ui.id().with("fs_bg"), Sense::click());
+                if bg.hovered() {
+                    app.blank_hover = true;
+                }
                 if bg.double_clicked() {
                     app.toggle_fullscreen(ctx);
                 }
@@ -341,6 +344,9 @@ pub(crate) fn draw_top_bar(app: &mut FluentMediaPlayer, ctx: &egui::Context, t: 
             // so any part of it that doesn't drag is a dead spot.)
             if !fullscreen {
                 let drag = ui.interact(bar, ui.id().with("drag"), Sense::click_and_drag());
+                if drag.hovered() {
+                    app.blank_hover = true;
+                }
                 let pressed_on_edge = ctx
                     .input(|i| i.pointer.press_origin())
                     .is_some_and(|o| hit_edge(o, screen).is_some());
@@ -488,6 +494,9 @@ pub(crate) fn draw_bottom_bar(app: &mut FluentMediaPlayer, ctx: &egui::Context, 
             // moves the window. Registered first, so the seek bar and buttons added
             // after it take precedence.
             let bg = ui.interact(bar, ui.id().with("bar_bg"), Sense::click_and_drag());
+            if bg.hovered() {
+                app.blank_hover = true;
+            }
             if bg.double_clicked() {
                 app.toggle_fullscreen(ctx);
             }

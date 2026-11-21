@@ -1408,8 +1408,9 @@ pub fn draw_save_card(ctx: &egui::Context, title: &str, stage: &crate::online::S
     let screen = ctx.screen_rect();
     let w = 320.0_f32.min(screen.width() - 16.0);
     let done = matches!(stage, SaveStage::Done(_));
-    // (once saved: a separator, then the Show in folder button under it)
-    let h = if done { 138.0 } else { 96.0 };
+    let failed = matches!(stage, SaveStage::Failed(_));
+    // (a separator, then a button: Cancel saving / Show in folder / Close)
+    let h = 146.0;
     let rect = Rect::from_min_size(pos2(screen.right() - 8.0 - w, screen.top() + PANEL_TOP), vec2(w, h));
     let mut action = SaveCardAction::None;
     let (heading, detail, bar): (&str, String, Option<Option<f32>>) = match stage {
@@ -1475,20 +1476,22 @@ pub fn draw_save_card(ctx: &egui::Context, title: &str, stage: &crate::online::S
         let g = elided(&p, &detail, FontId::proportional(12.0), col, w - 32.0);
         p.galley(pos2(left, rect.top() + 67.0 - g.size().y / 2.0), g, col);
 
-        // Saved: a separator, then "Show in folder"
+        // A separator, then the button for this stage
+        let y = rect.top() + 96.0;
+        p.line_segment([pos2(rect.left() + 1.0, y), pos2(rect.right() - 1.0, y)], Stroke::new(1.0_f32, LINE));
+        let br = Rect::from_min_max(pos2(rect.left() + 16.0, rect.bottom() - 12.0 - 30.0), pos2(rect.right() - 16.0, rect.bottom() - 12.0));
         if done {
-            let y = rect.top() + 88.0;
-            p.line_segment([pos2(rect.left() + 1.0, y), pos2(rect.right() - 1.0, y)], Stroke::new(1.0_f32, LINE));
-            let br = Rect::from_min_max(pos2(rect.left() + 16.0, rect.bottom() - 12.0 - 30.0), pos2(rect.right() - 16.0, rect.bottom() - 12.0));
             if accent_button(ui, &p, br, "Show in folder", ui.id().with("save_show"), true, accent) {
                 action = SaveCardAction::ShowInFolder;
             }
+        } else if cap_sized(ui, &p, br, if failed { "Close" } else { "Cancel saving" }, ui.id().with("save_cancel"), 13.0) {
+            action = SaveCardAction::Close;
         }
 
         // Progress: a bar filling up, or a short piece sliding along while there's
         // nothing to measure (looking up, joining)
         if let Some(frac) = bar {
-            let track = Rect::from_min_max(pos2(left, rect.bottom() - 12.0), pos2(rect.right() - 16.0, rect.bottom() - 9.0));
+            let track = Rect::from_min_max(pos2(left, rect.top() + 81.0), pos2(rect.right() - 16.0, rect.top() + 84.0));
             crate::controls::pill(&p, track, Color32::from_rgb(70, 70, 72));
             match frac {
                 Some(f) => {
