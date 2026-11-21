@@ -48,6 +48,28 @@ pub(crate) fn hit(ui: &mut egui::Ui, centre: Pos2, id: &str, tip: &str, t: f32) 
     hit_at(ui, centre, id, tip, t, true)
 }
 
+/// The title of the chapter at `secs` (None if the video has no chapters, or
+/// `secs` is before the first one)
+pub(crate) fn chapter_at(chapters: &[(f64, String)], secs: f64) -> Option<&str> {
+    chapters.iter().rev().find(|(start, _)| *start <= secs + 0.01).map(|(_, t)| t.as_str())
+}
+
+/// One line of text cut to `width` with "…"
+fn elide(p: &egui::Painter, text: &str, font: FontId, color: Color32, width: f32) -> std::sync::Arc<egui::Galley> {
+    let mut job = egui::text::LayoutJob::simple_singleline(text.to_owned(), font, color);
+    job.wrap = egui::text::TextWrapping { max_width: width.max(10.0), max_rows: 1, break_anywhere: true, overflow_character: Some('\u{2026}') };
+    p.layout_job(job)
+}
+
+/// A chapter title in a small dark box `w` wide at `left`, its bottom at `bottom`
+fn chapter_box(p: &egui::Painter, title: &str, left: f32, w: f32, bottom: f32, t: f32) {
+    let white = Color32::WHITE.gamma_multiply(t);
+    let g = elide(p, title, FontId::proportional(12.5), white, w - 16.0);
+    let r = Rect::from_min_max(pos2(left, bottom - g.size().y - 8.0), pos2(left + w, bottom));
+    p.rect_filled(r, 4.0, Color32::from_rgba_unmultiplied(32, 32, 32, (235.0 * t) as u8));
+    p.galley(pos2(r.center().x - g.size().x / 2.0, r.top() + 4.0), g, white);
+}
+
 /// A button that's greyed out: does nothing, but is still a button (so a
 /// right-click on it doesn't count as the blank bar)
 pub(crate) fn inert(ui: &mut egui::Ui, centre: Pos2, id: &str) {
@@ -648,9 +670,16 @@ pub(crate) fn draw_bottom_bar(app: &mut FluentMediaPlayer, ctx: &egui::Context, 
                 if thumbs_ok {
                     app.thumbs.request(ctx, secs);
                 }
+                // The chapter there (videos with chapters): its title in a box
+                // above the thumbnail, no wider than the thumbnail
+                let chapter = chapter_at(&app.chapters, secs).map(str::to_owned);
+                let thumb_shown = app.thumbs.aspect().filter(|_| thumbs_ok).is_some();
                 if let Some(aspect) = app.thumbs.aspect().filter(|_| thumbs_ok) {
-                    let tw = (thumbs::THUMB_H * aspect).clamp(64.0, 200.0);
-                    let th = (tw / aspect).clamp(40.0, 150.0);
+                    let (mut tw, mut th) = (thumbs::THUMB_W, thumbs::THUMB_W / aspect);
+                    if th > thumbs::THUMB_MAX_H {
+                        th = thumbs::THUMB_MAX_H;
+                        tw = th * aspect;
+                    }
                     let ppp = ctx.pixels_per_point();
                     let snap = |v: f32| (v * ppp).round() / ppp;
                     let tx = (k0 + kw * f - tw / 2.0).clamp(screen.left() + 8.0, screen.right() - 8.0 - tw);
@@ -661,6 +690,16 @@ pub(crate) fn draw_bottom_bar(app: &mut FluentMediaPlayer, ctx: &egui::Context, 
                     }
                     app.thumbs.paint(&tp, tr, 2.0);
                     tp.rect_stroke(tr.expand(0.5), 2.5, Stroke::new(1.0_f32, { let a = (70.0 * t) as u8; Color32::from_rgba_premultiplied(a, a, a, a) }));
+                    if let Some(title) = &chapter {
+                        chapter_box(&tp, title, tr.left(), tr.width(), tr.top() - 5.0, t);
+                    }
+                }
+                // (no thumbnail: the box goes above the time instead)
+                if let (Some(title), false) = (&chapter, thumb_shown) {
+                    let w = p.layout_no_wrap(title.clone(), FontId::proportional(12.5), white).size().x + 16.0;
+                    let bw = w.min(thumbs::THUMB_W);
+                    let bx = (k0 + kw * f - bw / 2.0).clamp(screen.left() + 8.0, screen.right() - 8.0 - bw);
+                    chapter_box(&p, title, bx, bw, r.top() - 5.0, t);
                 }
             }
 
@@ -701,6 +740,17 @@ pub(crate) fn draw_bottom_bar(app: &mut FluentMediaPlayer, ctx: &egui::Context, 
 
             // Time
             p.text(pos2(lay.time_x, row_y - 1.0), Align2::LEFT_CENTER, time_text, time_font, white);
+            // The chapter playing (videos with chapters): "12:41 / 33:07 | Title",
+            // cut short to the room before the buttons on the right
+            if let Some(title) = chapter_at(&app.chapters, app.time_pos) {
+                let x = lay.time_x + time_w + 10.0;
+                let room = lay.mute - BTN_BOX / 2.0 - 14.0 - x;
+                if room > 60.0 {
+                    p.text(pos2(x, row_y - 1.0), Align2::LEFT_CENTER, "|", FontId::proportional(14.0), Color32::from_white_alpha((90.0 * t) as u8));
+                    let g = elide(&p, title, FontId::proportional(14.0), white, room - 14.0);
+                    p.galley(pos2(x + 12.0, row_y - 1.0 - g.size().y / 2.0), g, white);
+                }
+            }
 
             // Volume icon (click = mute) + slider (the slider is left out when the
             // window is too narrow for it; the wheel and arrow keys still work)

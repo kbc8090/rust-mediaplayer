@@ -863,7 +863,11 @@ impl SaveJob {
         add("-f");
         add(&o.format());
         add("-S");
-        add(&o.sort());
+        // A clip prefers WebM streams (VP9 / Opus): ffmpeg can jump straight to
+        // the clip in those, while in YouTube's MP4 streams (H.264 / AV1) it has to
+        // read everything before the clip first. Same quality settings otherwise;
+        // sites without WebM still get MP4.
+        add(&if clip.is_some() { format!("vext:webm,aext:webm,{}", o.sort()) } else { o.sort() });
         add("--merge-output-format");
         add("mp4/webm/mkv");
         add("-P");
