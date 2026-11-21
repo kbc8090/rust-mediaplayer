@@ -1244,7 +1244,7 @@ pub fn draw_online(ctx: &egui::Context, ui_state: &mut AdjustUi, o: &mut crate::
             ui_state.lang_open = false;
         } else {
             let lid = egui::Id::new("online_lang_list");
-            egui::Area::new(lid).order(egui::Order::Foreground).fixed_pos(lr.min).show(ctx, |ui| {
+            egui::Area::new(lid).order(crate::menus::POPUP).fixed_pos(lr.min).show(ctx, |ui| {
                 ui.allocate_rect(lr, Sense::click_and_drag());
                 let p = ui.painter().clone();
                 panel_frame(&p, lr);
@@ -1274,7 +1274,7 @@ pub fn draw_online(ctx: &egui::Context, ui_state: &mut AdjustUi, o: &mut crate::
                     ui_state.lang_scroll = false;
                 });
             });
-            ctx.move_to_top(egui::LayerId::new(egui::Order::Foreground, lid));
+            ctx.move_to_top(egui::LayerId::new(crate::menus::POPUP, lid));
         }
     } else {
         ui_state.lang_rect = Rect::NOTHING;

@@ -171,6 +171,11 @@ pub(crate) fn order_labels(by: SortBy) -> (&'static str, &'static str) {
     }
 }
 
+/// The layer popup menus (main, speed, text field, dropdowns) live on: above every
+/// panel. (On the panels' own layer they'd end up underneath one once they'd been
+/// closed and opened again, because egui keeps the last stacking order.)
+pub(crate) const POPUP: egui::Order = egui::Order::Debug;
+
 pub(crate) const MENU_ITEM_H: f32 = 28.0;
 
 pub(crate) const MENU_PAD: f32 = 3.0;
@@ -340,10 +345,10 @@ pub(crate) fn draw_text_menu(ctx: &egui::Context, at: Pos2, selected: bool, can_
     }
     let id = egui::Id::new("text_menu");
     let mut picked = None;
-    egui::Area::new(id).order(egui::Order::Foreground).fixed_pos(rect.min).show(ctx, |ui| {
+    egui::Area::new(id).order(POPUP).fixed_pos(rect.min).show(ctx, |ui| {
         picked = draw_menu_rows(ui, rect, &rows, None, None, MenuSize::NORMAL).0;
     });
-    ctx.move_to_top(egui::LayerId::new(egui::Order::Foreground, id));
+    ctx.move_to_top(egui::LayerId::new(POPUP, id));
     picked
 }
 
@@ -457,19 +462,19 @@ pub(crate) fn draw_main_menu(app: &mut FluentMediaPlayer, ctx: &egui::Context) {
     let id = egui::Id::new("main_menu");
     let sub_open = app.menu_sub.map(|(k, _)| k);
     let mut out = (None, None, Vec::new());
-    egui::Area::new(id).order(egui::Order::Foreground).fixed_pos(rect.min).show(ctx, |ui| {
+    egui::Area::new(id).order(POPUP).fixed_pos(rect.min).show(ctx, |ui| {
         out = draw_menu_rows(ui, rect, &rows, sub_open, None, MenuSize::NORMAL);
     });
-    ctx.move_to_top(egui::LayerId::new(egui::Order::Foreground, id));
+    ctx.move_to_top(egui::LayerId::new(POPUP, id));
     let (mut picked, hovered, subs) = out;
 
     let mut sub_picked = None;
     if let Some(sr) = sub_rect {
         let sid = egui::Id::new("main_menu_sub");
-        egui::Area::new(sid).order(egui::Order::Foreground).fixed_pos(sr.min).show(ctx, |ui| {
+        egui::Area::new(sid).order(POPUP).fixed_pos(sr.min).show(ctx, |ui| {
             sub_picked = draw_menu_rows(ui, sr, &sub_rows, None, None, MenuSize::NORMAL).0;
         });
-        ctx.move_to_top(egui::LayerId::new(egui::Order::Foreground, sid));
+        ctx.move_to_top(egui::LayerId::new(POPUP, sid));
     }
 
     // Submenu opening / closing, with a short delay like Windows' menus (so the
@@ -592,10 +597,10 @@ pub(crate) fn draw_speed_menu(app: &mut FluentMediaPlayer, ctx: &egui::Context) 
     let id = egui::Id::new("speed_menu");
     let mut picked = None;
     let selected = app.accent.gamma_multiply(0.42);
-    egui::Area::new(id).order(egui::Order::Foreground).fixed_pos(rect.min).show(ctx, |ui| {
+    egui::Area::new(id).order(POPUP).fixed_pos(rect.min).show(ctx, |ui| {
         picked = draw_menu_rows(ui, rect, &rows, None, Some(selected), MenuSize::COMPACT).0;
     });
-    ctx.move_to_top(egui::LayerId::new(egui::Order::Foreground, id));
+    ctx.move_to_top(egui::LayerId::new(POPUP, id));
     if let Some(key) = picked {
         if let Some((s, _)) = SPEEDS.iter().find(|(_, l)| *l == key) {
             app.set_speed(*s);
