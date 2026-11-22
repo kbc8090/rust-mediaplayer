@@ -22,9 +22,11 @@ libmpv2 = { version = "7.0.1", features = ["render"] }
 
 # The native window handle (HWND), for the Windows integration in taskbar.rs
 raw-window-handle = "0.6"
+realfft = "3"
 
 # Reading yt-dlp's details about a link (info panel, error messages, thumbnails)
 serde_json = "1"
+symphonia = { version = "0.6.1", default-features = false, features = ["mp3", "flac", "wav", "aiff", "ogg", "vorbis", "pcm", "aac", "alac", "isomp4", "mkv", "id3v2", "opt-simd"] }
 
 [target.'cfg(windows)'.build-dependencies]
 # Embeds assets/icon.ico into the .exe
