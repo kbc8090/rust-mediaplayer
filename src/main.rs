@@ -787,6 +787,21 @@ impl FluentMediaPlayer {
             self.denoise_ok = false;
             self.apply_vf();
         }
+        // Read-ahead. A file on disk is read in an instant, so mpv keeps only a few
+        // seconds of it (little memory). A link gets mpv's network cache: it reads
+        // well ahead and pauses to catch up if the connection stalls. (Without it a
+        // link had about one second of read-ahead, so any hiccup in the connection
+        // stuttered the video, and going back a few seconds downloaded it again.)
+        // These apply to the file opened next.
+        if is_url(path) {
+            self.link.set("cache", "yes");
+            self.link.set("demuxer-max-bytes", "64MiB");
+            self.link.set("demuxer-max-back-bytes", "16MiB");
+        } else {
+            self.link.set("cache", "no");
+            self.link.set("demuxer-max-bytes", "32MiB");
+            self.link.set("demuxer-max-back-bytes", "8MiB");
+        }
         self.link.command("loadfile", &[path]);
         self.link.set("pause", "no");
         self.is_playing = true;

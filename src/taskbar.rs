@@ -169,7 +169,9 @@ unsafe extern "system" {
     fn MonitorFromWindow(hwnd: isize, flags: u32) -> isize;
     fn GetMonitorInfoW(monitor: isize, info: *mut MonitorInfo) -> i32;
     fn SetWindowPos(hwnd: isize, insert_after: isize, x: i32, y: i32, cx: i32, cy: i32, flags: u32) -> i32;
-    fn FindWindowW(class: *const u16, title: *const u16) -> isize;
+    fn SetPropW(hwnd: isize, name: *const u16, data: isize) -> i32;
+    fn GetPropW(hwnd: isize, name: *const u16) -> isize;
+    fn EnumWindows(callback: unsafe extern "system" fn(isize, isize) -> i32, lparam: isize) -> i32;
     fn SendMessageTimeoutW(
         hwnd: isize,
         msg: u32,
@@ -326,6 +328,9 @@ pub fn post_fullscreen(hwnd: isize, enter: bool) {
 pub fn hook_window(hwnd: isize) -> bool {
     unsafe {
         let ok = SetWindowSubclass(hwnd, Some(subclass_proc), SUBCLASS_ID, 0) != 0;
+        // A tag on the window, so a second launch can find this player (see
+        // forward_to_running_instance)
+        SetPropW(hwnd, wide(WINDOW_TAG).as_ptr(), 1);
         if ok {
             // While the window is minimised the UI loop sleeps; this timer wakes it
             // twice a second so the taskbar progress keeps moving.
@@ -460,6 +465,30 @@ unsafe fn exit_fullscreen_now(hwnd: isize) {
 }
 
 // ── Single window ─────────────────────────────────────────────────────────────
+/// The tag on the player's window. (It used to be found by its title, but the
+/// title now names the file playing; and a folder called RustMediaPlayer open in
+/// Explorer has a window with that title too.)
+const WINDOW_TAG: &str = "RustMediaPlayer.Window";
+
+/// The first top-level window carrying WINDOW_TAG (0 if none)
+unsafe fn find_player_window() -> isize {
+    struct Search {
+        tag: Vec<u16>,
+        found: isize,
+    }
+    unsafe extern "system" fn check(hwnd: isize, lparam: isize) -> i32 {
+        let s = &mut *(lparam as *mut Search);
+        if GetPropW(hwnd, s.tag.as_ptr()) != 0 {
+            s.found = hwnd;
+            return 0; // stop
+        }
+        1
+    }
+    let mut s = Search { tag: wide(WINDOW_TAG), found: 0 };
+    EnumWindows(check, &mut s as *mut Search as isize);
+    s.found
+}
+
 /// A file handed over by a second launch of the player ("" = just come to front)
 static FORWARDED: Mutex<Option<String>> = Mutex::new(None);
 
@@ -480,10 +509,9 @@ pub fn forward_to_running_instance(file: Option<&str>, forward: bool) -> bool {
             return false;
         }
         // The other player may still be starting up: give its window a moment
-        let title = wide("Rust Media Player");
         let mut hwnd = 0;
         for _ in 0..30 {
-            hwnd = FindWindowW(std::ptr::null(), title.as_ptr());
+            hwnd = find_player_window();
             if hwnd != 0 {
                 break;
             }
