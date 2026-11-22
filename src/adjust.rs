@@ -32,6 +32,29 @@ const EQ_PRESETS: [(&str, [i32; 10]); 9] = [
 /// ~1 s ahead and smoothly raises quiet passages / lowers loud ones.
 const NORMALIZER: &str = "lavfi=[dynaudnorm=f=150:g=15]";
 
+/// What fills the window while a song plays (Picture & Sound → Sound)
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum MusicShow {
+    /// Glowing bars that move with the music
+    Visualizer,
+    /// The song's cover with a strip of bars under it; songs without a cover get
+    /// the visualizer
+    AlbumArt,
+    /// Nothing that moves: the cover if there is one, else a still background
+    Off,
+}
+
+impl MusicShow {
+    const ALL: [MusicShow; 3] = [MusicShow::Visualizer, MusicShow::AlbumArt, MusicShow::Off];
+    fn key(self) -> &'static str {
+        match self {
+            MusicShow::Visualizer => "visualizer",
+            MusicShow::AlbumArt => "album_art",
+            MusicShow::Off => "off",
+        }
+    }
+}
+
 #[derive(Clone, PartialEq, Debug)]
 pub struct Adjust {
     // Picture: mpv's own controls, −100…100
@@ -61,6 +84,8 @@ pub struct Adjust {
     pub crossfeed: bool,
     pub widen: bool,
     pub keep_pitch: bool,
+    /// While a song plays (not reset by Reset: it's how songs look, not how they sound)
+    pub music: MusicShow,
     // Equalizer (dB)
     pub eq_on: bool,
     pub preamp: i32,
@@ -89,6 +114,7 @@ impl Default for Adjust {
             crossfeed: false,
             widen: false,
             keep_pitch: true,
+            music: MusicShow::AlbumArt,
             eq_on: false,
             preamp: 0,
             eq: [0; 10],
@@ -130,6 +156,11 @@ impl Adjust {
                 "crossfeed" => a.crossfeed = b,
                 "widen" => a.widen = b,
                 "keep_pitch" => a.keep_pitch = b,
+                "music" => {
+                    if let Some(m) = MusicShow::ALL.into_iter().find(|m| m.key() == v) {
+                        a.music = m;
+                    }
+                }
                 "eq_on" => a.eq_on = b,
                 "preamp" => a.preamp = n.clamp(-EQ_MAX, EQ_MAX),
                 "eq" => {
@@ -149,11 +180,11 @@ impl Adjust {
         let text = format!(
             "brightness={}\ncontrast={}\nsaturation={}\ngamma={}\nhue={}\ntemperature={}\nvibrance_fine={}\n\
              sharpen={}\ndenoise={}\ndeband={}\ndeinterlace={}\nsmooth={}\nnight={}\ndialogue={}\n\
-             delay_ms={}\nmono={}\ncrossfeed={}\nwiden={}\nkeep_pitch={}\neq_on={}\npreamp={}\neq={}\n",
+             delay_ms={}\nmono={}\ncrossfeed={}\nwiden={}\nkeep_pitch={}\nmusic={}\neq_on={}\npreamp={}\neq={}\n",
             self.brightness, self.contrast, self.saturation, self.gamma, self.hue, self.temperature,
             self.vibrance, self.sharpen, self.denoise, b(self.deband), b(self.deinterlace), b(self.smooth),
             b(self.night), b(self.dialogue), self.delay_ms, b(self.mono), b(self.crossfeed), b(self.widen),
-            b(self.keep_pitch), b(self.eq_on), self.preamp, eq.join(","),
+            b(self.keep_pitch), self.music.key(), b(self.eq_on), self.preamp, eq.join(","),
         );
         if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);
@@ -554,7 +585,16 @@ enum Row {
     Switch(&'static str, &'static str, bool, SwitchKey),
     /// The equalizer button
     Equalizer(bool),
+    /// name, description, choices, chosen (a segmented control)
+    Choice(&'static str, &'static str, &'static [&'static str], usize, ChoiceKey),
+    /// A small heading
+    Section(&'static str),
     Sep,
+}
+
+#[derive(Clone, Copy)]
+enum ChoiceKey {
+    Music,
 }
 
 #[derive(Clone, Copy)]
@@ -675,7 +715,17 @@ fn rows(a: &Adjust, normalize: bool, hq: bool, tab: Tab, denoise_skipped: bool) 
         }
         Tab::Sound => {
             let delay = if a.delay_ms == 0 { "0 ms".to_owned() } else { format!("{} ms", signed(a.delay_ms)) };
+            let music = MusicShow::ALL.iter().position(|m| *m == a.music).unwrap_or(1);
             vec![
+                Row::Section("While music plays"),
+                Row::Choice(
+                    "Show",
+                    "Visualizer: glowing bars that move with the music. Album art: the song's cover with a strip of bars under it (songs without a cover show the visualizer). Off: just the cover, or a still background; nothing moves, so it uses no extra power.",
+                    &["Visualizer", "Album art", "Off"],
+                    music,
+                    ChoiceKey::Music,
+                ),
+                Row::Sep,
                 Row::Equalizer(a.eq_on),
                 Row::Sep,
                 Row::Switch("Normalize volume", "Evens out loud and quiet passages, and songs from different albums.", normalize, SwitchKey::Normalize),
@@ -706,7 +756,11 @@ pub fn draw_panel(ctx: &egui::Context, ui_state: &mut AdjustUi, a: &mut Adjust, 
     }
     let screen = ctx.screen_rect();
     let list = rows(a, *normalize, *hq, ui_state.tab, ui_state.denoise_skipped);
-    let row_h = |r: &Row| if matches!(r, Row::Sep) { 9.0 } else { ROW_H };
+    let row_h = |r: &Row| match r {
+        Row::Sep => 9.0,
+        Row::Section(_) => 24.0,
+        _ => ROW_H,
+    };
     let content_h: f32 = list.iter().map(row_h).sum();
     const TABS_H: f32 = 42.0;
     let full_h = HEAD_H + TABS_H + content_h + 10.0;
@@ -780,6 +834,21 @@ pub fn draw_panel(ctx: &egui::Context, ui_state: &mut AdjustUi, a: &mut Adjust, 
                 match row {
                     Row::Sep => {
                         p.line_segment([pos2(r.left() + 4.0, r.center().y), pos2(r.right() - 4.0, r.center().y)], Stroke::new(1.0_f32, LINE));
+                    }
+                    Row::Section(title) => {
+                        p.text(pos2(r.left() + 10.0, r.bottom() - 4.0), Align2::LEFT_BOTTOM, title.to_uppercase(), FontId::proportional(10.5), DIM);
+                    }
+                    Row::Choice(name, desc, labels, chosen, key) => {
+                        if ui.rect_contains_pointer(r) {
+                            p.rect_filled(r, 4.0, HOVER);
+                            hovered_desc = Some((r, desc));
+                        }
+                        p.text(pos2(r.left() + 10.0, r.center().y), Align2::LEFT_CENTER, *name, FontId::proportional(NAME_SIZE), TEXT);
+                        if let Some(i) = segmented(ui, &p, r.right() - 8.0, r.center().y, labels, *chosen, name, accent) {
+                            match key {
+                                ChoiceKey::Music => a.music = MusicShow::ALL[i],
+                            }
+                        }
                     }
                     Row::Step(name, desc, value, changed, key) => {
                         if ui.rect_contains_pointer(r) {

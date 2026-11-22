@@ -49,6 +49,26 @@ pub struct Snapshot {
     pub info: Vec<InfoRow>,
     /// The last link's details from yt-dlp (or why it failed), once known
     pub link_info: Option<Arc<crate::online::LinkInfo>>,
+    /// What the picture is: a real video, a song's cover art, or nothing (a song
+    /// without a cover)
+    pub video_kind: VideoKind,
+    /// A song's artist and album tags ("" if it has none)
+    pub artist: String,
+    pub album: String,
+}
+
+/// What is in the current file's picture
+#[derive(Clone, Copy, PartialEq, Default, Debug)]
+pub enum VideoKind {
+    /// Not known yet (nothing open, or the file is still opening)
+    #[default]
+    Unknown,
+    /// Sound only: no picture at all
+    None,
+    /// Sound with an embedded cover picture (album art)
+    Cover,
+    /// A video or a picture
+    Video,
 }
 
 /// A line of the info overlay
@@ -238,6 +258,17 @@ fn run(mpv: Arc<Mutex<Mpv>>, rx: mpsc::Receiver<Job>, state: Arc<Mutex<Snapshot>
             idle: m.get_property::<bool>("idle-active").unwrap_or(false),
             media_title: m.get_property::<String>("media-title").unwrap_or_default(),
             link_info: None,
+            // (current-tracks/... only exist once the file has opened and its
+            // tracks are chosen)
+            video_kind: match m.get_property::<bool>("current-tracks/video/albumart") {
+                Ok(true) => VideoKind::Cover,
+                Ok(false) => VideoKind::Video,
+                Err(_) if m.get_property::<i64>("current-tracks/video/id").is_ok() => VideoKind::Video,
+                Err(_) if m.get_property::<i64>("current-tracks/audio/id").is_ok() => VideoKind::None,
+                Err(_) => VideoKind::Unknown,
+            },
+            artist: m.get_property::<String>("metadata/by-key/artist").unwrap_or_default(),
+            album: m.get_property::<String>("metadata/by-key/album").unwrap_or_default(),
         };
         let key = (
             m.get_property::<String>("path").unwrap_or_default(),

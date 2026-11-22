@@ -14,13 +14,14 @@ mod files;
 mod controls;
 mod menus;
 mod online;
+mod visualizer;
 use settings::*;
 use files::*;
 use controls::*;
 use menus::*;
 use online::*;
 
-use mpv_link::{yn, InfoRow, MpvLink};
+use mpv_link::{yn, InfoRow, MpvLink, VideoKind};
 
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use std::sync::{Arc, Mutex};
@@ -147,6 +148,27 @@ unsafe fn paint_video(gl: &glow::Context, rc: &mut RenderContext<'static>, x: i3
         gl.bind_framebuffer(glow::FRAMEBUFFER, None);
         drew
     })
+}
+
+/// Draws mpv's picture into `rect`
+fn video_callback(rect: Rect) -> egui::PaintCallback {
+    egui::PaintCallback {
+        rect,
+        callback: Arc::new(egui_glow::CallbackFn::new(move |info, painter| {
+            // Render at the real pixel size so HiDPI scaling stays correct
+            let vp = info.viewport_in_pixels();
+            let started = std::time::Instant::now();
+            let drew = TLS_RENDER_CTX.with(|c| match c.borrow_mut().as_mut() {
+                Some(rc) => unsafe { paint_video(painter.gl(), rc, vp.left_px, vp.from_bottom_px, vp.width_px, vp.height_px) },
+                None => false,
+            });
+            // (timings only count real mpv draws, not copies of the last picture)
+            if drew {
+                let ms = started.elapsed().as_secs_f32() * 1000.0;
+                RENDER_MS.with(|r| r.set(r.get() * 0.8 + ms * 0.2));
+            }
+        })),
+    }
 }
 
 thread_local! {
@@ -386,6 +408,19 @@ struct FluentMediaPlayer {
     retried_url: Option<String>,
     /// The link whose preview stream the thumbnails are using
     link_thumbs: Option<String>,
+    /// What the current file's picture is (a song without one, with a cover, a
+    /// video); songs get the visualizer / album-art screen
+    video_kind: VideoKind,
+    /// A song's title (or file name), artist and album, for the album-art screen
+    song_title: String,
+    song_artist: String,
+    song_album: String,
+    /// The cover's width / height
+    cover_aspect: f32,
+    /// The music visualizer: the second decoder, the bars, and when they last moved
+    scope: visualizer::Scope,
+    bars: visualizer::Bars,
+    bars_tick: std::time::Instant,
     /// The link playing is a live stream (yt-dlp says so): the seek bar is full and
     /// still, and the time shows "● Live" beside it
     pub(crate) live: bool,
@@ -657,6 +692,14 @@ impl FluentMediaPlayer {
             link_retry: None,
             retried_url: None,
             link_thumbs: None,
+            video_kind: VideoKind::Unknown,
+            song_title: String::new(),
+            song_artist: String::new(),
+            song_album: String::new(),
+            cover_aspect: 1.0,
+            scope: visualizer::Scope::new(),
+            bars: visualizer::Bars::new(),
+            bars_tick: std::time::Instant::now(),
             live: false,
             video_hold: None,
             save_pending: None,
@@ -810,6 +853,8 @@ impl FluentMediaPlayer {
         self.chapters = Arc::new(Vec::new());
         self.link_thumbs = None;
         self.live = false;
+        self.video_kind = VideoKind::Unknown;
+        self.bars.reset();
         self.clip = None;
         if is_url(path) {
             self.thumbs.forget();
@@ -1103,6 +1148,55 @@ impl FluentMediaPlayer {
     }
 
     /// Remember the window geometry, then end the process at once
+    /// A song is playing: the visualizer, the album-art screen, or (Show: Off)
+    /// the cover / a still background (Picture & Sound → Sound → Show)
+    fn draw_music(&mut self, ui: &egui::Ui, rect: Rect) {
+        use adjust::MusicShow;
+        let now = std::time::Instant::now();
+        let dt = now.saturating_duration_since(self.bars_tick).as_secs_f32();
+        self.bars_tick = now;
+
+        let mode = self.adjust.music;
+        let has_cover = self.video_kind == VideoKind::Cover && self.render_ctx_initialized;
+        let cover = if has_cover && mode == MusicShow::AlbumArt { visualizer::Bars::cover_rect(rect, self.cover_aspect) } else { None };
+        // (Off, or the cover shown full size: no bars, so no second decoder either)
+        let wants_bars = match mode {
+            MusicShow::Off => false,
+            MusicShow::AlbumArt | MusicShow::Visualizer => true,
+        };
+        let moving = if wants_bars {
+            self.scope.follow(&self.current_file, self.time_pos);
+            let playing = self.is_playing && !self.eof;
+            self.bars.update(&self.scope, &self.current_file, self.time_pos, playing, dt)
+        } else {
+            self.scope.stop();
+            false
+        };
+        let readable = self.bars.state != visualizer::State::Unsupported;
+
+        // The song's name: its title tag (else the file name), then "artist · album"
+        let title = if self.song_title.is_empty() { self.file_name() } else { self.song_title.clone() };
+        let sub = [self.song_artist.trim(), self.song_album.trim()].iter().filter(|t| !t.is_empty()).copied().collect::<Vec<_>>().join(" \u{b7} ");
+
+        let p = ui.painter();
+        if mode == MusicShow::Off && has_cover {
+            p.add(video_callback(rect));
+        } else if let Some(c) = cover {
+            self.bars.draw_cover_back(p, rect, c, self.accent);
+            p.add(video_callback(c));
+            self.bars.draw_cover_front(p, rect, (&title, &sub), self.accent, readable);
+        } else if mode == MusicShow::Off || !readable {
+            self.bars.draw_still(p, rect, &title, &sub, self.accent);
+        } else {
+            self.bars.draw_visualizer(p, rect, self.accent);
+        }
+        // Keep the bars moving (at the screen's refresh rate; the 6 ms is only a
+        // limit in case vsync is off). Paused, they settle and the redrawing stops.
+        if moving && readable {
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(6));
+        }
+    }
+
     fn quit(&mut self) -> ! {
         if self.win_state != self.win_saved {
             save_window_state(&self.win_state);
@@ -1385,6 +1479,24 @@ impl eframe::App for FluentMediaPlayer {
             }
             self.duration = snap.duration;
             self.video_fps = snap.fps;
+            // (A link can turn into other addresses, e.g. a YouTube playlist into
+            // its videos: then whatever mpv is playing counts. While a link opens
+            // the screen stays black anyway, see url_load.)
+            if snap.path == self.current_file || (is_url(&self.current_file) && !snap.path.is_empty()) {
+                self.video_kind = snap.video_kind;
+                for (mine, theirs) in [
+                    (&mut self.song_title, &snap.media_title),
+                    (&mut self.song_artist, &snap.artist),
+                    (&mut self.song_album, &snap.album),
+                ] {
+                    if mine != theirs {
+                        mine.clone_from(theirs);
+                    }
+                }
+                if snap.dwidth > 0 && snap.dheight > 0 {
+                    self.cover_aspect = snap.dwidth as f32 / snap.dheight as f32;
+                }
+            }
             self.update_smooth();
             // Denoise only up to 1080p, counted in pixels (so a 1080x1920 phone
             // video counts too); larger videos play without it. (Sizes still
@@ -1910,30 +2022,23 @@ impl eframe::App for FluentMediaPlayer {
                     ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
                 }
 
+                let music = self.has_file && matches!(self.video_kind, VideoKind::None | VideoKind::Cover);
+                if !music {
+                    self.scope.stop();
+                }
                 if !self.has_file {
                     splash::draw(ui.painter(), rect, self.accent);
-                } else if self.render_ctx_initialized && self.url_load.is_none() && self.video_hold.is_none() {
-                    // (while a link is opening, just black: not the last frame of
-                    // whatever played before)
-                    ui.painter().add(egui::PaintCallback {
-                        rect,
-                        callback: Arc::new(egui_glow::CallbackFn::new(move |info, painter| {
-                            // Render at the real pixel size so HiDPI scaling stays correct
-                            let vp = info.viewport_in_pixels();
-                            let started = std::time::Instant::now();
-                            let drew = TLS_RENDER_CTX.with(|c| match c.borrow_mut().as_mut() {
-                                Some(rc) => unsafe {
-                                    paint_video(painter.gl(), rc, vp.left_px, vp.from_bottom_px, vp.width_px, vp.height_px)
-                                },
-                                None => false,
-                            });
-                            // (timings only count real mpv draws, not copies of the last picture)
-                            if drew {
-                                let ms = started.elapsed().as_secs_f32() * 1000.0;
-                                RENDER_MS.with(|r| r.set(r.get() * 0.8 + ms * 0.2));
-                            }
-                        })),
-                    });
+                } else if music {
+                    self.draw_music(ui, rect);
+                } else if self.render_ctx_initialized
+                    && self.video_kind == VideoKind::Video
+                    && self.url_load.is_none()
+                    && self.video_hold.is_none()
+                {
+                    // (Until the new file is known to be a video, and while a link
+                    // is opening: just black, not the last picture of whatever
+                    // played before, such as the previous song's cover.)
+                    ui.painter().add(video_callback(rect));
                 }
             });
 

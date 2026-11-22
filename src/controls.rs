@@ -55,7 +55,7 @@ pub(crate) fn chapter_at(chapters: &[(f64, String)], secs: f64) -> Option<&str> 
 }
 
 /// One line of text cut to `width` with "…"
-fn elide(p: &egui::Painter, text: &str, font: FontId, color: Color32, width: f32) -> std::sync::Arc<egui::Galley> {
+pub(crate) fn elide(p: &egui::Painter, text: &str, font: FontId, color: Color32, width: f32) -> std::sync::Arc<egui::Galley> {
     let mut job = egui::text::LayoutJob::simple_singleline(text.to_owned(), font, color);
     job.wrap = egui::text::TextWrapping { max_width: width.max(10.0), max_rows: 1, break_anywhere: true, overflow_character: Some('\u{2026}') };
     p.layout_job(job)

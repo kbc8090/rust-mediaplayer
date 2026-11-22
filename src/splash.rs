@@ -9,28 +9,28 @@
 
 use eframe::egui::{self, pos2, vec2, Align2, Color32, FontId, Mesh, Pos2, Rect};
 
-type Rgb = [f32; 3];
+pub(crate) type Rgb = [f32; 3];
 
 const TEAL: Rgb = [0.10, 0.90, 0.80];
 const VIOLET: Rgb = [0.70, 0.35, 1.00];
 const GRID: Rgb = [0.60, 0.80, 1.00];
 
-fn rgb(c: Color32) -> Rgb {
+pub(crate) fn rgb(c: Color32) -> Rgb {
     [c.r() as f32 / 255.0, c.g() as f32 / 255.0, c.b() as f32 / 255.0]
 }
 
-fn mix(a: Rgb, b: Rgb, t: f32) -> Rgb {
+pub(crate) fn mix(a: Rgb, b: Rgb, t: f32) -> Rgb {
     [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t]
 }
 
 /// Additive light of colour `c` at strength `k`
-fn light(c: Rgb, k: f32) -> Color32 {
+pub(crate) fn light(c: Rgb, k: f32) -> Color32 {
     let ch = |v: f32| (v * k * 255.0).round().clamp(0.0, 255.0) as u8;
     Color32::from_rgba_premultiplied(ch(c[0]), ch(c[1]), ch(c[2]), 0)
 }
 
 /// Ribbon colour along the width: teal → accent → violet
-fn ribbon_colour(accent: Rgb, t: f32) -> Rgb {
+pub(crate) fn ribbon_colour(accent: Rgb, t: f32) -> Rgb {
     if t < 0.5 {
         mix(TEAL, accent, t * 2.0)
     } else {
@@ -86,29 +86,26 @@ fn rings(mesh: &mut Mesh, c: Pos2, rx: f32, ry: f32, ds: &[f32], ring: impl Fn(f
     }
 }
 
-pub fn draw(p: &egui::Painter, rect: Rect, accent: Color32) {
-    let p = p.with_clip_rect(rect);
+/// The dark background with its faint grid and the accent glow, centred on the
+/// height `cy` (the start screen's ribbon, the music visualizer's bars)
+pub(crate) fn backdrop(m: &mut Mesh, rect: Rect, accent: Color32, cy: f32) {
     let (w, h) = (rect.width(), rect.height());
     if w < 4.0 || h < 4.0 {
         return;
     }
     let acc = rgb(accent);
-    let s = (h / 720.0).clamp(0.45, 2.0); // scale relative to the 720 p design
+    let s = (h / 720.0).clamp(0.45, 2.0);
     let cx = rect.center().x;
-    let cy = rect.top() + h * 0.44;
 
     // ── background: deep blue-black gradient ────────────────────────────────
-    let mut bg = Mesh::default();
     let (top, bot) = (Color32::from_rgb(4, 5, 9), Color32::from_rgb(3, 3, 6));
-    bg.colored_vertex(rect.left_top(), top);
-    bg.colored_vertex(rect.right_top(), top);
-    bg.colored_vertex(rect.right_bottom(), bot);
-    bg.colored_vertex(rect.left_bottom(), bot);
-    bg.add_triangle(0, 1, 2);
-    bg.add_triangle(0, 2, 3);
-    p.add(egui::Shape::mesh(bg));
-
-    let mut m = Mesh::default();
+    let base = m.vertices.len() as u32;
+    m.colored_vertex(rect.left_top(), top);
+    m.colored_vertex(rect.right_top(), top);
+    m.colored_vertex(rect.right_bottom(), bot);
+    m.colored_vertex(rect.left_bottom(), bot);
+    m.add_triangle(base, base + 1, base + 2);
+    m.add_triangle(base, base + 2, base + 3);
 
     // ── faint grid, fading away from the ribbon ─────────────────────────────
     let fade = |y: f32| (-((y - cy) / (0.5 * h)).powi(2)).exp();
@@ -147,9 +144,24 @@ pub fn draw(p: &egui::Painter, rect: Rect, accent: Color32) {
 
     // ── accent glow behind the ribbon ───────────────────────────────────────
     let glow_ds: Vec<f32> = (0..=10).map(|i| i as f32 * 0.16).collect();
-    rings(&mut m, pos2(cx, cy), w * 0.55, w * 0.55, &glow_ds, |d| {
+    rings(m, pos2(cx, cy), w * 0.55, w * 0.55, &glow_ds, |d| {
         if d >= 1.59 { Color32::TRANSPARENT } else { light(acc, 0.16 * (-2.2 * d * d).exp()) }
     });
+}
+
+pub fn draw(p: &egui::Painter, rect: Rect, accent: Color32) {
+    let p = p.with_clip_rect(rect);
+    let (w, h) = (rect.width(), rect.height());
+    if w < 4.0 || h < 4.0 {
+        return;
+    }
+    let acc = rgb(accent);
+    let s = (h / 720.0).clamp(0.45, 2.0); // scale relative to the 720 p design
+    let cx = rect.center().x;
+    let cy = rect.top() + h * 0.44;
+
+    let mut m = Mesh::default();
+    backdrop(&mut m, rect, accent, cy);
 
     // ── the ribbon: 11 interleaved waves ────────────────────────────────────
     let npts = ((w / 3.0) as usize).clamp(120, 900);
@@ -177,12 +189,7 @@ pub fn draw(p: &egui::Painter, rect: Rect, accent: Color32) {
         strip(&mut m, &pts, if k == 0 { 2.3 } else { 1.25 }, &core);
     }
 
-    // ── vignette ────────────────────────────────────────────────────────────
-    let vig_ds = [0.25, 0.35, 0.45, 0.55, 0.65, 0.75, 0.85, 1.6];
-    rings(&mut m, rect.center(), w / 1.15, h, &vig_ds, |d| {
-        let t = ((d - 0.25) / 0.6).clamp(0.0, 1.0);
-        Color32::from_black_alpha((0.5 * t.powf(1.6) * 255.0) as u8)
-    });
+    vignette(&mut m, rect);
 
     p.add(egui::Shape::mesh(m));
 
@@ -199,4 +206,13 @@ pub fn draw(p: &egui::Painter, rect: Rect, accent: Color32) {
         FontId::proportional(12.5),
         Color32::from_rgb(170, 176, 190),
     );
+}
+
+/// Darkens the edges and corners
+pub(crate) fn vignette(m: &mut Mesh, rect: Rect) {
+    let vig_ds = [0.25, 0.35, 0.45, 0.55, 0.65, 0.75, 0.85, 1.6];
+    rings(m, rect.center(), rect.width() / 1.15, rect.height(), &vig_ds, |d| {
+        let t = ((d - 0.25) / 0.6).clamp(0.0, 1.0);
+        Color32::from_black_alpha((0.5 * t.powf(1.6) * 255.0) as u8)
+    });
 }
