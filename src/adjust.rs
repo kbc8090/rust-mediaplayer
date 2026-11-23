@@ -481,6 +481,13 @@ fn semibold(size: f32) -> FontId {
     FontId::new(size, FontFamily::Name("semibold".into()))
 }
 
+/// Is the pointer on row `r`? Its bottom and right edges belong to the next row
+/// (egui's own check counts both edges as inside, so on the line between two
+/// rows both were "hovered" at once)
+fn pointer_on(ui: &egui::Ui, r: Rect) -> bool {
+    ui.rect_contains_pointer(r) && ui.input(|i| i.pointer.hover_pos()).is_some_and(|p| p.x < r.right() && p.y < r.bottom())
+}
+
 fn panel_frame(p: &egui::Painter, rect: Rect) {
     let r = 8.0;
     glass::shadow(p, rect, r, 1.0);
@@ -855,7 +862,7 @@ pub fn draw_panel(ctx: &egui::Context, ui_state: &mut AdjustUi, a: &mut Adjust, 
                         p.text(pos2(r.left() + 10.0, r.bottom() - 4.0), Align2::LEFT_BOTTOM, title.to_uppercase(), FontId::proportional(10.5), DIM);
                     }
                     Row::Choice(name, desc, labels, chosen, key) => {
-                        if ui.rect_contains_pointer(r) {
+                        if pointer_on(ui, r) {
                             p.rect_filled(r, 4.0, HOVER);
                             hovered_desc = Some((r, desc));
                         }
@@ -867,7 +874,7 @@ pub fn draw_panel(ctx: &egui::Context, ui_state: &mut AdjustUi, a: &mut Adjust, 
                         }
                     }
                     Row::Step(name, desc, value, changed, key) => {
-                        if ui.rect_contains_pointer(r) {
+                        if pointer_on(ui, r) {
                             p.rect_filled(r, 4.0, HOVER);
                             hovered_desc = Some((r, desc));
                         }
@@ -897,7 +904,7 @@ pub fn draw_panel(ctx: &egui::Context, ui_state: &mut AdjustUi, a: &mut Adjust, 
                             }
                         }
                         // The wheel over a row steps it too (the normal step)
-                        if ui.rect_contains_pointer(r) {
+                        if pointer_on(ui, r) {
                             let wheel = ui.input(|i| i.raw_scroll_delta.y);
                             if wheel > 0.0 {
                                 step(a, *key, 1, false);
@@ -1199,7 +1206,7 @@ pub fn draw_online(ctx: &egui::Context, ui_state: &mut AdjustUi, o: &mut crate::
             p.text(pos2(r.left() + 10.0, r.center().y), Align2::LEFT_CENTER, text, FontId::proportional(NAME_SIZE), TEXT);
         };
         let hover_row = |ui: &egui::Ui, p: &egui::Painter, r: Rect| {
-            let over = ui.rect_contains_pointer(r);
+            let over = pointer_on(ui, r);
             if over {
                 p.rect_filled(r, 4.0, HOVER);
             }
@@ -1996,7 +2003,8 @@ pub fn draw_playlist(
                     } else {
                         (FontId::proportional(12.5), Color32::from_rgb(222, 222, 226))
                     };
-                    let num_r = r.left() + 26.0;
+                    // (the bars start 10 px in, as the length ends 10 px from the right)
+                    let num_r = r.left() + 23.0;
                     if cur {
                         playing_mark(p, num_r, r.center().y + 6.0, playing, accent);
                     } else {
