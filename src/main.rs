@@ -388,6 +388,10 @@ struct FluentMediaPlayer {
     hw_decode: usize,
     /// File given on the command line (drop on the .exe / "Open with"), played once ready
     startup_file: Option<String>,
+    /// Files arriving from Explorer together (see open_arriving), and when the
+    /// last one came
+    arriving: Vec<String>,
+    arriving_last: Option<std::time::Instant>,
     /// The window was maximized when last closed: re-apply it at startup
     start_max: bool,
     start_max_done: bool,
@@ -594,11 +598,13 @@ impl FluentMediaPlayer {
         let (volume, muted) = (st.volume as f64, st.muted);
         // A file passed on the command line: drag a video onto the .exe, double-click an
         // associated file, or "Open with". (Explorer passes the path as the first argument.)
-        let startup_file = std::env::args_os()
+        let startup_files: Vec<String> = std::env::args_os()
             .skip(1)
             .map(PathBuf::from)
-            .find(|p| p.is_file() || is_url(&p.to_string_lossy()))
-            .map(|p| p.to_string_lossy().into_owned());
+            .filter(|p| p.is_file() || is_url(&p.to_string_lossy()))
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+        let startup_file = startup_files.first().cloned();
 
         // video-timing-offset = 0 stops mpv from blocking the UI thread inside
         // render() while it waits for each frame's display time (the default 50 ms
@@ -704,6 +710,10 @@ impl FluentMediaPlayer {
             show_info: false,
             info_rows: Vec::new(),
             hw_decode: st.hwdec,
+            // (the file the player was started with counts as the first to arrive)
+            // (several on the command line: a playlist of them too)
+            arriving_last: startup_file.as_ref().map(|_| std::time::Instant::now()),
+            arriving: startup_files,
             startup_file,
             start_max: saved.maximized,
             start_max_done: false,
@@ -842,10 +852,15 @@ impl FluentMediaPlayer {
         self.playlist_selected = selected;
         self.playlist_shuffle = false;
         self.play_order.clear();
+        // (already playing the first one, e.g. the first of several opened from
+        // Explorer: carry on, don't start it again)
+        let playing_it = self.has_file && self.current_file == first;
         self.start_playlist_rows(&entries);
         self.folder_files = entries.into_iter().map(|e| e.path).collect();
         self.folder_index = Some(0);
-        self.load_entry(&first);
+        if !playing_it {
+            self.load_entry(&first);
+        }
         self.scan_gen += 1; // a folder scan still running is no longer wanted
     }
 
@@ -984,6 +999,27 @@ impl FluentMediaPlayer {
     }
 
     /// Open a file handed to us from outside (open dialog, a second launch)
+    /// A file opened from outside (Explorer, a later launch). The first one plays
+    /// at once; more arriving right after it are collected, and become a playlist
+    /// once they stop coming (Explorer's "Open" on several selected files starts
+    /// the player once per file, a moment apart).
+    fn open_arriving(&mut self, path: String) {
+        if !Path::new(&path).is_file() && !is_url(&path) {
+            return; // ("": just come to the front)
+        }
+        let now = std::time::Instant::now();
+        let together = self.arriving_last.is_some_and(|t| now.duration_since(t) < std::time::Duration::from_millis(2000));
+        self.arriving_last = Some(now);
+        if together {
+            if !self.arriving.contains(&path) {
+                self.arriving.push(path);
+            }
+            return;
+        }
+        self.arriving = vec![path.clone()];
+        self.open_external(path);
+    }
+
     fn open_external(&mut self, path: String) {
         if !Path::new(&path).is_file() && !is_url(&path) {
             return;
@@ -1928,8 +1964,23 @@ impl eframe::App for FluentMediaPlayer {
         if let Some(path) = taskbar::take_picked_file() {
             self.open_external(path);
         }
-        if let Some(path) = taskbar::take_forwarded() {
-            self.open_external(path);
+        for path in taskbar::take_forwarded() {
+            self.open_arriving(path);
+        }
+        // Several files opened from Explorer together have all arrived: they
+        // become a selected playlist (like dropping them in together)
+        if let Some(t) = self.arriving_last {
+            if t.elapsed() > std::time::Duration::from_millis(450) && self.render_ctx_initialized {
+                self.arriving_last = None;
+                let mut files: Vec<PathBuf> = std::mem::take(&mut self.arriving).into_iter().filter(|s| is_media_file(s)).map(PathBuf::from).collect();
+                if files.len() > 1 {
+                    files.sort_by(|a, b| natural_cmp(&a.file_name().unwrap_or_default().to_string_lossy(), &b.file_name().unwrap_or_default().to_string_lossy()));
+                    let entries: Vec<PlaylistEntry> = files.into_iter().map(|path| PlaylistEntry { path, title: None, secs: None }).collect();
+                    self.start_playlist(PathBuf::from("Selected files"), entries, true);
+                }
+            } else {
+                ctx.request_repaint_after(std::time::Duration::from_millis(100));
+            }
         }
         let status = taskbar::Status {
             has_file: self.has_file,
@@ -2920,13 +2971,14 @@ fn main() -> eframe::Result<()> {
 
     // Single window: if the player is already running, hand it the file (it plays
     // it in place of the current one) and leave
-    let arg_file = std::env::args_os()
+    let arg_files: Vec<String> = std::env::args_os()
         .skip(1)
         .map(PathBuf::from)
-        .find(|p| p.is_file() || is_url(&p.to_string_lossy()))
-        .map(|p| p.to_string_lossy().into_owned());
+        .filter(|p| p.is_file() || is_url(&p.to_string_lossy()))
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect();
     // (unless multiple windows are allowed in the menu)
-    if taskbar::forward_to_running_instance(arg_file.as_deref(), !load_settings().multi) {
+    if taskbar::forward_to_running_instance(&arg_files, !load_settings().multi) {
         return Ok(());
     }
 

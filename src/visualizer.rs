@@ -567,7 +567,12 @@ impl Bars {
         let area = Rect::from_min_max(pos2(rect.left(), base - h * 0.34), pos2(rect.right(), base));
         self.draw_bars(&p, area, accent, true, 14.0 * s);
         self.vignette(&p);
-        song_name(&p, rect.center().x, l.name_top, rect.width() * 0.8, &name, l.scale);
+        // The details: just above the seek bar in a small window; with more room,
+        // partway up towards the bars (so they don't sit far down on their own)
+        let gap = 16.0 * l.scale;
+        let spare = (l.name_top - (base + gap)).max(0.0);
+        let top = l.name_top - spare * 0.55;
+        song_name(&p, rect.center().x, top.round(), rect.width() * 0.8, &name, l.scale);
     }
 
     /// Where the cover goes on the album-art screen (None: the window is too small

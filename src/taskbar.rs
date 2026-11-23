@@ -489,19 +489,21 @@ unsafe fn find_player_window() -> isize {
     s.found
 }
 
-/// A file handed over by a second launch of the player ("" = just come to front)
-static FORWARDED: Mutex<Option<String>> = Mutex::new(None);
+/// Files handed over by later launches of the player ("" = just come to front).
+/// A list: Explorer's "Open" on several files starts the player once per file,
+/// so several can arrive between two frames.
+static FORWARDED: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
-pub fn take_forwarded() -> Option<String> {
-    FORWARDED.lock().ok().and_then(|mut f| f.take())
+pub fn take_forwarded() -> Vec<String> {
+    FORWARDED.lock().map(|mut f| std::mem::take(&mut *f)).unwrap_or_default()
 }
 
 /// Called at startup, before any window exists. If the player is already running,
-/// hand it `file` (it opens it in place of what's playing), bring it to the front and
+/// hand it `files` (it opens them in place of what's playing), bring it to the front and
 /// return true: this process should then just exit.
 /// With `forward` false (multiple windows allowed) it never hands over, but still
 /// marks this player as running for later launches.
-pub fn forward_to_running_instance(file: Option<&str>, forward: bool) -> bool {
+pub fn forward_to_running_instance(files: &[String], forward: bool) -> bool {
     unsafe {
         // The mutex lives as long as this process; a second process finds it taken
         let mutex = CreateMutexW(std::ptr::null(), 0, wide("Local\\RustMediaPlayer.SingleWindow").as_ptr());
@@ -520,14 +522,18 @@ pub fn forward_to_running_instance(file: Option<&str>, forward: bool) -> bool {
         if hwnd == 0 {
             return false; // couldn't find it: just run as a second player
         }
-        let payload: Vec<u16> = file.unwrap_or("").encode_utf16().collect();
-        let cds = CopyDataStruct {
-            data: COPYDATA_MAGIC,
-            len: (payload.len() * 2) as u32,
-            ptr: payload.as_ptr() as *const c_void,
-        };
-        let mut result = 0usize;
-        SendMessageTimeoutW(hwnd, WM_COPYDATA, 0, &cds as *const _ as isize, 0x2 /* SMTO_ABORTIFHUNG */, 3000, &mut result);
+        // (each file in turn; none: just "come to the front")
+        let none = [String::new()];
+        for file in if files.is_empty() { &none[..] } else { files } {
+            let payload: Vec<u16> = file.encode_utf16().collect();
+            let cds = CopyDataStruct {
+                data: COPYDATA_MAGIC,
+                len: (payload.len() * 2) as u32,
+                ptr: payload.as_ptr() as *const c_void,
+            };
+            let mut result = 0usize;
+            SendMessageTimeoutW(hwnd, WM_COPYDATA, 0, &cds as *const _ as isize, 0x2 /* SMTO_ABORTIFHUNG */, 3000, &mut result);
+        }
         if IsIconic(hwnd) != 0 {
             ShowWindow(hwnd, 9); // SW_RESTORE
         }
@@ -1226,8 +1232,8 @@ unsafe extern "system" fn subclass_proc(
             } else {
                 String::new()
             };
-            if let Ok(mut slot) = FORWARDED.lock() {
-                *slot = Some(path);
+            if let Ok(mut list) = FORWARDED.lock() {
+                list.push(path);
             }
             wake(hwnd);
             return 1;
