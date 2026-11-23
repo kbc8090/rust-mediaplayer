@@ -1374,8 +1374,8 @@ fn drop_icon(p: &egui::Painter, c: Pos2, size: f32, icon: DropIcon, colour: &dyn
 }
 
 /// While files are dragged over the window: between the title bar and the
-/// controls, the video blurs behind a glowing frame (teal → accent → violet,
-/// like the start screen's ribbon; grey for something it can't play), with an
+/// controls, the video blurs inside an accent-coloured frame (grey for
+/// something it can't play), with an
 /// icon for the kind of file, its format in big letters, and what dropping it
 /// will do
 pub(crate) fn draw_drop_overlay(app: &FluentMediaPlayer, ctx: &egui::Context) {
@@ -1394,37 +1394,22 @@ pub(crate) fn draw_drop_overlay(app: &FluentMediaPlayer, ctx: &egui::Context) {
     let p = ctx.layer_painter(egui::LayerId::new(egui::Order::Tooltip, egui::Id::new("drop_overlay")));
     let acc = crate::splash::rgb(app.accent);
     let grey = |_: f32| Color32::from_rgb(128, 128, 136);
+    // (the start screen's teal → accent → violet, but mostly the accent: a
+    // gentle shift across the letters rather than the full ribbon)
     let ribbon = |f: f32| {
-        let [r, g, b] = crate::splash::ribbon_colour(acc, f);
+        let [r, g, b] = crate::splash::mix(acc, crate::splash::ribbon_colour(acc, f), 0.4);
         Color32::from_rgb((r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8)
     };
     let colour: &dyn Fn(f32) -> Color32 = if d.playable { &ribbon } else { &grey };
 
-    // The blur (the frosted glass the menus use; a dark veil without it)
-    crate::glass::fill(&p, area, 0.0, Color32::from_black_alpha(170), 1.0);
-
-    // The frame: a rounded outline 10 px in, glowing inwards
+    // Inside a rounded frame 10 px in from the window's edges: the video blurred
+    // (the frosted glass the menus use; a dark veil without it), outlined in
+    // the accent colour (grey for something it can't play)
     let fr = area.shrink(10.0);
     let r = 16.0;
-    let mut pts = Vec::new();
-    for (cx, cy, a0) in [(fr.right() - r, fr.top() + r, -90.0_f32), (fr.right() - r, fr.bottom() - r, 0.0), (fr.left() + r, fr.bottom() - r, 90.0), (fr.left() + r, fr.top() + r, 180.0)] {
-        for i in 0..=8 {
-            let a = (a0 + i as f32 * 11.25).to_radians();
-            pts.push(pos2(cx + r * a.cos(), cy + r * a.sin()));
-        }
-    }
-    pts.push(pts[0]);
-    let x_frac = |q: &Pos2| ((q.x - fr.left()) / fr.width()).clamp(0.0, 1.0);
-    let light = |q: &Pos2, k: f32| {
-        let c = colour(x_frac(q));
-        crate::splash::light([c.r() as f32 / 255.0, c.g() as f32 / 255.0, c.b() as f32 / 255.0], k)
-    };
-    let glow: Vec<Color32> = pts.iter().map(|q| light(q, 0.22)).collect();
-    let line: Vec<Color32> = pts.iter().map(|q| light(q, 1.0)).collect();
-    let mut m = egui::Mesh::default();
-    crate::splash::strip(&mut m, &pts, 16.0, &glow);
-    crate::splash::strip(&mut m, &pts, 1.8, &line);
-    p.add(egui::Shape::mesh(m));
+    crate::glass::fill(&p, fr, r, Color32::from_black_alpha(170), 1.0);
+    let edge = if d.playable { app.accent } else { Color32::from_rgb(128, 128, 136) };
+    p.rect_stroke(fr.shrink(1.0), r - 1.0, Stroke::new(2.0_f32, edge));
 
     // The icon, the format, the details and what dropping does: centred
     let s = (area.height() / 560.0).clamp(0.55, 1.4);
