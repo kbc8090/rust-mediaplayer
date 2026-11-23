@@ -552,14 +552,15 @@ impl Bars {
     pub(crate) fn draw_visualizer(&mut self, p: &egui::Painter, rect: Rect, name: SongName, accent: Color32) {
         let p = p.with_clip_rect(rect);
         let h = rect.height();
-        let base = rect.top() + h * 0.58;
+        let l = CoverLayout::new(rect, name.lines());
+        // (the bars stand above the song's details, also in a small window)
+        let base = (rect.top() + h * 0.58).min(l.name_top - 16.0 * l.scale).round();
         self.backdrop(&p, rect, accent, base);
         let s = (h / 720.0).clamp(0.45, 2.0);
         // (edge to edge)
         let area = Rect::from_min_max(pos2(rect.left(), base - h * 0.34), pos2(rect.right(), base));
         self.draw_bars(&p, area, accent, true, 14.0 * s);
         self.vignette(&p);
-        let l = CoverLayout::new(rect, name.lines());
         song_name(&p, rect.center().x, l.name_top, rect.width() * 0.8, &name, l.scale);
     }
 
@@ -639,11 +640,19 @@ pub(crate) struct SongName<'a> {
     pub(crate) album: &'a str,
     /// "3 of 12" in a playlist
     pub(crate) playlist: Option<&'a str>,
+    /// "FLAC — 16-bit · 44.1 kHz · 1,012 kb/s"
+    pub(crate) format: Option<&'a str>,
 }
 
 impl SongName<'_> {
     fn rows(&self) -> Vec<(&'static str, &str)> {
-        [("Song", self.song), ("Artist", self.artist), ("Album", self.album), ("Playlist", self.playlist.unwrap_or(""))]
+        [
+            ("Song", self.song),
+            ("Artist", self.artist),
+            ("Album", self.album),
+            ("Playlist", self.playlist.unwrap_or("")),
+            ("Format", self.format.unwrap_or("")),
+        ]
             .into_iter()
             .map(|(k, v)| (k, v.trim()))
             .filter(|(_, v)| !v.is_empty())
@@ -738,43 +747,102 @@ fn soft_rect(m: &mut Mesh, inner: Rect, l: f32, r: f32, t: f32, b: f32, col: Col
     }
 }
 
-/// A song's title and artist tags and its length, for the playlist panel (None
-/// for what isn't there or can't be read)
-pub(crate) fn song_info(path: &str) -> (Option<String>, Option<String>, Option<f64>) {
+/// What a song's file says about itself (None for what isn't there or can't be
+/// read): its tags, length, and format details
+#[derive(Clone, Default, Debug)]
+pub(crate) struct SongInfo {
+    pub(crate) title: Option<String>,
+    pub(crate) artist: Option<String>,
+    pub(crate) secs: Option<f64>,
+    pub(crate) rate: Option<u32>,
+    pub(crate) bits: Option<u32>,
+    /// Average bitrate (kb/s): the sound's share of the file over its length
+    pub(crate) kbps: Option<u32>,
+}
+
+pub(crate) fn song_info(path: &str) -> SongInfo {
     use symphonia::core::codecs::CodecParameters;
     use symphonia::core::formats::probe::Hint;
     use symphonia::core::formats::{FormatOptions, TrackType};
     use symphonia::core::io::MediaSourceStream;
     use symphonia::core::meta::{MetadataOptions, StandardTag};
 
-    let Ok(file) = std::fs::File::open(path) else { return (None, None, None) };
+    let mut info = SongInfo::default();
+    let Ok(file) = std::fs::File::open(path) else { return info };
+    let size = file.metadata().map(|m| m.len()).unwrap_or(0);
     let mss = MediaSourceStream::new(Box::new(file), Default::default());
     let mut hint = Hint::new();
     if let Some(ext) = std::path::Path::new(path).extension().and_then(|e| e.to_str()) {
         hint.with_extension(ext);
     }
     let Ok(mut format) = symphonia::default::get_probe().probe(&hint, mss, FormatOptions::default(), MetadataOptions::default()) else {
-        return (None, None, None);
+        return info;
     };
-    let secs = format.default_track(TrackType::Audio).and_then(|t| {
-        let rate = match &t.codec_params {
-            Some(CodecParameters::Audio(a)) => a.sample_rate?,
-            _ => return None,
-        };
-        let n = t.num_frames?;
-        Some(n as f64 / rate as f64).filter(|s| *s > 0.0)
-    });
-    let (mut title, mut artist) = (None, None);
+    if let Some(t) = format.default_track(TrackType::Audio) {
+        if let Some(CodecParameters::Audio(a)) = &t.codec_params {
+            info.rate = a.sample_rate;
+            info.bits = a.bits_per_sample.or(a.bits_per_coded_sample);
+            if let (Some(n), Some(rate)) = (t.num_frames, a.sample_rate) {
+                info.secs = Some(n as f64 / rate as f64).filter(|s| *s > 0.0);
+            }
+        }
+    }
+    let mut pictures = 0u64;
     let mut meta = format.metadata();
     if let Some(rev) = meta.skip_to_latest() {
         let tags = rev.media.tags.iter().chain(rev.per_track.iter().flat_map(|t| t.metadata.tags.iter()));
         for tag in tags {
             match &tag.std {
-                Some(StandardTag::TrackTitle(t)) if title.is_none() => title = Some(t.trim().to_owned()),
-                Some(StandardTag::Artist(a)) if artist.is_none() => artist = Some(a.trim().to_owned()),
+                Some(StandardTag::TrackTitle(t)) if info.title.is_none() => info.title = Some(t.trim().to_owned()).filter(|t| !t.is_empty()),
+                Some(StandardTag::Artist(a)) if info.artist.is_none() => info.artist = Some(a.trim().to_owned()).filter(|a| !a.is_empty()),
                 _ => {}
             }
         }
+        pictures = rev.media.visuals.iter().map(|v| v.data.len() as u64).sum();
     }
-    (title.filter(|t| !t.is_empty()), artist.filter(|a| !a.is_empty()), secs)
+    // (the file's size without its cover pictures, over its length)
+    if let Some(secs) = info.secs {
+        let bytes = size.saturating_sub(pictures);
+        info.kbps = Some((bytes as f64 * 8.0 / secs / 1000.0).round() as u32).filter(|k| *k > 0);
+    }
+    info
+}
+
+/// The FORMAT line: "FLAC — 16-bit · 44.1 kHz · 1,012 kb/s", "MP3 — 44.1 kHz ·
+/// 320 kb/s". `codec`: mpv's name for the sound's codec; `rate`: mpv's sample
+/// rate, used when the file's own details aren't known.
+pub(crate) fn format_line(path: &str, codec: &str, rate: Option<u32>, info: Option<&SongInfo>) -> Option<String> {
+    let ext = std::path::Path::new(path).extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
+    let (name, lossless) = match codec {
+        "flac" => ("FLAC", true),
+        "alac" => ("ALAC", true),
+        "mp3" | "mp3float" => ("MP3", false),
+        "aac" => ("AAC", false),
+        "opus" => ("Opus", false),
+        "vorbis" => ("Vorbis", false),
+        "ape" => ("APE", true),
+        "wavpack" => ("WavPack", true),
+        "wmav1" | "wmav2" | "wmapro" => ("WMA", false),
+        "wmalossless" => ("WMA Lossless", true),
+        "ac3" | "eac3" => ("Dolby Digital", false),
+        "dts" => ("DTS", false),
+        c if c.starts_with("pcm") => (if ext == "aif" || ext == "aiff" { "AIFF" } else { "WAV" }, true),
+        _ if !ext.is_empty() => return Some(ext.to_uppercase()),
+        _ => return None,
+    };
+    let mut parts = Vec::new();
+    if lossless {
+        if let Some(b) = info.and_then(|i| i.bits).filter(|b| *b > 0) {
+            parts.push(format!("{b}-bit"));
+        }
+    }
+    if let Some(r) = info.and_then(|i| i.rate).or(rate).filter(|r| *r > 0) {
+        let khz = r as f64 / 1000.0;
+        parts.push(if (khz - khz.round()).abs() < 0.05 { format!("{} kHz", khz.round()) } else { format!("{khz:.1} kHz") });
+    }
+    if let Some(k) = info.and_then(|i| i.kbps) {
+        let k = if k >= 1000 { format!("{},{:03}", k / 1000, k % 1000) } else { k.to_string() };
+        parts.push(format!("{k} kb/s"));
+    }
+    Some(if parts.is_empty() { name.to_owned() } else { format!("{name} \u{2014} {}", parts.join(" \u{b7} ")) })
 }

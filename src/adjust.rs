@@ -1835,6 +1835,45 @@ fn clock(secs: f64) -> String {
     }
 }
 
+/// The playing row's progress: a lighter fill up to `frac`, ending in a bright
+/// thin "spark" line with a soft glow behind it
+fn progress_fill(p: &egui::Painter, r: Rect, frac: f32, accent: Color32) {
+    let frac = frac.clamp(0.0, 1.0);
+    if frac <= 0.0 {
+        return;
+    }
+    let x = r.left() + r.width() * frac;
+    let fill = Rect::from_min_max(r.min, pos2(x, r.bottom()));
+    let round = egui::Rounding { nw: 5.0, sw: 5.0, ne: if frac > 0.99 { 5.0 } else { 0.0 }, se: if frac > 0.99 { 5.0 } else { 0.0 } };
+    p.rect_filled(fill, round, accent.gamma_multiply(0.26));
+    if frac > 0.99 {
+        return;
+    }
+    // Glow: fading in towards the edge (additive light: alpha 0)
+    let glow_w = (18.0_f32).min(x - r.left());
+    let light = |k: f32| {
+        let [r0, g0, b0, _] = accent.to_array();
+        Color32::from_rgba_premultiplied((r0 as f32 * k) as u8, (g0 as f32 * k) as u8, (b0 as f32 * k) as u8, 0)
+    };
+    let mut m = egui::Mesh::default();
+    let g = Rect::from_min_max(pos2(x - glow_w, r.top() + 1.0), pos2(x, r.bottom() - 1.0));
+    m.colored_vertex(g.left_top(), Color32::TRANSPARENT);
+    m.colored_vertex(g.right_top(), light(0.45));
+    m.colored_vertex(g.right_bottom(), light(0.45));
+    m.colored_vertex(g.left_bottom(), Color32::TRANSPARENT);
+    m.add_triangle(0, 1, 2);
+    m.add_triangle(0, 2, 3);
+    p.add(egui::Shape::mesh(m));
+    // The spark: a bright 2 px line, softer at its ends
+    let spark = Color32::from_rgb(
+        (accent.r() as u16 * 2 / 5 + 153) as u8,
+        (accent.g() as u16 * 2 / 5 + 153) as u8,
+        (accent.b() as u16 * 2 / 5 + 153) as u8,
+    );
+    p.rect_filled(Rect::from_min_max(pos2(x - 2.0, r.top() + 3.0), pos2(x, r.bottom() - 3.0)), 1.0, spark);
+    p.rect_filled(Rect::from_min_max(pos2(x - 2.0, r.top() + 1.0), pos2(x, r.bottom() - 1.0)), 1.0, spark.gamma_multiply(0.35));
+}
+
 /// The little three-bar "playing" mark (heights 0…1)
 fn playing_mark(p: &egui::Painter, right: f32, bottom: f32, levels: [f32; 3], col: Color32) {
     for (i, v) in levels.iter().enumerate() {
@@ -1845,7 +1884,8 @@ fn playing_mark(p: &egui::Painter, right: f32, bottom: f32, levels: [f32; 3], co
 }
 
 /// The playlist panel on the right: every entry (click one to play it), and its
-/// two options. `playing`: heights for the playing entry's three-bar mark.
+/// two options. `playing`: heights for the playing entry's three-bar mark;
+/// `progress`: how far into it (0…1), shown as a fill along its row.
 #[allow(clippy::too_many_arguments)]
 pub fn draw_playlist(
     ctx: &egui::Context,
@@ -1853,6 +1893,7 @@ pub fn draw_playlist(
     rows: &[PlaylistRow],
     current: usize,
     playing: [f32; 3],
+    progress: f32,
     replay: &mut bool,
     summary: &mut bool,
     accent: Color32,
@@ -1903,6 +1944,7 @@ pub fn draw_playlist(
                     let cur = i == current;
                     if cur {
                         p.rect_filled(r, 5.0, accent.gamma_multiply(0.22));
+                        progress_fill(p, r, progress, accent);
                     } else if let Some(c) = state_fill(&resp) {
                         p.rect_filled(r, 5.0, c);
                     }

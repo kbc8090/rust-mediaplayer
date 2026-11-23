@@ -437,6 +437,11 @@ struct FluentMediaPlayer {
     song_title: String,
     song_artist: String,
     song_album: String,
+    song_codec: String,
+    song_rate: i64,
+    /// The playing song's own details (bit depth, average bitrate...), read on
+    /// another thread when it starts: (its path, the details)
+    song_info: Arc<Mutex<Option<(String, visualizer::SongInfo)>>>,
     /// The cover's width / height
     cover_aspect: f32,
     /// The music visualizer: the second decoder, the bars, and when they last moved
@@ -719,6 +724,9 @@ impl FluentMediaPlayer {
             song_title: String::new(),
             song_artist: String::new(),
             song_album: String::new(),
+            song_codec: String::new(),
+            song_rate: 0,
+            song_info: Arc::new(Mutex::new(None)),
             cover_aspect: 1.0,
             scope: visualizer::Scope::new(),
             bars: visualizer::Bars::new(),
@@ -797,13 +805,7 @@ impl FluentMediaPlayer {
             self.open_url(path);
         } else if is_playlist_file(path) {
             let entries = read_playlist(Path::new(path));
-            let Some(first) = entries.first().map(|e| e.path.to_string_lossy().into_owned()) else { return };
-            self.playlist = Some(PathBuf::from(path));
-            self.start_playlist_rows(&entries);
-            self.folder_files = entries.into_iter().map(|e| e.path).collect();
-            self.folder_index = Some(0);
-            self.load_entry(&first);
-            self.scan_gen += 1; // a folder scan still running is no longer wanted
+            self.start_playlist(PathBuf::from(path), entries);
         } else {
             self.playlist = None;
             self.playlist_rows.clear();
@@ -816,6 +818,17 @@ impl FluentMediaPlayer {
             self.start_folder_scan(path);
             self.load_entry(path);
         }
+    }
+
+    /// Play a playlist (an .m3u's entries, or files dropped together) from its start
+    fn start_playlist(&mut self, name: PathBuf, entries: Vec<PlaylistEntry>) {
+        let Some(first) = entries.first().map(|e| e.path.to_string_lossy().into_owned()) else { return };
+        self.playlist = Some(name);
+        self.start_playlist_rows(&entries);
+        self.folder_files = entries.into_iter().map(|e| e.path).collect();
+        self.folder_index = Some(0);
+        self.load_entry(&first);
+        self.scan_gen += 1; // a folder scan still running is no longer wanted
     }
 
     /// The playlist panel's rows: what the playlist itself says (or the file
@@ -844,7 +857,7 @@ impl FluentMediaPlayer {
                 if is_url(p) {
                     continue;
                 }
-                let (title, _artist, secs) = visualizer::song_info(p);
+                let visualizer::SongInfo { title, secs, .. } = visualizer::song_info(p);
                 if title.is_some() || secs.is_some() {
                     if let Ok(mut f) = found.lock() {
                         f.push((gen, i, title, secs));
@@ -928,6 +941,16 @@ impl FluentMediaPlayer {
         self.link_thumbs = None;
         self.live = false;
         self.video_kind = VideoKind::Unknown;
+        if media_kind(path) == Some(MediaKind::Music) && !is_url(path) {
+            let (slot, p, ctx) = (self.song_info.clone(), path.to_owned(), self.egui_ctx.clone());
+            let _ = std::thread::Builder::new().name("song info".into()).spawn(move || {
+                let info = visualizer::song_info(&p);
+                if let Ok(mut s) = slot.lock() {
+                    *s = Some((p, info));
+                }
+                ctx.request_repaint();
+            });
+        }
         // (the bars carry on from the last song and settle by themselves: no
         // jump to nothing between songs)
         self.bars.soften();
@@ -1267,7 +1290,12 @@ impl FluentMediaPlayer {
             }
         }
         let (mut replay, mut summary) = (self.playlist_replay, self.playlist_summary);
-        let mut action = adjust::draw_playlist(ctx, &mut self.adjust_ui, &self.playlist_rows, current, mark, &mut replay, &mut summary, self.accent);
+        let progress = if self.duration > 0.0 { (self.time_pos / self.duration) as f32 } else { 0.0 };
+        if playing && self.adjust_ui.playlist_open {
+            // (the playing row's progress fill moves on)
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        }
+        let mut action = adjust::draw_playlist(ctx, &mut self.adjust_ui, &self.playlist_rows, current, mark, progress, &mut replay, &mut summary, self.accent);
         if summary && !self.adjust_ui.playlist_open {
             let noun = self.playlist_noun();
             let a = adjust::draw_playlist_summary(ctx, &mut self.adjust_ui, &self.playlist_rows, current, replay, noun, self.accent);
@@ -1341,7 +1369,15 @@ impl FluentMediaPlayer {
         // The song's name: its title tag (else the file name), then "artist · album"
         let title = if self.song_title.is_empty() { self.file_name() } else { self.song_title.clone() };
         let position = self.playlist_position();
-        let name = visualizer::SongName { song: &title, artist: &self.song_artist, album: &self.song_album, playlist: position.as_deref() };
+        let info = self.song_info.lock().ok().and_then(|s| s.as_ref().filter(|(p, _)| *p == self.current_file).map(|(_, i)| i.clone()));
+        let format = visualizer::format_line(&self.current_file, &self.song_codec, u32::try_from(self.song_rate).ok(), info.as_ref());
+        let name = visualizer::SongName {
+            song: &title,
+            artist: &self.song_artist,
+            album: &self.song_album,
+            playlist: position.as_deref(),
+            format: format.as_deref(),
+        };
         let p = ui.painter();
 
         // Album art: the cover with the song's name; nothing moves, so nothing
@@ -1682,6 +1718,10 @@ impl eframe::App for FluentMediaPlayer {
                         mine.clone_from(theirs);
                     }
                 }
+                if self.song_codec != snap.audio_codec {
+                    self.song_codec.clone_from(&snap.audio_codec);
+                }
+                self.song_rate = snap.audio_rate;
                 if snap.dwidth > 0 && snap.dheight > 0 {
                     self.cover_aspect = snap.dwidth as f32 / snap.dheight as f32;
                 }
@@ -2091,8 +2131,17 @@ impl eframe::App for FluentMediaPlayer {
         }
 
         // ── Actions ───────────────────────────────────────────────────────────
-        for s in &inp.dropped {
-            if is_media_file(s) || is_playlist_file(s) { self.open_file(s); }
+        // Several files dropped at once: a playlist of them, in Explorer's name order
+        let media: Vec<&String> = inp.dropped.iter().filter(|s| is_media_file(s)).collect();
+        if media.len() > 1 {
+            let mut files: Vec<PathBuf> = media.iter().map(PathBuf::from).collect();
+            files.sort_by(|a, b| natural_cmp(&a.file_name().unwrap_or_default().to_string_lossy(), &b.file_name().unwrap_or_default().to_string_lossy()));
+            let entries: Vec<PlaylistEntry> = files.into_iter().map(|path| PlaylistEntry { path, title: None, secs: None }).collect();
+            self.start_playlist(PathBuf::from("Dropped files"), entries);
+        } else {
+            for s in &inp.dropped {
+                if is_media_file(s) || is_playlist_file(s) { self.open_file(s); }
+            }
         }
         if inp.space { self.toggle_play_pause(); }
         if inp.right { self.step(5.0); }

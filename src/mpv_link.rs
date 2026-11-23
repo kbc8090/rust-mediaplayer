@@ -55,6 +55,9 @@ pub struct Snapshot {
     /// A song's artist and album tags ("" if it has none)
     pub artist: String,
     pub album: String,
+    /// The sound's codec ("flac", "mp3"...) and sample rate, for the FORMAT line
+    pub audio_codec: String,
+    pub audio_rate: i64,
 }
 
 /// What is in the current file's picture
@@ -269,6 +272,8 @@ fn run(mpv: Arc<Mutex<Mpv>>, rx: mpsc::Receiver<Job>, state: Arc<Mutex<Snapshot>
             },
             artist: m.get_property::<String>("metadata/by-key/artist").unwrap_or_default(),
             album: m.get_property::<String>("metadata/by-key/album").unwrap_or_default(),
+            audio_codec: m.get_property::<String>("audio-codec-name").unwrap_or_default(),
+            audio_rate: m.get_property::<i64>("audio-params/samplerate").unwrap_or(0),
         };
         let key = (
             m.get_property::<String>("path").unwrap_or_default(),
