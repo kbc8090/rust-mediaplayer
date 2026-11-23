@@ -241,6 +241,29 @@ pub(crate) fn icon_repeat(p: &egui::Painter, c: Pos2, col: Color32) {
     kpoly(p, c, &[(-3.5, 2.5), (-6.0, 5.0), (-3.5, 7.5)], col, SW);
 }
 
+/// Playlist: three lines and a small play arrow; `replay`: a small loop arrow in
+/// that colour at the corner (the playlist starts again when it ends)
+pub(crate) fn icon_playlist(p: &egui::Painter, c: Pos2, col: Color32, replay: Option<Color32>) {
+    kpoly(p, c, &[(-8.0, -5.5), (4.0, -5.5)], col, SW);
+    kpoly(p, c, &[(-8.0, -0.5), (4.0, -0.5)], col, SW);
+    kpoly(p, c, &[(-8.0, 4.5), (-1.0, 4.5)], col, SW);
+    let tri = [(2.5, 1.5), (2.5, 8.0), (8.0, 4.75)].map(|(x, y)| pos2(c.x + x * K, c.y + y * K));
+    p.add(egui::Shape::convex_polygon(tri.to_vec(), col, Stroke::NONE));
+    if let Some(rc) = replay {
+        // a small circle arrow at the top right
+        let o = pos2(c.x + 8.5 * K, c.y - 6.5 * K);
+        let r = 3.2 * K;
+        let pts: Vec<Pos2> = (0..=10).map(|i| {
+            let a = -0.6 + 4.6 * i as f32 / 10.0;
+            pos2(o.x + r * a.cos(), o.y + r * a.sin())
+        }).collect();
+        p.add(egui::Shape::line(pts, Stroke::new(1.3_f32, rc)));
+        let a = -0.6 + 4.6;
+        let tip = |da: f32, dr: f32| pos2(o.x + (r + dr) * (a + da).cos(), o.y + (r + dr) * (a + da).sin());
+        p.add(egui::Shape::convex_polygon(vec![tip(0.55, 0.0), tip(-0.1, 1.9), tip(-0.1, -1.9)], rc, Stroke::NONE));
+    }
+}
+
 pub(crate) fn icon_captions(p: &egui::Painter, c: Pos2, col: Color32) {
     p.rect_stroke(Rect::from_center_size(c, vec2(18.0 * K, 13.0 * K)), 2.0, Stroke::new(SW, col));
     kpoly(p, c, &[(-5.0, -1.0), (-1.5, -1.0)], col, SW);
@@ -842,9 +865,28 @@ pub(crate) fn draw_bottom_bar(app: &mut FluentMediaPlayer, ctx: &egui::Context, 
                 icon_mirror(&p, c, tint(app.mirror));
             }
 
+            // Repeat; while a playlist plays (which always plays on), the Playlist
+            // button instead: click for the list, right-click to replay it at the end
             let c = pos2(lay.repeat, row_y);
-            if hit(ui, c, "repeat", "Repeat this video", t).activated() { app.toggle_repeat(); }
-            icon_repeat(&p, c, tint(app.repeat));
+            if app.playlist.is_some() {
+                let n = app.folder_files.len();
+                let noun = app.playlist_noun();
+                let tip = format!(
+                    "Playlist: {n} {noun} (L)\nRight-click: replay it when it ends ({})",
+                    if app.playlist_replay { "on" } else { "off" }
+                );
+                let r = hit(ui, c, "repeat", &tip, t);
+                if r.activated() {
+                    app.toggle_playlist_panel();
+                }
+                if r.secondary_clicked() {
+                    app.playlist_replay = !app.playlist_replay;
+                }
+                icon_playlist(&p, c, tint(app.adjust_ui.playlist_open), app.playlist_replay.then_some(accent));
+            } else {
+                if hit(ui, c, "repeat", "Repeat this video or song", t).activated() { app.toggle_repeat(); }
+                icon_repeat(&p, c, tint(app.repeat));
+            }
 
             let c = pos2(lay.captions, row_y);
             if hit(ui, c, "captions", "Cycle subtitles", t).activated() { app.cycle_captions(); }

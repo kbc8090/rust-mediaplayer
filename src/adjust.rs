@@ -375,6 +375,12 @@ pub struct AdjustUi {
     pub lang_rect: Rect,
     /// Scroll the language list to the chosen language (set when it opens)
     pub lang_scroll: bool,
+    /// The playlist panel (right side) and the "Up next" card (bottom right)
+    pub playlist_open: bool,
+    pub playlist_rect: Rect,
+    pub summary_rect: Rect,
+    /// Scroll the playlist to the playing entry (set when it opens)
+    pub playlist_scroll: bool,
 }
 
 impl AdjustUi {
@@ -394,6 +400,10 @@ impl AdjustUi {
             lang_open: false,
             lang_rect: Rect::NOTHING,
             lang_scroll: false,
+            playlist_open: false,
+            playlist_rect: Rect::NOTHING,
+            summary_rect: Rect::NOTHING,
+            playlist_scroll: false,
         }
     }
 
@@ -401,6 +411,8 @@ impl AdjustUi {
         (self.open && self.panel_rect.contains(p))
             || (self.eq_open && self.eq_rect.contains(p))
             || (self.online_open && (self.online_rect.contains(p) || (self.lang_open && self.lang_rect.contains(p))))
+            || (self.playlist_open && self.playlist_rect.contains(p))
+            || self.summary_rect.contains(p)
     }
 }
 
@@ -1794,5 +1806,232 @@ pub fn draw_clip_panel(ctx: &egui::Context, c: &mut crate::online::ClipUi, durat
         }
     });
     ctx.move_to_top(egui::LayerId::new(egui::Order::Foreground, id));
+    action
+}
+
+// ── Playlist ──────────────────────────────────────────────────────────────────
+
+/// One entry of the playlist panel: its title (tag, else file name) and length
+pub struct PlaylistRow {
+    pub title: String,
+    pub secs: Option<f64>,
+}
+
+pub enum PlaylistAction {
+    None,
+    /// Play this entry (also the one playing: from the start)
+    Play(usize),
+    /// Open the playlist panel (from the "Up next" card)
+    Open,
+}
+
+/// "4:03", "1:02:03"
+fn clock(secs: f64) -> String {
+    let s = secs.max(0.0).round() as u64;
+    if s >= 3600 {
+        format!("{}:{:02}:{:02}", s / 3600, s / 60 % 60, s % 60)
+    } else {
+        format!("{}:{:02}", s / 60, s % 60)
+    }
+}
+
+/// The little three-bar "playing" mark (heights 0…1)
+fn playing_mark(p: &egui::Painter, right: f32, bottom: f32, levels: [f32; 3], col: Color32) {
+    for (i, v) in levels.iter().enumerate() {
+        let h = 3.0 + 9.0 * v.clamp(0.0, 1.0);
+        let x = right - (2 - i) as f32 * 5.0;
+        p.rect_filled(Rect::from_min_max(pos2(x - 3.0, bottom - h), pos2(x, bottom)), 0.0, col);
+    }
+}
+
+/// The playlist panel on the right: every entry (click one to play it), and its
+/// two options. `playing`: heights for the playing entry's three-bar mark.
+#[allow(clippy::too_many_arguments)]
+pub fn draw_playlist(
+    ctx: &egui::Context,
+    ui_state: &mut AdjustUi,
+    rows: &[PlaylistRow],
+    current: usize,
+    playing: [f32; 3],
+    replay: &mut bool,
+    summary: &mut bool,
+    accent: Color32,
+) -> PlaylistAction {
+    if !ui_state.playlist_open || rows.is_empty() {
+        ui_state.playlist_rect = Rect::NOTHING;
+        return PlaylistAction::None;
+    }
+    const ITEM_H: f32 = 28.0;
+    let screen = ctx.screen_rect();
+    let w = PANEL_W.min(screen.width() - 16.0);
+    let foot_h = 9.0 + ROW_H * 2.0 + 6.0;
+    let max_h = (screen.height() - PANEL_TOP - BOTTOM_GAP).max(HEAD_H + foot_h + ITEM_H * 2.0);
+    let list_h = (rows.len() as f32 * ITEM_H + 8.0).min(max_h - HEAD_H - foot_h);
+    let h = HEAD_H + list_h + foot_h;
+    let rect = Rect::from_min_size(pos2(screen.right() - 8.0 - w, screen.top() + PANEL_TOP), vec2(w, h));
+    ui_state.playlist_rect = rect;
+
+    let mut action = PlaylistAction::None;
+    let id = egui::Id::new("playlist_panel");
+    egui::Area::new(id).order(egui::Order::Foreground).fixed_pos(rect.min).show(ctx, |ui| {
+        ui.allocate_rect(rect, Sense::click_and_drag());
+        let p = ui.painter().clone();
+        panel_frame(&p, rect);
+        let (_, close) = header_with(ui, &p, rect, "Playlist", "playlist", false);
+        if close {
+            ui_state.playlist_open = false;
+        }
+        // "3 of 12 · 46:00" after the title (the total only once every length is known)
+        let title_w = p.layout_no_wrap("Playlist".to_owned(), semibold(14.5), TEXT).size().x;
+        let total: Option<f64> = rows.iter().map(|r| r.secs).sum();
+        let count = match total {
+            Some(t) => format!("{} of {} \u{b7} {}", current + 1, rows.len(), clock(t)),
+            None => format!("{} of {}", current + 1, rows.len()),
+        };
+        p.text(pos2(rect.left() + 16.0 + title_w + 9.0, rect.top() + HEAD_H / 2.0 + 0.5), Align2::LEFT_CENTER, count, FontId::proportional(11.5), DIM);
+
+        // The entries (scrolling when they don't fit)
+        let list = Rect::from_min_size(pos2(rect.left() + 6.0, rect.top() + HEAD_H + 4.0), vec2(w - 12.0, list_h - 8.0));
+        let scroll_to_current = std::mem::take(&mut ui_state.playlist_scroll);
+        ui.allocate_ui_at_rect(list, |ui| {
+            egui::ScrollArea::vertical().id_source("playlist_rows").max_height(list.height()).auto_shrink([false, false]).show(ui, |ui| {
+                ui.spacing_mut().item_spacing = vec2(0.0, 0.0);
+                for (i, row) in rows.iter().enumerate() {
+                    // (a little short of the right edge: room for the scroll bar)
+                    let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width() - 8.0, ITEM_H), Sense::click_and_drag());
+                    let p = ui.painter();
+                    let cur = i == current;
+                    if cur {
+                        p.rect_filled(r, 5.0, accent.gamma_multiply(0.22));
+                    } else if let Some(c) = state_fill(&resp) {
+                        p.rect_filled(r, 5.0, c);
+                    }
+                    if resp.hovered() {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                    }
+                    let (font, col) = if cur {
+                        (semibold(12.5), TEXT)
+                    } else if i < current {
+                        (FontId::proportional(12.5), Color32::from_rgb(140, 142, 150))
+                    } else {
+                        (FontId::proportional(12.5), Color32::from_rgb(222, 222, 226))
+                    };
+                    let num_r = r.left() + 26.0;
+                    if cur {
+                        playing_mark(p, num_r, r.center().y + 6.0, playing, accent);
+                    } else {
+                        p.text(pos2(num_r, r.center().y), Align2::RIGHT_CENTER, (i + 1).to_string(), FontId::proportional(11.0), Color32::from_rgb(125, 128, 138));
+                    }
+                    let len = row.secs.map(clock).unwrap_or_default();
+                    let len_w = if len.is_empty() { 0.0 } else { p.layout_no_wrap(len.clone(), FontId::proportional(11.5), DIM).size().x + 10.0 };
+                    if !len.is_empty() {
+                        p.text(pos2(r.right() - 10.0, r.center().y), Align2::RIGHT_CENTER, len, FontId::proportional(11.5), DIM);
+                    }
+                    let g = crate::controls::elide(p, &row.title, font, col, r.right() - 10.0 - len_w - (num_r + 10.0));
+                    p.galley(pos2(num_r + 10.0, r.center().y - g.size().y / 2.0), g, col);
+                    if activated(&resp) {
+                        action = PlaylistAction::Play(i);
+                    }
+                    if cur && scroll_to_current {
+                        ui.scroll_to_rect(r, Some(egui::Align::Center));
+                    }
+                }
+            });
+        });
+
+        // The options
+        let mut top = rect.top() + HEAD_H + list_h;
+        p.line_segment([pos2(rect.left() + 10.0, top + 4.5), pos2(rect.right() - 10.0, top + 4.5)], Stroke::new(1.0_f32, LINE));
+        top += 9.0;
+        for (label, key) in [("Replay when it ends", 0), ("Always show \u{201c}Up next\u{201d}", 1)] {
+            let r = Rect::from_min_size(pos2(rect.left() + 6.0, top), vec2(w - 12.0, ROW_H));
+            top += ROW_H;
+            let resp = ui.interact(r, ui.id().with(("playlist_switch", key)), Sense::click_and_drag());
+            if let Some(c) = state_fill(&resp) {
+                p.rect_filled(r, 4.0, c);
+            }
+            p.text(pos2(r.left() + 10.0, r.center().y), Align2::LEFT_CENTER, label, FontId::proportional(NAME_SIZE), TEXT);
+            let on = if key == 0 { *replay } else { *summary };
+            switch(&p, Rect::from_center_size(pos2(r.right() - 28.0, r.center().y), vec2(38.0, 19.0)), on, accent);
+            if activated(&resp) {
+                if key == 0 {
+                    *replay = !*replay;
+                } else {
+                    *summary = !*summary;
+                }
+            }
+        }
+    });
+    action
+}
+
+/// The "Up next" card, bottom right: the next three entries (click one to play
+/// it) and a link to the whole list
+/// `noun`: "songs", "videos" or "files", for its "All 12 songs…" link
+pub fn draw_playlist_summary(ctx: &egui::Context, ui_state: &mut AdjustUi, rows: &[PlaylistRow], current: usize, replay: bool, noun: &str, accent: Color32) -> PlaylistAction {
+    const ITEM_H: f32 = 25.0;
+    // The next three, going round to the start when it replays
+    let mut next: Vec<usize> = (current + 1..rows.len()).take(3).collect();
+    if replay {
+        let more = 3 - next.len();
+        next.extend((0..rows.len()).take(more.min(current + 1)));
+    }
+    let screen = ctx.screen_rect();
+    let w = 240.0_f32.min(screen.width() - 16.0);
+    let body = if next.is_empty() { ITEM_H } else { next.len() as f32 * ITEM_H };
+    let h = 34.0 + body + 28.0;
+    let rect = Rect::from_min_size(pos2(screen.right() - 12.0 - w, screen.bottom() - BOTTOM_GAP - h), vec2(w, h));
+    ui_state.summary_rect = rect;
+
+    let mut action = PlaylistAction::None;
+    egui::Area::new(egui::Id::new("playlist_summary")).order(egui::Order::Foreground).fixed_pos(rect.min).show(ctx, |ui| {
+        ui.allocate_rect(rect, Sense::click_and_drag());
+        let p = ui.painter().clone();
+        panel_frame(&p, rect);
+        p.text(pos2(rect.left() + 14.0, rect.top() + 18.0), Align2::LEFT_CENTER, "Up next", semibold(12.5), TEXT);
+        p.text(pos2(rect.right() - 14.0, rect.top() + 18.0), Align2::RIGHT_CENTER, format!("{} of {}", current + 1, rows.len()), FontId::proportional(11.5), DIM);
+        let mut top = rect.top() + 32.0;
+        if next.is_empty() {
+            let r = Rect::from_min_size(pos2(rect.left() + 6.0, top), vec2(w - 12.0, ITEM_H));
+            p.text(pos2(r.left() + 10.0, r.center().y), Align2::LEFT_CENTER, "That\u{2019}s the last one", FontId::proportional(12.5), DIM);
+            top += ITEM_H;
+        }
+        for i in next {
+            let r = Rect::from_min_size(pos2(rect.left() + 6.0, top), vec2(w - 12.0, ITEM_H));
+            top += ITEM_H;
+            let resp = ui.interact(r, ui.id().with(("summary_row", i)), Sense::click_and_drag());
+            if let Some(c) = state_fill(&resp) {
+                p.rect_filled(r, 5.0, c);
+            }
+            let num_r = r.left() + 22.0;
+            p.text(pos2(num_r, r.center().y), Align2::RIGHT_CENTER, (i + 1).to_string(), FontId::proportional(11.0), Color32::from_rgb(125, 128, 138));
+            let len = rows[i].secs.map(clock).unwrap_or_default();
+            let len_w = if len.is_empty() { 0.0 } else { p.layout_no_wrap(len.clone(), FontId::proportional(11.5), DIM).size().x + 10.0 };
+            if !len.is_empty() {
+                p.text(pos2(r.right() - 8.0, r.center().y), Align2::RIGHT_CENTER, len, FontId::proportional(11.5), DIM);
+            }
+            let col = Color32::from_rgb(222, 222, 226);
+            let g = crate::controls::elide(&p, &rows[i].title, FontId::proportional(12.5), col, r.right() - 8.0 - len_w - (num_r + 9.0));
+            p.galley(pos2(num_r + 9.0, r.center().y - g.size().y / 2.0), g, col);
+            if activated(&resp) {
+                action = PlaylistAction::Play(i);
+            }
+        }
+        // "All 12 songs…" opens the panel
+        let r = Rect::from_min_size(pos2(rect.left() + 6.0, top + 2.0), vec2(w - 12.0, 22.0));
+        let resp = ui.interact(r, ui.id().with("summary_all"), Sense::click_and_drag());
+        if let Some(c) = state_fill(&resp) {
+            p.rect_filled(r, 5.0, c);
+        }
+        let link = Color32::from_rgb(
+            accent.r() / 4 * 3 + 64,
+            accent.g() / 4 * 3 + 64,
+            accent.b() / 4 * 3 + 64,
+        );
+        p.text(pos2(r.left() + 8.0, r.center().y), Align2::LEFT_CENTER, format!("All {} {noun}\u{2026}", rows.len()), FontId::proportional(11.5), link);
+        if activated(&resp) {
+            action = PlaylistAction::Open;
+        }
+    });
     action
 }

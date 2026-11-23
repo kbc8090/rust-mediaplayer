@@ -129,26 +129,49 @@ pub(crate) fn is_playlist_file(path: &str) -> bool {
 
 /// The entries of an .m3u / .m3u8 playlist that exist (or are web addresses),
 /// in order. Relative paths are relative to the playlist's folder.
-pub(crate) fn read_playlist(path: &Path) -> Vec<PathBuf> {
+pub(crate) fn read_playlist(path: &Path) -> Vec<PlaylistEntry> {
     let Ok(bytes) = std::fs::read(path) else { return Vec::new() };
     let base = path.parent().map(Path::to_path_buf).unwrap_or_default();
-    playlist_text(&bytes)
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty() && !l.starts_with('#'))
-        .filter_map(|line| {
-            if line.contains("://") && !line.starts_with("file://") {
-                return Some(PathBuf::from(line)); // web address: mpv streams it
-            }
+    let mut out = Vec::new();
+    // "#EXTINF:243,Artist - Title" describes the entry on the next line
+    let mut info: (Option<f64>, Option<String>) = (None, None);
+    for line in playlist_text(&bytes).lines().map(str::trim).filter(|l| !l.is_empty()) {
+        if let Some(rest) = line.strip_prefix("#EXTINF:") {
+            let (secs, title) = rest.split_once(',').unwrap_or((rest, ""));
+            let secs = secs.split_whitespace().next().and_then(|s| s.parse::<f64>().ok()).filter(|s| *s > 0.0);
+            let title = title.trim();
+            info = (secs, (!title.is_empty()).then(|| title.to_owned()));
+            continue;
+        }
+        if line.starts_with('#') {
+            continue;
+        }
+        let (secs, title) = std::mem::take(&mut info);
+        let p = if line.contains("://") && !line.starts_with("file://") {
+            PathBuf::from(line) // web address: mpv streams it
+        } else {
             let line = match line.strip_prefix("file:///").or_else(|| line.strip_prefix("file://")) {
                 Some(rest) => percent_decode(rest),
                 None => line.to_owned(),
             };
             let p = PathBuf::from(line.replace('/', "\\"));
             let p = if p.is_absolute() { p } else { base.join(p) };
-            (p.is_file() && !is_playlist_file(&p.to_string_lossy())).then_some(p)
-        })
-        .collect()
+            if !p.is_file() || is_playlist_file(&p.to_string_lossy()) {
+                continue;
+            }
+            p
+        };
+        out.push(PlaylistEntry { path: p, title, secs });
+    }
+    out
+}
+
+/// An entry of a playlist, with what the playlist says about it
+pub(crate) struct PlaylistEntry {
+    pub(crate) path: PathBuf,
+    /// From "#EXTINF:" (often "Artist - Title")
+    pub(crate) title: Option<String>,
+    pub(crate) secs: Option<f64>,
 }
 
 /// .m3u8 (and modern .m3u) files are UTF-8; older .m3u files use the Windows

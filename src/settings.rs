@@ -62,6 +62,10 @@ pub(crate) struct Settings {
     pub(crate) glass: bool,
     /// A right-click on the video opens the main menu there (menu). On by default.
     pub(crate) right_click_menu: bool,
+    /// A playlist starts again when it ends, and shows its "Up next" card
+    /// (playlist panel). Both off by default.
+    pub(crate) playlist_replay: bool,
+    pub(crate) playlist_summary: bool,
     /// Online video panel (formats asked of yt-dlp)
     pub(crate) online: Online,
 }
@@ -134,6 +138,8 @@ pub(crate) fn settings_text(st: &Settings) -> String {
         format!("hq_upscaling={}", yn(st.hq)),
         format!("frosted_glass={}", yn(st.glass)),
         format!("right_click_menu={}", yn(st.right_click_menu)),
+        format!("playlist_replay={}", yn(st.playlist_replay)),
+        format!("playlist_up_next={}", yn(st.playlist_summary)),
     ]
     .into_iter()
     .chain(st.online.settings_lines())
@@ -169,6 +175,8 @@ pub(crate) fn parse_settings(text: &str) -> Settings {
         hq: false,
         glass: true,
         right_click_menu: true,
+        playlist_replay: false,
+        playlist_summary: false,
         online: Online::default(),
     };
     for line in text.lines() {
@@ -195,6 +203,8 @@ pub(crate) fn parse_settings(text: &str) -> Settings {
             "hq_upscaling" => st.hq = on,
             "frosted_glass" => st.glass = on,
             "right_click_menu" => st.right_click_menu = on,
+            "playlist_replay" => st.playlist_replay = on,
+            "playlist_up_next" => st.playlist_summary = on,
             _ => {
                 st.online.read_setting(key, value);
             }
@@ -243,6 +253,8 @@ pub(crate) fn parse_old_settings(text: &str) -> Settings {
         hq,
         glass,
         right_click_menu: true,
+        playlist_replay: false,
+        playlist_summary: false,
         online: Online::default(),
     }
 }

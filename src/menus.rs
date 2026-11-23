@@ -28,6 +28,7 @@ pub(crate) const SHORTCUTS: &[(&[&str], &str)] = &[
     (&["Z"], "Clip: zoom the seek bar in / out"),
     (&["Ctrl+V"], "Play a copied link"),
     (&["E"], "Picture & Sound"),
+    (&["L"], "Playlist (while one plays)"),
     (&["Tab"], "Video info"),
     (&["H"], "Next decoding method"),
     (&["Media keys"], "Play / pause, next, previous"),

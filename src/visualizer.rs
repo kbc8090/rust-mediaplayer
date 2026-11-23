@@ -29,6 +29,8 @@ const AHEAD: f64 = 0.4;
 const BEHIND: f64 = 0.3;
 /// How many dB below the loudest bar a bar reaches zero
 const RANGE_DB: f32 = 42.0;
+/// Rounding of the bars' top corners
+const BAR_RADIUS: f32 = 4.0;
 
 // ── The second decoder ────────────────────────────────────────────────────────
 
@@ -351,6 +353,11 @@ impl Bars {
         }
     }
 
+    /// The bars' heights (the playlist's little "playing" mark follows them)
+    pub(crate) fn levels(&self) -> &[f32; BARS] {
+        &self.level
+    }
+
     /// Forget the last song's bars (a new song starts from nothing)
     pub(crate) fn reset(&mut self) {
         self.level = [0.0; BARS];
@@ -516,13 +523,13 @@ impl Bars {
             let g = glow * (0.5 + 0.5 * self.level[i]);
             soft_rect(&mut m, bar, g, g, g * 1.3, 0.0, splash::light(c, 0.10 + 0.12 * self.level[i]));
 
-            // The bar: lighter at the top, with a rounded top
+            // The bar: lighter at the top, its top corners slightly rounded
             let top_col = splash::light(splash::mix(c, white, 0.25), 0.95);
             let bot_col = splash::light(c, 0.55);
-            let r = (bw / 2.0).min(bh / 2.0);
+            let r = BAR_RADIUS.min(bw / 2.0).min(bh / 2.0);
             let body = Rect::from_min_max(pos2(bar.left(), bar.top() + r), bar.max);
             quad_v(&mut m, body, top_col, bot_col);
-            cap(&mut m, pos2(bar.center().x, bar.top() + r), bw / 2.0, r, top_col);
+            rounded_top(&mut m, bar, r, top_col);
 
             // Mirror image fading out under the line
             if reflect {
@@ -544,8 +551,8 @@ impl Bars {
         p.add(egui::Shape::mesh(m));
     }
 
-    /// The visualizer filling `rect`
-    pub(crate) fn draw_visualizer(&mut self, p: &egui::Painter, rect: Rect, accent: Color32) {
+    /// The visualizer filling `rect`, with the song's name at the bottom middle
+    pub(crate) fn draw_visualizer(&mut self, p: &egui::Painter, rect: Rect, name: SongName, accent: Color32) {
         let p = p.with_clip_rect(rect);
         let h = rect.height();
         let base = rect.top() + h * 0.58;
@@ -555,12 +562,14 @@ impl Bars {
         let area = Rect::from_min_max(pos2(rect.left(), base - h * 0.34), pos2(rect.right(), base));
         self.draw_bars(&p, area, accent, true, 14.0 * s);
         self.vignette(&p);
+        let l = CoverLayout::new(rect, name.2.is_some());
+        song_name(&p, pos2(rect.center().x, l.title_y), rect.width() * 0.8, name, l.scale);
     }
 
     /// Where the cover goes on the album-art screen (None: the window is too small
     /// for it, show the visualizer instead). `aspect` = the cover's width / height.
-    pub(crate) fn cover_rect(rect: Rect, aspect: f32) -> Option<Rect> {
-        let l = CoverLayout::new(rect);
+    pub(crate) fn cover_rect(rect: Rect, aspect: f32, extra_line: bool) -> Option<Rect> {
+        let l = CoverLayout::new(rect, extra_line);
         let side = (l.cover_bottom - l.cover_top).min(rect.width() * 0.6);
         if side < 90.0 {
             return None;
@@ -583,20 +592,20 @@ impl Bars {
     }
 
     /// The album-art screen, around the cover: the song's name under it
-    pub(crate) fn draw_cover_front(&mut self, p: &egui::Painter, rect: Rect, (title, sub): (&str, &str)) {
+    pub(crate) fn draw_cover_front(&mut self, p: &egui::Painter, rect: Rect, name: SongName) {
         let p = p.with_clip_rect(rect);
-        let l = CoverLayout::new(rect);
-        song_name(&p, pos2(rect.center().x, l.title_y), rect.width() * 0.8, title, sub, l.scale);
+        let l = CoverLayout::new(rect, name.2.is_some());
+        song_name(&p, pos2(rect.center().x, l.title_y), rect.width() * 0.8, name, l.scale);
         self.vignette(&p);
     }
 
     /// No pictures and no bars: the backdrop with the song's name
-    pub(crate) fn draw_still(&mut self, p: &egui::Painter, rect: Rect, title: &str, sub: &str, accent: Color32) {
+    pub(crate) fn draw_still(&mut self, p: &egui::Painter, rect: Rect, name: SongName, accent: Color32) {
         let p = p.with_clip_rect(rect);
         let cy = rect.top() + rect.height() * 0.46;
         self.backdrop(&p, rect, accent, cy);
         let s = (rect.height() / 720.0).clamp(0.6, 1.6);
-        song_name(&p, pos2(rect.center().x, cy - 12.0 * s), rect.width() * 0.8, title, sub, s);
+        song_name(&p, pos2(rect.center().x, cy - 12.0 * s), rect.width() * 0.8, name, s);
         self.vignette(&p);
     }
 }
@@ -611,27 +620,40 @@ struct CoverLayout {
 }
 
 impl CoverLayout {
-    fn new(rect: Rect) -> Self {
+    /// `extra_line`: a third line under the name ("3 of 12" in a playlist)
+    fn new(rect: Rect, extra_line: bool) -> Self {
         let scale = (rect.height() / 720.0).clamp(0.6, 1.6);
-        let title_y = rect.bottom() - 120.0 - SUB_GAP * scale;
+        let extra = if extra_line { EXTRA_GAP * scale } else { 0.0 };
+        let title_y = rect.bottom() - 120.0 - SUB_GAP * scale - extra;
         Self { scale, cover_top: rect.top() + 56.0, cover_bottom: title_y - 34.0 * scale, title_y }
     }
 }
 
-/// Distance from the title's middle to the "artist · album" line's middle
+/// Distance from the title's middle to the "artist · album" line's middle, and
+/// from there to the playlist line's
 const SUB_GAP: f32 = 27.0;
+const EXTRA_GAP: f32 = 21.0;
 
-/// The song's title, with "artist · album" under it, centred on `at`
-fn song_name(p: &egui::Painter, at: Pos2, max_w: f32, title: &str, sub: &str, s: f32) {
+/// The song's title, "artist · album" ("" if no tags), and in a playlist "3 of 12"
+pub(crate) type SongName<'a> = (&'a str, &'a str, Option<&'a str>);
+
+/// The song's title, with "artist · album" (and "3 of 12") under it, centred on `at`
+fn song_name(p: &egui::Painter, at: Pos2, max_w: f32, (title, sub, extra): SongName, s: f32) {
     let title_font = FontId::new(21.0 * s, FontFamily::Name("semibold".into()));
     let shadow = crate::controls::elide(p, title, title_font.clone(), Color32::from_black_alpha(150), max_w);
     let galley = crate::controls::elide(p, title, title_font, Color32::from_rgb(240, 242, 248), max_w);
     let pos = at - galley.size() / 2.0;
     p.galley(pos + vec2(1.0, 1.0), shadow, Color32::TRANSPARENT);
     p.galley(pos, galley, Color32::TRANSPARENT);
+    let mut y = at.y + SUB_GAP * s;
     if !sub.is_empty() {
         let g = crate::controls::elide(p, sub, FontId::proportional(14.0 * s), Color32::from_rgb(175, 180, 194), max_w);
-        p.galley(at + vec2(0.0, SUB_GAP * s) - g.size() / 2.0, g, Color32::TRANSPARENT);
+        p.galley(pos2(at.x, y) - g.size() / 2.0, g, Color32::TRANSPARENT);
+        y += EXTRA_GAP * s;
+    }
+    if let Some(extra) = extra {
+        let g = crate::controls::elide(p, extra, FontId::proportional(12.5 * s), Color32::from_rgb(135, 141, 158), max_w);
+        p.galley(pos2(at.x, y) - g.size() / 2.0, g, Color32::TRANSPARENT);
     }
 }
 
@@ -646,17 +668,23 @@ fn quad_v(m: &mut Mesh, r: Rect, top: Color32, bottom: Color32) {
     m.add_triangle(i, i + 2, i + 3);
 }
 
-/// A half-ellipse on top of a bar: centre `c`, half-width `rx`, height `ry`
-fn cap(m: &mut Mesh, c: Pos2, rx: f32, ry: f32, col: Color32) {
-    const SEG: u32 = 8;
+/// The top `r` of a bar, with its two top corners rounded by `r`
+fn rounded_top(m: &mut Mesh, bar: Rect, r: f32, col: Color32) {
+    use std::f32::consts::{FRAC_PI_2, PI};
+    const SEG: u32 = 4;
+    let cy = bar.top() + r;
+    // A fan from the middle of the strip's bottom edge, round the two corners
     let i = m.vertices.len() as u32;
-    m.colored_vertex(c, col);
-    for s in 0..=SEG {
-        let a = std::f32::consts::PI * s as f32 / SEG as f32;
-        m.colored_vertex(pos2(c.x - rx * a.cos(), c.y - ry * a.sin()), col);
+    m.colored_vertex(pos2(bar.center().x, cy), col);
+    for (cx, from) in [(bar.left() + r, PI), (bar.right() - r, FRAC_PI_2)] {
+        for s in 0..=SEG {
+            let a = from - FRAC_PI_2 * s as f32 / SEG as f32;
+            m.colored_vertex(pos2(cx + r * a.cos(), cy - r * a.sin()), col);
+        }
     }
-    for s in 0..SEG {
-        m.add_triangle(i, i + 1 + s, i + 2 + s);
+    let n = 2 * (SEG + 1);
+    for k in 1..n {
+        m.add_triangle(i, i + k, i + k + 1);
     }
 }
 
@@ -679,4 +707,45 @@ fn soft_rect(m: &mut Mesh, inner: Rect, l: f32, r: f32, t: f32, b: f32, col: Col
             m.add_triangle(a, a + 5, a + 4);
         }
     }
+}
+
+/// A song's title and artist tags and its length, for the playlist panel (None
+/// for what isn't there or can't be read)
+pub(crate) fn song_info(path: &str) -> (Option<String>, Option<String>, Option<f64>) {
+    use symphonia::core::codecs::CodecParameters;
+    use symphonia::core::formats::probe::Hint;
+    use symphonia::core::formats::{FormatOptions, TrackType};
+    use symphonia::core::io::MediaSourceStream;
+    use symphonia::core::meta::{MetadataOptions, StandardTag};
+
+    let Ok(file) = std::fs::File::open(path) else { return (None, None, None) };
+    let mss = MediaSourceStream::new(Box::new(file), Default::default());
+    let mut hint = Hint::new();
+    if let Some(ext) = std::path::Path::new(path).extension().and_then(|e| e.to_str()) {
+        hint.with_extension(ext);
+    }
+    let Ok(mut format) = symphonia::default::get_probe().probe(&hint, mss, FormatOptions::default(), MetadataOptions::default()) else {
+        return (None, None, None);
+    };
+    let secs = format.default_track(TrackType::Audio).and_then(|t| {
+        let rate = match &t.codec_params {
+            Some(CodecParameters::Audio(a)) => a.sample_rate?,
+            _ => return None,
+        };
+        let n = t.num_frames?;
+        Some(n as f64 / rate as f64).filter(|s| *s > 0.0)
+    });
+    let (mut title, mut artist) = (None, None);
+    let mut meta = format.metadata();
+    if let Some(rev) = meta.skip_to_latest() {
+        let tags = rev.media.tags.iter().chain(rev.per_track.iter().flat_map(|t| t.metadata.tags.iter()));
+        for tag in tags {
+            match &tag.std {
+                Some(StandardTag::TrackTitle(t)) if title.is_none() => title = Some(t.trim().to_owned()),
+                Some(StandardTag::Artist(a)) if artist.is_none() => artist = Some(a.trim().to_owned()),
+                _ => {}
+            }
+        }
+    }
+    (title.filter(|t| !t.is_empty()), artist.filter(|a| !a.is_empty()), secs)
 }
