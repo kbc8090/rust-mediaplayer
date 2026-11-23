@@ -1,107 +1,144 @@
-# MediaPlayer
+<div align="center">
 
-A lightweight, modern video player built in Rust — inspired by the Windows 11 Media Player aesthetic.
-Dark theme, full-bleed video, amber seek bar, clean minimal controls. No ads. No telemetry. No bloat.
+<img src="assets/icon.png" width="96" alt="">
 
-## Supported Formats
-MP4, MKV, AVI, MOV, WMV, FLV, WebM, M4V, TS, MPG, MPEG, 3GP, OGV — anything FFmpeg can decode.
+# Rust Media Player
 
-## Controls
+**A fast, good-looking video and music player for Windows, built on mpv.**
 
-| Action | Input |
-|---|---|
-| Play / Pause | `Space` or click the ⏸/▶ button |
-| Seek | Click or drag the seek bar |
-| Skip ±10s | `← →` arrow keys or ⏮⏭ buttons |
-| Volume | `↑ ↓` arrow keys or drag the volume bar |
-| Fullscreen | `F` key or ⛶ button |
-| Exit fullscreen | `Escape` |
-| Next file | `N` key |
-| Previous file | `P` key |
-| Open file | Drag & drop onto the window |
+Plays just about anything: local files, YouTube and other sites, music with a live visualizer.
+No clutter, no history, no telemetry.
+
+[![Build](https://github.com/kbc8090/rust-mediaplayer/actions/workflows/build.yaml/badge.svg)](https://github.com/kbc8090/rust-mediaplayer/actions/workflows/build.yaml)
+
+<!-- HERO: a video playing with the controls showing and the seek-bar thumbnail
+     preview up (hover the seek bar). 1280×720-ish window, PNG. -->
+<img src="docs/hero.png" width="860" alt="Rust Media Player playing a video, with the seek bar's thumbnail preview">
+
+</div>
 
 ---
 
-## Building on Windows
+## Highlights
 
-### Step 1 — Install Rust
-Download and run the installer from https://rustup.rs
-Accept all defaults. This installs `rustc` and `cargo`.
-
-### Step 2 — Install FFmpeg
-
-FFmpeg must be available for the `ffmpeg-next` crate to link against.
-The easiest way on Windows is via `vcpkg`:
-
-```powershell
-# Install vcpkg (if you don't have it)
-git clone https://github.com/microsoft/vcpkg.git C:\vcpkg
-cd C:\vcpkg
-.\bootstrap-vcpkg.bat
-
-# Install FFmpeg (this takes a few minutes)
-.\vcpkg install ffmpeg:x64-windows-static
-
-# Set environment variables so Rust can find it
-$env:VCPKG_ROOT = "C:\vcpkg"
-$env:FFMPEG_DIR = "C:\vcpkg\installed\x64-windows-static"
-```
-
-**Alternative: pre-built FFmpeg**
-Download the "shared" build from https://www.gyan.dev/ffmpeg/builds/
-Extract it and set:
-```powershell
-$env:FFMPEG_DIR = "C:\path\to\ffmpeg"
-```
-
-### Step 3 — Install Visual Studio Build Tools
-Required for linking on Windows.
-Download from: https://visualstudio.microsoft.com/visual-cpp-build-tools/
-Install the **"Desktop development with C++"** workload.
-
-### Step 4 — Build
-
-```powershell
-cd path\to\mediaplayer
-cargo build --release
-```
-
-Your `.exe` will be at:
-```
-target\release\mediaplayer.exe
-```
+- **Plays nearly everything.** Videos, music and pictures, through [mpv](https://mpv.io) and its
+  hardware decoding: MP4, MKV, AVI, WebM, MP3, FLAC, AAC, Opus, JPG, PNG, GIF, M3U playlists
+  and more.
+- **Online video.** Paste a YouTube (or other site) link and it plays, using
+  [yt-dlp](https://github.com/yt-dlp/yt-dlp). Pick the quality, codec and audio language, save the
+  video, or save just a clip of it. Live streams show as **● Live**.
+- **Music made to look at.** Three visualizer styles (Bars, Wave and Circle), an album-art
+  screen, and the song's details: title, artist, album, year and the exact format
+  (`FLAC · 16-bit · 44.1 kHz`, `MP3 · (VBR) 245 kb/s`).
+- **Playlists that keep up.** Open or drop a handful of files and they become a playlist in the
+  same order Explorer shows them. A slide-out panel shows each song's progress, with
+  shuffle and replay.
+- **Looks like it belongs on Windows 11.** A frameless window with your Windows accent colour,
+  frosted-glass menus, snapping to screen edges, and controls on the taskbar thumbnail.
 
 ---
 
-## Optional: Associate with video files
+## Video
 
-To make double-clicking `.mp4` / `.mkv` / etc. open MediaPlayer:
-1. Right-click any video file → "Open with" → "Choose another app"
-2. Browse to `mediaplayer.exe`
-3. Check "Always use this app"
+<!-- A video in full swing, or the seek bar hovered on a YouTube video so the
+     "most replayed" hill shows. -->
+<img src="docs/video.png" width="860" alt="Hovering the seek bar of an online video">
+
+- **Seek-bar thumbnails** for local files and online videos, with chapter titles above them
+- **YouTube's "most replayed" graph** rises above the seek bar while you hover it
+- **Picture & Sound** (`E`): brightness, contrast, colour temperature, sharpening, denoising,
+  debanding, deinterlacing, smooth motion and high-quality upscaling
+- Frame-by-frame stepping (`D` / `F`), rotating, mirroring, playback speed and subtitles
+- **Save clip as**: mark a start and end on the seek bar and save just that part of any video,
+  local or online
+
+## Music
+
+<!-- Two screenshots side by side work well here: the Circle visualizer with a
+     cover inside it, and the Wave. -->
+<p align="center">
+  <img src="docs/music-circle.png" width="49%" alt="The Circle visualizer with the album cover inside it">
+  <img src="docs/music-wave.png" width="49%" alt="The Wave visualizer">
+</p>
+
+- **Bars, Wave or Circle** visualizers, drawn from the music itself (low CPU, no GPU-heavy effects)
+- **Album art** screen with the cover, or a slowly drifting details card when a song has none
+- The song's details from its tags, and its format and bitrate in the title bar
+- A **10-band equalizer**, volume normalizing, night mode, dialogue boost, crossfeed and more
+
+## Playlists
+
+<!-- A short clip (MP4 or GIF) of opening several songs from Explorer, the
+     playlist sliding out from its tab, and clicking a song. -->
+<img src="docs/playlist.gif" width="860" alt="Opening several songs, and the playlist sliding out">
+
+- Select several files in Explorer and press **Open**, or drag them in: they play as a playlist,
+  in Explorer's order
+- `.m3u` playlists, shuffle, "replay when it ends", and a small **Up next** card
+- The playing song's row fills as it plays
+
+## Drag and drop
+
+<!-- A GIF of dragging a song (or a few) over the window: the blur, the frame
+     and "FLAC" / "8 SONGS" in big letters. -->
+<img src="docs/drop.gif" width="860" alt="Dragging songs over the player">
+
+Drag something over the window and it tells you what it is (**FLAC**, **MP4**, **8 SONGS**)
+before you let go, and greys out anything it can't play.
 
 ---
 
-## Troubleshooting
+## Download
 
-**"cannot find ffmpeg"** — make sure `FFMPEG_DIR` is set correctly and points to a directory containing `include/` and `lib/` subdirectories.
+Grab the latest build from the [**Releases**](https://github.com/kbc8090/rust-mediaplayer/releases)
+page (or the newest successful run under [Actions](https://github.com/kbc8090/rust-mediaplayer/actions)),
+unzip it anywhere and run `RustMediaPlayer.exe`.
 
-**No audio** — check that your default audio device is working. The player uses `rodio` which outputs to the system default device.
+Everything it needs comes in the zip: libmpv, yt-dlp, Deno (which yt-dlp uses for YouTube)
+and a small FFmpeg for saving clips. Nothing is installed.
 
-**Black screen / crash on some files** — try a different FFmpeg build. The gyan.dev "full" build includes more codecs than the "essentials" build.
+**Requires** Windows 10 or 11, 64-bit.
 
----
+## Keyboard shortcuts
 
-## Architecture
+| Key | Action | | Key | Action |
+|---|---|---|---|---|
+| `Space` | Play / pause | | `Ctrl+O` | Open file |
+| `←` `→` | Back / forward 5 seconds | | `Ctrl+U` | Open URL |
+| `↑` `↓` / wheel | Volume | | `Ctrl+V` | Play a copied link |
+| `M` | Mute | | `Ctrl+S` | Save video (online videos) |
+| `P` / `N` | Previous / next file | | `Ctrl+Shift+S` | Save clip |
+| `D` / `F` | Previous / next frame | | `[` `]` | Clip start / end at the playhead |
+| `Enter` / double-click | Full screen | | `Z` | Zoom the seek bar around the clip |
+| `Esc` | Leave full screen / close menu | | `E` | Picture & Sound |
+| `R` | Rotate 90° | | `L` | Playlist |
+| Right-click | Main menu | | `Tab` | Video info |
+| Media keys | Play / pause, next, previous | | `H` | Next decoding method |
 
-```
-src/
-  main.rs      — entry point, eframe setup
-  app.rs       — MediaPlayerApp: wires UI + player + drag-and-drop
-  player.rs    — PlayerCommand / PlayerEvent enums, shared PlaybackState
-  decoder.rs   — FFmpeg decode loop + rodio audio, runs on background thread
-  ui.rs        — All egui rendering: video frame, control bar, seek bar
-```
+## Privacy
 
-The decode loop runs on a dedicated thread and communicates via crossbeam channels.
-Video frames are uploaded to a GPU texture each frame. Audio goes through rodio's default device.
+- No recent-files list and no watch history: nothing about what you play is saved.
+- No telemetry, accounts or ads.
+- Settings are plain text files in `%APPDATA%\rust-mediaplayer`. Delete the folder and the
+  player starts fresh.
+- The only network access is what you ask for: opening an online link (through yt-dlp), and
+  fetching a newer yt-dlp when a link fails because the site has changed.
+
+## Building from source
+
+The [build workflow](.github/workflows/build.yaml) is the reference: it fetches the newest
+libmpv, builds the player with `cargo build --release`, and bundles yt-dlp, Deno and FFmpeg next
+to it. To build locally you need Rust (MSVC toolchain) and `libmpv-2.dll` plus an import
+library for it. The workflow shows how to make one.
+
+## Built with
+
+[mpv](https://mpv.io) · [yt-dlp](https://github.com/yt-dlp/yt-dlp) ·
+[FFmpeg](https://ffmpeg.org) · [egui](https://github.com/emilk/egui) ·
+[Symphonia](https://github.com/pdeljanov/Symphonia) · [Deno](https://deno.com) ·
+[Golos Text](https://github.com/googlefonts/golos-text-font)
+
+## License
+
+<!-- TODO: pick a license (MIT is the common choice for apps like this). Without one,
+     others can look at the code but have no right to use or share it. -->
