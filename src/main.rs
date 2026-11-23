@@ -1801,7 +1801,9 @@ impl eframe::App for FluentMediaPlayer {
             self.track_url_load(ctx, &snap);
             // A link's thumbnails: from the small preview stream yt-dlp found
             if is_url(&self.current_file) && self.link_thumbs.as_deref() != Some(self.current_file.as_str()) {
-                if let Some(li) = snap.link_info.as_ref().filter(|li| li.url == self.current_file) {
+                // (not from a failed answer: opening the same link again after it
+                // failed, the old answer can still be around for a frame or two)
+                if let Some(li) = snap.link_info.as_ref().filter(|li| li.url == self.current_file && li.error.is_none()) {
                     if let Some(pv) = &li.preview {
                         self.thumbs.load_stream(&pv.url, pv.user_agent.clone(), pv.headers.clone());
                     }
@@ -2111,6 +2113,15 @@ impl eframe::App for FluentMediaPlayer {
             if matches!(media_kind(&self.current_file), Some(MediaKind::Video)) {
                 self.thumbs.warm(ctx, self.time_pos);
             }
+        }
+
+        // The window's title as Windows shows it (taskbar thumbnail, Alt+Tab).
+        // Before the minimised check: Next on the taskbar thumbnail changes the
+        // song while minimised, and its tooltip should say so.
+        let title = if self.has_file { format!("{} - RustMediaPlayer", self.file_name()) } else { "RustMediaPlayer".to_owned() };
+        if title != self.os_title {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
+            self.os_title = title;
         }
 
         // Minimised (the taskbar timer still wakes us): nothing to draw
@@ -2524,13 +2535,6 @@ impl eframe::App for FluentMediaPlayer {
         }
         if self.has_file || self.link_error.is_some() || self.link_retry.is_some() {
             draw_link_status(self, ctx);
-        }
-
-        // The window's title as Windows shows it (taskbar thumbnail, Alt+Tab)
-        let title = if self.has_file { format!("{} - RustMediaPlayer", self.file_name()) } else { "RustMediaPlayer".to_owned() };
-        if title != self.os_title {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
-            self.os_title = title;
         }
 
         // The save card: with the title bar while saving; on its own for a few

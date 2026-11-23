@@ -205,6 +205,12 @@ fn run(mpv: Arc<Mutex<Mpv>>, rx: mpsc::Receiver<Job>, state: Arc<Mutex<Snapshot>
                         // and has since gone private kept its old "no error".)
                         link_read.clear();
                         link_info = None;
+                        // (and the last link mpv was on: right after this command
+                        // mpv still reports itself idle, which read as "that link
+                        // gave up" and, for the same link opened again after it
+                        // failed, took the not-yet-there answer as final: no
+                        // thumbnails or details for the attempt that worked)
+                        last_link.clear();
                         // A previous file may have needed software threads (see below);
                         // a hardware decoder gets its single thread back
                         if m.get_property::<String>("hwdec").is_ok_and(|h| h != "no") {
