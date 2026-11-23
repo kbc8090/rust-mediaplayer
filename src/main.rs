@@ -348,11 +348,11 @@ struct FluentMediaPlayer {
     show_controls: bool,
     /// Fraction of the seek bar while the user is dragging it
     drag_frac: Option<f32>,
-    /// Files being dragged over the window: what they are, and whether the
-    /// overlay blurs (kept for the moment they're dropped); then the short
-    /// animation after the drop (and when it started)
-    pub(crate) drop_seen: Option<(controls::DropPreview, bool)>,
-    pub(crate) drop_anim: Option<(controls::DropPreview, bool, std::time::Instant)>,
+    /// Files being dragged over the window: what they are (kept for the moment
+    /// they're dropped); then the short animation after the drop (and when it
+    /// started)
+    pub(crate) drop_seen: Option<controls::DropPreview>,
+    pub(crate) drop_anim: Option<(controls::DropPreview, std::time::Instant)>,
     /// The drag along the seek bar has seeked to keyframes only (an exact seek
     /// follows when it ends)
     pub(crate) drag_rough: bool,
@@ -2450,8 +2450,10 @@ impl eframe::App for FluentMediaPlayer {
             self.show_top = self.show_controls;
         }
         // (files being dragged over the window: the title bar and controls show,
-        // framing the drop area between them)
-        if ctx.input(|i| !i.raw.hovered_files.is_empty()) {
+        // framing the drop area between them; not for a video of the same kind
+        // as the one open, which gets no overlay)
+        let dragged: Vec<String> = ctx.input(|i| i.raw.hovered_files.iter().filter_map(|f| f.path.as_ref().map(|p| p.to_string_lossy().into_owned())).collect());
+        if !dragged.is_empty() && !controls::quiet_drop(self, &dragged) {
             self.show_controls = true;
             self.show_top = true;
         }

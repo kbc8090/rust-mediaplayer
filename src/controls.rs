@@ -1383,32 +1383,49 @@ pub(crate) fn draw_drop_overlay(app: &mut FluentMediaPlayer, ctx: &egui::Context
     let paths: Vec<String> = ctx.input(|i| {
         i.raw.hovered_files.iter().filter_map(|f| f.path.as_ref().map(|p| p.to_string_lossy().into_owned())).collect()
     });
-    // (a video dragged over a video that's open: no blur, so the one playing
-    // stays in view; just the frame and the details over it)
-    let video_open = app.has_file && (app.video_kind == VideoKind::Video || matches!(media_kind(&app.current_file), Some(MediaKind::Video)));
-    if let Some(d) = drop_preview(&paths) {
-        let blur = !(video_open && d.icon == DropIcon::Video);
-        paint_drop(ctx, app.accent, &d, blur, None);
-        app.drop_seen = Some((d, blur));
+    // A video open (playing or paused) and more of the same kind dragged over
+    // it (MP4 over MP4): nothing at all, it just plays when dropped. A
+    // different kind (an MKV over an MP4) gets the overlay.
+    if quiet_drop(app, &paths) {
+        app.drop_seen = None;
         return;
     }
-    // Let go: a short send-off (a third of a second). Taken: the frame opens out
-    // a little and everything fades. Refused: it shakes its head, then fades.
-    // (Dragged away again: it just goes.)
+    if let Some(d) = drop_preview(&paths) {
+        paint_drop(ctx, app.accent, &d, None);
+        app.drop_seen = Some(d);
+        return;
+    }
+    // Let go: a short send-off (a third of a second) for songs, pictures and
+    // playlists (a video just starts). Taken: the frame opens out a little and
+    // everything fades; refused: it shakes its head, then fades. (Dragged away
+    // again: it just goes.)
     if let Some(d) = app.drop_seen.take() {
-        if ctx.input(|i| !i.raw.dropped_files.is_empty()) {
-            app.drop_anim = Some((d.0, d.1, std::time::Instant::now()));
+        if ctx.input(|i| !i.raw.dropped_files.is_empty()) && d.icon != DropIcon::Video {
+            app.drop_anim = Some((d, std::time::Instant::now()));
         }
     }
-    if let Some((d, blur, t0)) = &app.drop_anim {
+    if let Some((d, t0)) = &app.drop_anim {
         let k = t0.elapsed().as_secs_f32() / DROP_ANIM_SECS;
         if k >= 1.0 {
             app.drop_anim = None;
         } else {
-            paint_drop(ctx, app.accent, d, *blur, Some(k));
+            paint_drop(ctx, app.accent, d, Some(k));
             ctx.request_repaint();
         }
     }
+}
+
+/// Videos of the same kind as the video that's open (playing or paused) being
+/// dragged over it: no overlay (they just play when dropped)
+pub(crate) fn quiet_drop(app: &FluentMediaPlayer, paths: &[String]) -> bool {
+    let video_open = app.has_file && (app.video_kind == VideoKind::Video || matches!(media_kind(&app.current_file), Some(MediaKind::Video)));
+    let ext = |p: &str| Path::new(p).extension().map(|e| e.to_string_lossy().to_lowercase());
+    let open_ext = ext(&app.current_file);
+    let mut media = paths.iter().filter(|p| is_media_file(p)).peekable();
+    video_open
+        && open_ext.is_some()
+        && media.peek().is_some()
+        && media.all(|p| matches!(media_kind(p), Some(MediaKind::Video)) && ext(p) == open_ext)
 }
 
 /// How long the send-off after a drop takes
@@ -1416,7 +1433,7 @@ const DROP_ANIM_SECS: f32 = 0.32;
 
 /// The drop overlay itself. `after`: how far through the send-off after the
 /// drop (0…1), None while still dragging.
-fn paint_drop(ctx: &egui::Context, accent: Color32, d: &DropPreview, blur: bool, after: Option<f32>) {
+fn paint_drop(ctx: &egui::Context, accent: Color32, d: &DropPreview, after: Option<f32>) {
     let screen = ctx.screen_rect();
     let area = Rect::from_min_max(
         pos2(screen.left(), screen.top() + WIN_BTN_H + 1.0),
@@ -1450,12 +1467,7 @@ fn paint_drop(ctx: &egui::Context, accent: Color32, d: &DropPreview, blur: bool,
     // the accent colour (grey for something it can't play)
     let fr = area.shrink(10.0).expand(grow).translate(vec2(shake, 0.0));
     let r = 16.0;
-    if blur {
-        crate::glass::fill(&p, fr, r, Color32::from_black_alpha(170), alpha);
-    } else {
-        // (a light veil, so the details still read over the video)
-        p.rect_filled(fr, r, Color32::from_black_alpha((70.0 * alpha) as u8));
-    }
+    crate::glass::fill(&p, fr, r, Color32::from_black_alpha(170), alpha);
     let edge = if d.playable { accent } else { Color32::from_rgb(128, 128, 136) };
     p.rect_stroke(fr.shrink(1.0), r - 1.0, Stroke::new(2.0_f32, edge.gamma_multiply(alpha)));
 
