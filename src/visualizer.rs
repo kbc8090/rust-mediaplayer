@@ -333,6 +333,9 @@ pub(crate) struct Bars {
     /// fraction of the room it has to move in, and its direction
     float_at: egui::Vec2,
     float_dir: egui::Vec2,
+    /// How far the wave has drifted (moves on while a song plays, faster when
+    /// it's louder)
+    wave_t: f32,
 }
 
 impl Bars {
@@ -356,6 +359,7 @@ impl Bars {
             cache: None,
             float_at: vec2(0.5, 0.42),
             float_dir: vec2(0.8, 0.6),
+            wave_t: 0.0,
         }
     }
 
@@ -412,6 +416,12 @@ impl Bars {
                 self.measure(&mut input, &mut target, dt);
             }
             self.input = input;
+        }
+
+        // The wave drifts on while it plays (a little faster when it's loud)
+        if playing && state == State::Ready {
+            let energy = self.level.iter().sum::<f32>() / BARS as f32;
+            self.wave_t = (self.wave_t + dt * (0.7 + 1.6 * energy)) % 10_000.0;
         }
 
         // Fast up, gentle down; the peak caps wait a moment, then drop with gravity
@@ -554,18 +564,77 @@ impl Bars {
         p.add(egui::Shape::mesh(m));
     }
 
+    /// The wave: the start screen's ribbon (one bright line and ten fainter ones
+    /// woven round it, teal → accent → violet), swelling with the music: the
+    /// bass in the middle, the highs out towards the sides. Centred on `cy`.
+    fn draw_wave(&self, p: &egui::Painter, rect: Rect, cy: f32, accent: Color32) {
+        let (w, h) = (rect.width(), rect.height());
+        let acc = splash::rgb(accent);
+        let s = (h / 720.0).clamp(0.45, 2.0);
+        // The music's level at a point across: mirrored about the middle (bass
+        // there), read smoothly between the bars' bands
+        let level_at = |u: f32| {
+            let x = u.abs().min(1.0) * (BARS - 1) as f32;
+            let (i, f) = (x.floor() as usize, x.fract());
+            let b = (i + 1).min(BARS - 1);
+            self.level[i] * (1.0 - f) + self.level[b] * f
+        };
+        let npts = ((w / 3.5) as usize).clamp(100, 600);
+        let mut m = Mesh::default();
+        let mut pts = Vec::with_capacity(npts + 1);
+        let mut core = Vec::with_capacity(npts + 1);
+        let mut glow = Vec::with_capacity(npts + 1);
+        let levels: Vec<f32> = (0..=npts).map(|i| level_at((i as f32 / npts as f32 - 0.5) * 2.0)).collect();
+        let t = self.wave_t;
+        for k in 0..11 {
+            // (each line drifts at its own pace, so they keep weaving)
+            let ph = k as f32 * 0.42 + t * (0.55 + 0.06 * k as f32);
+            let amp = 118.0 * (1.0 - 0.055 * k as f32);
+            let a = if k == 0 { 1.0 } else { 0.55 * (1.0 - k as f32 / 13.0) };
+            pts.clear();
+            core.clear();
+            glow.clear();
+            for (i, &lv) in levels.iter().enumerate() {
+                let x = i as f32 / npts as f32;
+                let u = (x - 0.5) * 2.0;
+                let env = (-(u.abs() / 0.78).powf(3.2)).exp();
+                // (calm when quiet; the louder, the bigger the swell)
+                let wave = amp * (0.22 + 1.05 * lv) * (u * 8.5 + ph * 1.3).sin() * (u * 2.7 + ph).cos()
+                    + 34.0 * (0.35 + 0.9 * lv) * (u * 19.0 + ph * 2.6).sin()
+                    + 12.0 * (u * 41.0 + ph).sin();
+                // (0.85: room above for the top bar and below for the song's details)
+                pts.push(pos2(rect.left() + w * x, cy + env * wave * s * 0.85));
+                let c = splash::ribbon_colour(acc, x);
+                // (brighter where it's loud)
+                let b = a * (0.75 + 0.35 * lv);
+                core.push(splash::light(c, b));
+                glow.push(splash::light(c, b * 0.11));
+            }
+            splash::strip(&mut m, &pts, 18.0 * s, &glow);
+            splash::strip(&mut m, &pts, if k == 0 { 2.3 } else { 1.25 }, &core);
+        }
+        p.add(egui::Shape::mesh(m));
+    }
+
     /// The visualizer filling `rect`, with the song's name at the bottom middle
-    pub(crate) fn draw_visualizer(&mut self, p: &egui::Painter, rect: Rect, name: SongName, accent: Color32) {
+    pub(crate) fn draw_visualizer(&mut self, p: &egui::Painter, rect: Rect, name: SongName, accent: Color32, wave: bool) {
         let p = p.with_clip_rect(rect);
         let h = rect.height();
         let l = CoverLayout::new(rect, name.lines());
         // (the bars stand above the song's details, also in a small window)
         let base = (rect.top() + h * 0.58).min(l.name_top - 16.0 * l.scale).round();
-        self.backdrop(&p, rect, accent, base);
         let s = (h / 720.0).clamp(0.45, 2.0);
-        // (edge to edge)
-        let area = Rect::from_min_max(pos2(rect.left(), base - h * 0.34), pos2(rect.right(), base));
-        self.draw_bars(&p, area, accent, true, 14.0 * s);
+        if wave {
+            // (the wave in the middle of where the bars stand)
+            let cy = (base - h * 0.17).round();
+            self.backdrop(&p, rect, accent, cy);
+            self.draw_wave(&p, rect, cy, accent);
+        } else {
+            self.backdrop(&p, rect, accent, base);
+            // (edge to edge)
+            let area = Rect::from_min_max(pos2(rect.left(), base - h * 0.34), pos2(rect.right(), base));
+            self.draw_bars(&p, area, accent, true, 14.0 * s);
+        }
         self.vignette(&p);
         // The details: just above the seek bar in a small window; with more room,
         // partway up towards the bars (so they don't sit far down on their own)

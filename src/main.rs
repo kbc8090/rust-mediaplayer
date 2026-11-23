@@ -1538,7 +1538,7 @@ impl FluentMediaPlayer {
             }
             return;
         }
-        self.bars.draw_visualizer(p, rect, name, self.accent);
+        self.bars.draw_visualizer(p, rect, name, self.accent, self.adjust.vis_style == adjust::VisStyle::Wave);
         // Keep the bars moving (at the screen's refresh rate; the 6 ms is only a
         // limit in case vsync is off). Paused, they settle and the redrawing stops.
         if moving {

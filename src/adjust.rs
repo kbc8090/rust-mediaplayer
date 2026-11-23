@@ -52,6 +52,25 @@ impl MusicShow {
     }
 }
 
+/// How the visualizer looks
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum VisStyle {
+    /// Glowing bars, lows to highs left to right
+    Bars,
+    /// The start screen's ribbon of lines, moved by the music
+    Wave,
+}
+
+impl VisStyle {
+    const ALL: [VisStyle; 2] = [VisStyle::Bars, VisStyle::Wave];
+    fn key(self) -> &'static str {
+        match self {
+            VisStyle::Bars => "bars",
+            VisStyle::Wave => "wave",
+        }
+    }
+}
+
 #[derive(Clone, PartialEq, Debug)]
 pub struct Adjust {
     // Picture: mpv's own controls, −100…100
@@ -83,6 +102,8 @@ pub struct Adjust {
     pub keep_pitch: bool,
     /// While a song plays (not reset by Reset: it's how songs look, not how they sound)
     pub music: MusicShow,
+    /// The visualizer's look (not reset either)
+    pub vis_style: VisStyle,
     // Equalizer (dB)
     pub eq_on: bool,
     pub preamp: i32,
@@ -112,6 +133,7 @@ impl Default for Adjust {
             widen: false,
             keep_pitch: true,
             music: MusicShow::AlbumArt,
+            vis_style: VisStyle::Bars,
             eq_on: false,
             preamp: 0,
             eq: [0; 10],
@@ -158,6 +180,11 @@ impl Adjust {
                         a.music = m;
                     }
                 }
+                "vis_style" => {
+                    if let Some(m) = VisStyle::ALL.into_iter().find(|m| m.key() == v) {
+                        a.vis_style = m;
+                    }
+                }
                 "eq_on" => a.eq_on = b,
                 "preamp" => a.preamp = n.clamp(-EQ_MAX, EQ_MAX),
                 "eq" => {
@@ -177,11 +204,11 @@ impl Adjust {
         let text = format!(
             "brightness={}\ncontrast={}\nsaturation={}\ngamma={}\nhue={}\ntemperature={}\nvibrance_fine={}\n\
              sharpen={}\ndenoise={}\ndeband={}\ndeinterlace={}\nsmooth={}\nnight={}\ndialogue={}\n\
-             delay_ms={}\nmono={}\ncrossfeed={}\nwiden={}\nkeep_pitch={}\nmusic={}\neq_on={}\npreamp={}\neq={}\n",
+             delay_ms={}\nmono={}\ncrossfeed={}\nwiden={}\nkeep_pitch={}\nmusic={}\nvis_style={}\neq_on={}\npreamp={}\neq={}\n",
             self.brightness, self.contrast, self.saturation, self.gamma, self.hue, self.temperature,
             self.vibrance, self.sharpen, self.denoise, b(self.deband), b(self.deinterlace), b(self.smooth),
             b(self.night), b(self.dialogue), self.delay_ms, b(self.mono), b(self.crossfeed), b(self.widen),
-            b(self.keep_pitch), self.music.key(), b(self.eq_on), self.preamp, eq.join(","),
+            b(self.keep_pitch), self.music.key(), self.vis_style.key(), b(self.eq_on), self.preamp, eq.join(","),
         );
         if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);
@@ -614,6 +641,7 @@ enum Row {
 #[derive(Clone, Copy)]
 enum ChoiceKey {
     Music,
+    Style,
 }
 
 #[derive(Clone, Copy)]
@@ -735,15 +763,28 @@ fn rows(a: &Adjust, normalize: bool, hq: bool, tab: Tab, denoise_skipped: bool) 
         Tab::Sound => {
             let delay = if a.delay_ms == 0 { "0 ms".to_owned() } else { format!("{} ms", signed(a.delay_ms)) };
             let music = MusicShow::ALL.iter().position(|m| *m == a.music).unwrap_or(1);
-            vec![
+            let mut rows = vec![
                 Row::Section("While music plays"),
                 Row::Choice(
                     "Show",
-                    "Visualizer: glowing bars that move with the music. Album art: the song's cover with its title, artist and album (songs without a cover show the visualizer).",
+                    "Visualizer: glowing bars or a flowing wave that move with the music. Album art: the song's cover with its title, artist and album (songs without a cover show the visualizer).",
                     &["Visualizer", "Album art"],
                     music,
                     ChoiceKey::Music,
                 ),
+            ];
+            // (the visualizer's look, while the visualizer is what shows)
+            if a.music == MusicShow::Visualizer {
+                let style = VisStyle::ALL.iter().position(|s| *s == a.vis_style).unwrap_or(0);
+                rows.push(Row::Choice(
+                    "Style",
+                    "Bars: glowing bars, lows to highs from left to right. Wave: flowing lines that swell with the music, bass in the middle and highs out to the sides.",
+                    &["Bars", "Wave"],
+                    style,
+                    ChoiceKey::Style,
+                ));
+            }
+            rows.extend([
                 Row::Sep,
                 Row::Equalizer(a.eq_on),
                 Row::Sep,
@@ -757,7 +798,8 @@ fn rows(a: &Adjust, normalize: bool, hq: bool, tab: Tab, denoise_skipped: bool) 
                 Row::Switch("Headphone crossfeed", "Blends a little of each side into the other, so hard-panned old stereo recordings are less tiring on headphones.", a.crossfeed, SwitchKey::Crossfeed),
                 Row::Switch("Stereo widening", "Makes the stereo sound wider.", a.widen, SwitchKey::Widen),
                 Row::Switch("Keep pitch at other speeds", "Voices sound normal at 1.5\u{d7} or 0.5\u{d7}. Turn off for the chipmunk / slow-motion effect.", a.keep_pitch, SwitchKey::Pitch),
-            ]
+            ]);
+            rows
         }
     }
 }
@@ -870,6 +912,7 @@ pub fn draw_panel(ctx: &egui::Context, ui_state: &mut AdjustUi, a: &mut Adjust, 
                         if let Some(i) = segmented(ui, &p, r.right() - 8.0, r.center().y, labels, *chosen, name, accent) {
                             match key {
                                 ChoiceKey::Music => a.music = MusicShow::ALL[i],
+                                ChoiceKey::Style => a.vis_style = VisStyle::ALL[i],
                             }
                         }
                     }

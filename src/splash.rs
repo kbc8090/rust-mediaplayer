@@ -39,7 +39,7 @@ pub(crate) fn ribbon_colour(accent: Rgb, t: f32) -> Rgb {
 }
 
 /// Soft strip along a polyline: full colour on the line, fading to nothing at ±half_w
-fn strip(mesh: &mut Mesh, pts: &[Pos2], half_w: f32, cols: &[Color32]) {
+pub(crate) fn strip(mesh: &mut Mesh, pts: &[Pos2], half_w: f32, cols: &[Color32]) {
     let n = pts.len();
     if n < 2 {
         return;
