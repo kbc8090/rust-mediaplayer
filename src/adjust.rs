@@ -472,6 +472,9 @@ const LINE: Color32 = Color32::from_rgba_premultiplied(26, 26, 26, 26);
 const NAME_SIZE: f32 = 13.5;
 const VALUE_SIZE: f32 = 12.5;
 const ROW_H: f32 = 30.0;
+/// From a panel's or menu's edge to its rows' highlights: the 1 px border, then a
+/// 4 px gap (the same as between a separator and the rows beside it)
+pub(crate) const EDGE: f32 = 5.0;
 const HEAD_H: f32 = 44.0;
 
 fn semibold(size: f32) -> FontId {
@@ -772,8 +775,8 @@ pub fn draw_panel(ctx: &egui::Context, ui_state: &mut AdjustUi, a: &mut Adjust, 
     };
     let content_h: f32 = list.iter().map(row_h).sum();
     const TABS_H: f32 = 42.0;
-    // (6 px under the last row, as at its sides)
-    let full_h = HEAD_H + TABS_H + content_h + 6.0;
+    // (5 px under the last row, as at its sides: the 1 px border, then a 4 px gap)
+    let full_h = HEAD_H + TABS_H + content_h + EDGE;
     let avail = (screen.bottom() - BOTTOM_GAP) - (screen.top() + PANEL_TOP);
     let h = full_h.min(avail.max(HEAD_H + TABS_H + ROW_H * 2.0));
     let w = PANEL_W.min(screen.width() - 16.0);
@@ -833,7 +836,7 @@ pub fn draw_panel(ctx: &egui::Context, ui_state: &mut AdjustUi, a: &mut Adjust, 
         }
 
         // Rows (scroll when the window is too short)
-        let list_rect = Rect::from_min_max(pos2(rect.left() + 6.0, rect.top() + HEAD_H + TABS_H), pos2(rect.right() - 6.0, rect.bottom() - 6.0));
+        let list_rect = Rect::from_min_max(pos2(rect.left() + EDGE, rect.top() + HEAD_H + TABS_H), pos2(rect.right() - EDGE, rect.bottom() - EDGE));
         let mut child = ui.child_ui(list_rect, egui::Layout::top_down(egui::Align::Min));
         egui::ScrollArea::vertical().max_height(list_rect.height()).show(&mut child, |ui| {
             ui.spacing_mut().item_spacing = vec2(0.0, 0.0);
@@ -1168,7 +1171,7 @@ pub fn draw_online(ctx: &egui::Context, ui_state: &mut AdjustUi, o: &mut crate::
     const NOTE_H: f32 = 34.0;
     let screen = ctx.screen_rect();
     let w = PANEL_W.min(screen.width() - 16.0);
-    let h = HEAD_H + 6.0 + ROW_H * 6.0 + 9.0 + NOTE_H;
+    let h = HEAD_H + 4.0 + ROW_H * 6.0 + 9.0 + NOTE_H;
     let rect = Rect::from_min_size(pos2(screen.left() + 8.0, screen.top() + PANEL_TOP), vec2(w, h));
     ui_state.online_rect = rect;
 
@@ -1186,9 +1189,9 @@ pub fn draw_online(ctx: &egui::Context, ui_state: &mut AdjustUi, o: &mut crate::
         if reset {
             *o = Online::default();
         }
-        let mut top = rect.top() + HEAD_H + 6.0;
+        let mut top = rect.top() + HEAD_H + 4.0;
         let mut next_row = |hgt: f32| {
-            let r = Rect::from_min_size(pos2(rect.left() + 6.0, top), vec2(w - 12.0, hgt));
+            let r = Rect::from_min_size(pos2(rect.left() + EDGE, top), vec2(w - 2.0 * EDGE, hgt));
             top += hgt;
             r
         };
@@ -1312,7 +1315,7 @@ pub fn draw_online(ctx: &egui::Context, ui_state: &mut AdjustUi, o: &mut crate::
         const ITEM_H: f32 = 24.0;
         // Whole rows only (at most 12), so the list never ends on half a name
         let rows = (((screen.height() - 22.0) / ITEM_H).floor() as usize).clamp(4, 12).min(LANGUAGES.len());
-        let list_h = rows as f32 * ITEM_H + 6.0;
+        let list_h = rows as f32 * ITEM_H + 2.0 * EDGE;
         let lw = 190.0;
         let x = (rect.right() + 6.0).min(screen.right() - lw - 8.0);
         let y = (lang_row.top() - 3.0).clamp(screen.top() + 8.0, (screen.bottom() - 8.0 - list_h).max(screen.top() + 8.0));
@@ -1330,7 +1333,7 @@ pub fn draw_online(ctx: &egui::Context, ui_state: &mut AdjustUi, o: &mut crate::
                 ui.allocate_rect(lr, Sense::click_and_drag());
                 let p = ui.painter().clone();
                 panel_frame(&p, lr);
-                let inner = lr.shrink(3.0);
+                let inner = lr.shrink(EDGE);
                 let mut child = ui.child_ui(inner, egui::Layout::top_down(egui::Align::Min));
                 egui::ScrollArea::vertical().max_height(inner.height()).show(&mut child, |ui| {
                     ui.spacing_mut().item_spacing = vec2(0.0, 0.0);
@@ -1919,9 +1922,11 @@ pub fn draw_playlist(
     // (shuffled, "already played" isn't the ones above: no greyed-out rows then)
     let grey_played = !shuffle.as_deref().copied().unwrap_or(false);
     let switches = if shuffle.is_some() { 3.0 } else { 2.0 };
-    let foot_h = 9.0 + ROW_H * switches + 6.0;
+    // (the separator right under the list, 4 px from the rows on each side of it)
+    let foot_h = 5.0 + ROW_H * switches + EDGE;
     let max_h = (screen.height() - PANEL_TOP - BOTTOM_GAP).max(HEAD_H + foot_h + ITEM_H * 2.0);
-    let list_h = (rows.len() as f32 * ITEM_H + 8.0).min(max_h - HEAD_H - foot_h);
+    // (3 px above and below the rows: with their highlights 1 px in, 4 px gaps)
+    let list_h = (rows.len() as f32 * ITEM_H + 6.0).min(max_h - HEAD_H - foot_h);
     let h = HEAD_H + list_h + foot_h;
     let rect = Rect::from_min_size(pos2(screen.right() - 8.0 - w, screen.top() + PANEL_TOP), vec2(w, h));
     ui_state.playlist_rect = rect;
@@ -1958,7 +1963,7 @@ pub fn draw_playlist(
         p.text(pos2(count_x, cy + 0.5), Align2::LEFT_CENTER, count, FontId::proportional(11.5), DIM);
 
         // The entries (scrolling when they don't fit)
-        let list = Rect::from_min_size(pos2(rect.left() + 6.0, rect.top() + HEAD_H + 4.0), vec2(w - 12.0, list_h - 8.0));
+        let list = Rect::from_min_size(pos2(rect.left() + EDGE, rect.top() + HEAD_H + 3.0), vec2(w - 2.0 * EDGE, list_h - 6.0));
         let scroll_to_current = std::mem::take(&mut ui_state.playlist_scroll);
         ui.allocate_ui_at_rect(list, |ui| {
             egui::ScrollArea::vertical().id_source("playlist_rows").max_height(list.height()).auto_shrink([false, false]).show(ui, |ui| {
@@ -2018,15 +2023,15 @@ pub fn draw_playlist(
 
         // The options
         let mut top = rect.top() + HEAD_H + list_h;
-        p.line_segment([pos2(rect.left() + 1.0, top + 4.5), pos2(rect.right() - 1.0, top + 4.5)], Stroke::new(1.0_f32, LINE));
-        top += 9.0;
+        p.line_segment([pos2(rect.left() + 1.0, top + 0.5), pos2(rect.right() - 1.0, top + 0.5)], Stroke::new(1.0_f32, LINE));
+        top += 5.0;
         let mut shuffle = shuffle;
         let has_shuffle = shuffle.is_some();
         for (label, key) in [("Shuffle", 2), ("Replay when it ends", 0), ("Always show \u{201c}Up next\u{201d}", 1)] {
             if key == 2 && !has_shuffle {
                 continue;
             }
-            let r = Rect::from_min_size(pos2(rect.left() + 6.0, top), vec2(w - 12.0, ROW_H));
+            let r = Rect::from_min_size(pos2(rect.left() + EDGE, top), vec2(w - 2.0 * EDGE, ROW_H));
             top += ROW_H;
             let resp = ui.interact(r, ui.id().with(("playlist_switch", key)), Sense::click_and_drag());
             if let Some(c) = state_fill(&resp) {
@@ -2066,7 +2071,7 @@ pub fn draw_playlist_summary(ctx: &egui::Context, ui_state: &mut AdjustUi, rows:
     let screen = ctx.screen_rect();
     let w = 240.0_f32.min(screen.width() - 16.0);
     let body = if next.is_empty() { ITEM_H } else { next.len() as f32 * ITEM_H };
-    let h = 34.0 + body + 28.0;
+    let h = 34.0 + body + 22.0 + EDGE;
     let rect = Rect::from_min_size(pos2(screen.right() - 12.0 - w, screen.bottom() - BOTTOM_GAP - h), vec2(w, h));
     ui_state.summary_rect = rect;
 
@@ -2079,12 +2084,12 @@ pub fn draw_playlist_summary(ctx: &egui::Context, ui_state: &mut AdjustUi, rows:
         p.text(pos2(rect.right() - 14.0, rect.top() + 18.0), Align2::RIGHT_CENTER, format!("{} of {}", current + 1, rows.len()), FontId::proportional(11.5), DIM);
         let mut top = rect.top() + 32.0;
         if next.is_empty() {
-            let r = Rect::from_min_size(pos2(rect.left() + 6.0, top), vec2(w - 12.0, ITEM_H));
+            let r = Rect::from_min_size(pos2(rect.left() + EDGE, top), vec2(w - 2.0 * EDGE, ITEM_H));
             p.text(pos2(r.left() + 10.0, r.center().y), Align2::LEFT_CENTER, "That\u{2019}s the last one", FontId::proportional(12.5), DIM);
             top += ITEM_H;
         }
         for i in next {
-            let r = Rect::from_min_size(pos2(rect.left() + 6.0, top), vec2(w - 12.0, ITEM_H));
+            let r = Rect::from_min_size(pos2(rect.left() + EDGE, top), vec2(w - 2.0 * EDGE, ITEM_H));
             top += ITEM_H;
             let resp = ui.interact(r, ui.id().with(("summary_row", i)), Sense::click_and_drag());
             if let Some(c) = state_fill(&resp) {
@@ -2105,7 +2110,7 @@ pub fn draw_playlist_summary(ctx: &egui::Context, ui_state: &mut AdjustUi, rows:
             }
         }
         // "All 12 songs…" opens the panel
-        let r = Rect::from_min_size(pos2(rect.left() + 6.0, top + 2.0), vec2(w - 12.0, 22.0));
+        let r = Rect::from_min_size(pos2(rect.left() + EDGE, top + 2.0), vec2(w - 2.0 * EDGE, 22.0));
         let resp = ui.interact(r, ui.id().with("summary_all"), Sense::click_and_drag());
         if let Some(c) = state_fill(&resp) {
             p.rect_filled(r, 5.0, c);

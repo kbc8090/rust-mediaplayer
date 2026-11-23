@@ -178,11 +178,11 @@ pub(crate) const POPUP: egui::Order = egui::Order::Debug;
 
 pub(crate) const MENU_ITEM_H: f32 = 28.0;
 
-/// Gap between a menu's edge and its rows' highlights (the same all round as
-/// in the panels)
-pub(crate) const MENU_PAD: f32 = 6.0;
+/// From a menu's edge to its rows' highlights (the same as in the panels)
+pub(crate) const MENU_PAD: f32 = adjust::EDGE;
 
-pub(crate) const MENU_SEP_H: f32 = 7.0;
+/// A separator row: its line with a 4 px gap above and below
+pub(crate) const MENU_SEP_H: f32 = 9.0;
 
 /// Hovering a row this long opens its submenu (or closes another one)
 pub(crate) const SUBMENU_DELAY: f32 = 0.3;
@@ -205,7 +205,7 @@ pub(crate) struct MenuSize {
 
 impl MenuSize {
     const NORMAL: Self = Self { item_h: MENU_ITEM_H, sep_h: MENU_SEP_H, font: 14.5, small_font: 13.5, text_x: 28.0, mark_x: 14.0 };
-    const COMPACT: Self = Self { item_h: 22.0, sep_h: 5.0, font: 13.0, small_font: 12.5, text_x: 22.0, mark_x: 11.0 };
+    const COMPACT: Self = Self { item_h: 22.0, sep_h: MENU_SEP_H, font: 13.0, small_font: 12.5, text_x: 22.0, mark_x: 11.0 };
 
     pub(crate) fn row_h(&self, r: &MenuRow) -> f32 {
         match r {
