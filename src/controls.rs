@@ -380,6 +380,67 @@ pub(crate) fn draw_knob(p: &egui::Painter, ppp: f32, centre: Pos2, hot: bool, ac
     adjust::disc(p, c, dot, accent);
 }
 
+/// Height of the "most replayed" hill at its highest
+const HEAT_H: f32 = 30.0;
+
+/// The "most replayed" hill along the seek bar from `ends.0` to `ends.1`, standing
+/// on `base`. `secs_at`: the video time at a point of the bar. `played_to`: where
+/// the played part ends (its outline is in the accent colour up to there).
+#[allow(clippy::too_many_arguments)]
+fn draw_heatmap(
+    p: &egui::Painter,
+    h: &crate::online::Heatmap,
+    ends: (f32, f32),
+    base: f32,
+    secs_at: &dyn Fn(f32) -> f64,
+    played_to: Option<f32>,
+    accent: Color32,
+    alpha: f32,
+) {
+    let (left, right) = ends;
+    // (a point every 2 px: smooth, and only a few hundred)
+    let steps = ((right - left) / 2.0).ceil().max(2.0) as usize;
+    let pts: Vec<Pos2> = (0..=steps)
+        .map(|i| {
+            let x = left + (right - left) * i as f32 / steps as f32;
+            pos2(x, base - HEAT_H * h.at(secs_at(x)))
+        })
+        .collect();
+    // The hill: white, fading from 40 % at the graph's full height to 12 % at the bar
+    let shade = |y: f32| {
+        let f = ((base - y) / HEAT_H).clamp(0.0, 1.0);
+        Color32::from_white_alpha(((0.12 + 0.28 * f) * 255.0 * alpha) as u8)
+    };
+    let mut m = egui::Mesh::default();
+    for (i, q) in pts.iter().enumerate() {
+        m.colored_vertex(*q, shade(q.y));
+        m.colored_vertex(pos2(q.x, base), shade(base));
+        if i > 0 {
+            let k = 2 * i as u32;
+            m.add_triangle(k - 2, k - 1, k);
+            m.add_triangle(k - 1, k, k + 1);
+        }
+    }
+    p.add(egui::Shape::mesh(m));
+    // Its outline, 1 px: accent over the played part, faint white after it
+    let rest_col = Color32::from_white_alpha((0.35 * 255.0 * alpha) as u8);
+    let split = played_to.map_or(0, |px| pts.partition_point(|q| q.x < px));
+    let mut played: Vec<Pos2> = pts[..split].to_vec();
+    let mut rest: Vec<Pos2> = pts[split..].to_vec();
+    if let (Some(px), true) = (played_to, split > 0 && split < pts.len()) {
+        let (a, b) = (pts[split - 1], pts[split]);
+        let mid = a + (b - a) * ((px - a.x) / (b.x - a.x).max(1e-3));
+        played.push(mid);
+        rest.insert(0, mid);
+    }
+    if played.len() >= 2 {
+        p.add(egui::Shape::line(played, Stroke::new(1.0_f32, accent.gamma_multiply(alpha))));
+    }
+    if rest.len() >= 2 {
+        p.add(egui::Shape::line(rest, Stroke::new(1.0_f32, rest_col)));
+    }
+}
+
 // ── Title bar (overlaid on the video) ─────────────────────────────────────────
 pub(crate) fn draw_top_bar(app: &mut FluentMediaPlayer, ctx: &egui::Context, t: f32) {
     let screen = ctx.screen_rect();
@@ -670,6 +731,15 @@ pub(crate) fn draw_bottom_bar(app: &mut FluentMediaPlayer, ctx: &egui::Context, 
             if app.clip.is_none() {
                 pill(&p, Rect::from_min_max(pos2(sr.left(), y0), pos2(fill_x, y1)), accent);
             }
+            // YouTube's "most replayed" graph: a soft hill over the bar while it's
+            // hovered, outlined by a 1 px line (in the accent colour over the part
+            // already played). Follows the bar when it's zoomed in around a clip.
+            let heat = app.heatmap.clone().filter(|_| duration > 0.0 && !live);
+            let heat_a = ctx.animate_bool_with_time(ui.id().with("heat"), hot && heat.is_some(), 0.15);
+            if let Some(h) = heat.filter(|_| heat_a > 0.0) {
+                let played_to = app.clip.is_none().then_some(fill_x);
+                draw_heatmap(&p, &h, (sr.left(), sr.right()), y0 - 3.0, &|x| to_secs(frac_at(x)), played_to, accent, heat_a * t);
+            }
             // Chapter marks: small gaps in the bar
             if duration > 0.0 && !live {
                 let ppp = ctx.pixels_per_point();
@@ -907,6 +977,11 @@ pub(crate) fn draw_bottom_bar(app: &mut FluentMediaPlayer, ctx: &egui::Context, 
                     if app.playlist_replay { "on" } else { "off" }
                 );
                 let r = hit(ui, c, "repeat", &tip, t);
+                // Panel open: the button stays lit, its highlight on as if pressed
+                // (plus the hover's own when the mouse is on it)
+                if app.adjust_ui.playlist_open {
+                    p.rect_filled(Rect::from_center_size(c, vec2(BTN_BOX, BTN_BOX)), 8.0, Color32::from_white_alpha((13.0 * t) as u8));
+                }
                 if r.activated() {
                     app.toggle_playlist_panel();
                 }

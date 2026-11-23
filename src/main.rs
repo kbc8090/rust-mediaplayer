@@ -443,6 +443,9 @@ struct FluentMediaPlayer {
     retried_url: Option<String>,
     /// The link whose preview stream the thumbnails are using
     link_thumbs: Option<String>,
+    /// YouTube's "most replayed" graph for the playing link (drawn over the seek
+    /// bar while hovering it)
+    pub(crate) heatmap: Option<Arc<online::Heatmap>>,
     /// What the current file's picture is (a song without one, with a cover, a
     /// video); songs get the visualizer / album-art screen
     video_kind: VideoKind,
@@ -743,6 +746,7 @@ impl FluentMediaPlayer {
             link_retry: None,
             retried_url: None,
             link_thumbs: None,
+            heatmap: None,
             video_kind: VideoKind::Unknown,
             song_title: String::new(),
             song_artist: String::new(),
@@ -977,6 +981,7 @@ impl FluentMediaPlayer {
         self.eof = false;
         self.chapters = Arc::new(Vec::new());
         self.link_thumbs = None;
+        self.heatmap = None;
         self.live = false;
         self.video_kind = VideoKind::Unknown;
         if media_kind(path) == Some(MediaKind::Music) && !is_url(path) {
@@ -1812,6 +1817,11 @@ impl eframe::App for FluentMediaPlayer {
             }
             self.live = is_url(&self.current_file)
                 && snap.link_info.as_ref().is_some_and(|li| li.url == self.current_file && li.live);
+            self.heatmap = snap
+                .link_info
+                .as_ref()
+                .filter(|li| is_url(&self.current_file) && li.url == self.current_file && li.error.is_none())
+                .and_then(|li| li.heatmap.clone());
             if is_url(&self.current_file) && snap.path == self.current_file && !snap.media_title.is_empty() {
                 self.media_title = snap.media_title.clone();
             }

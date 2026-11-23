@@ -311,6 +311,46 @@ pub(crate) struct LinkInfo {
     pub(crate) preview: Option<PreviewStream>,
     /// A live stream (Twitch, a YouTube live...): no end, so no seeking along a bar
     pub(crate) live: bool,
+    /// YouTube's "most replayed" graph, when it has one
+    pub(crate) heatmap: Option<std::sync::Arc<Heatmap>>,
+}
+
+/// How much each stretch of a video gets replayed (YouTube's "most replayed"):
+/// equal stretches from the start to `end`, each 0..1 (1: the most replayed)
+#[derive(Debug, PartialEq)]
+pub(crate) struct Heatmap {
+    pub(crate) values: Vec<f32>,
+    pub(crate) end: f64,
+}
+
+impl Heatmap {
+    /// The graph's height at `secs`, smoothed between the stretches (0..1)
+    pub(crate) fn at(&self, secs: f64) -> f32 {
+        let n = self.values.len();
+        if n == 0 || self.end <= 0.0 {
+            return 0.0;
+        }
+        // (Catmull-Rom through the middles of the stretches)
+        let u = (secs / self.end * n as f64 - 0.5).clamp(0.0, (n - 1) as f64);
+        let i = (u.floor() as usize).min(n - 1);
+        let f = (u - i as f64) as f32;
+        let v = |k: isize| self.values[k.clamp(0, n as isize - 1) as usize];
+        let (p0, p1, p2, p3) = (v(i as isize - 1), v(i as isize), v(i as isize + 1), v(i as isize + 2));
+        let y = 0.5 * (2.0 * p1 + (p2 - p0) * f + (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * f * f + (3.0 * p1 - p0 - 3.0 * p2 + p3) * f * f * f);
+        y.clamp(0.0, 1.0)
+    }
+}
+
+/// yt-dlp's "heatmap": a list of {start_time, end_time, value}
+fn parse_heatmap(j: &serde_json::Value) -> Option<std::sync::Arc<Heatmap>> {
+    let points = j["heatmap"].as_array()?;
+    let values: Vec<f32> = points.iter().map(|p| p["value"].as_f64().unwrap_or(0.0).clamp(0.0, 1.0) as f32).collect();
+    let end = points.last()?["end_time"].as_f64()?;
+    // (a flat or missing graph says nothing)
+    if values.len() < 10 || end <= 0.0 || values.iter().all(|&v| v <= 0.0) {
+        return None;
+    }
+    Some(std::sync::Arc::new(Heatmap { values, end }))
 }
 
 /// A low-resolution video stream the thumbnail player can open directly
@@ -444,7 +484,8 @@ pub(crate) fn parse_link_result(text: &str) -> Option<LinkInfo> {
         })
     };
     let live = j["is_live"].as_bool() == Some(true) || text(&j["live_status"]).as_deref() == Some("is_live");
-    Some(LinkInfo { url: String::new(), error: None, rows, preview, live })
+    let heatmap = if live { None } else { parse_heatmap(&j) };
+    Some(LinkInfo { url: String::new(), error: None, rows, preview, live, heatmap })
 }
 
 /// "20240312" → "12 Mar 2024"
