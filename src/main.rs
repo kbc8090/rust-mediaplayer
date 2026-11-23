@@ -852,6 +852,11 @@ impl FluentMediaPlayer {
         self.playlist_selected = selected;
         self.playlist_shuffle = false;
         self.play_order.clear();
+        // (files dropped / opened together: show what's in it straight away)
+        if selected {
+            self.adjust_ui.playlist_open = true;
+            self.adjust_ui.playlist_scroll = true;
+        }
         // (already playing the first one, e.g. the first of several opened from
         // Explorer: carry on, don't start it again)
         let playing_it = self.has_file && self.current_file == first;
@@ -1975,6 +1980,8 @@ impl eframe::App for FluentMediaPlayer {
                 let mut files: Vec<PathBuf> = std::mem::take(&mut self.arriving).into_iter().filter(|s| is_media_file(s)).map(PathBuf::from).collect();
                 if files.len() > 1 {
                     files.sort_by(|a, b| natural_cmp(&a.file_name().unwrap_or_default().to_string_lossy(), &b.file_name().unwrap_or_default().to_string_lossy()));
+                    // (in the order the Explorer window shows them, when it can tell us)
+                    taskbar::sort_like_explorer(&mut files);
                     let entries: Vec<PlaylistEntry> = files.into_iter().map(|path| PlaylistEntry { path, title: None, secs: None }).collect();
                     self.start_playlist(PathBuf::from("Selected files"), entries, true);
                 }
@@ -2254,11 +2261,13 @@ impl eframe::App for FluentMediaPlayer {
         }
 
         // ── Actions ───────────────────────────────────────────────────────────
-        // Several files dropped at once: a playlist of them, in Explorer's name order
+        // Several files dropped at once: a playlist of them, in the order the
+        // Explorer window they came from shows them (else by name)
         let media: Vec<&String> = inp.dropped.iter().filter(|s| is_media_file(s)).collect();
         if media.len() > 1 {
             let mut files: Vec<PathBuf> = media.iter().map(PathBuf::from).collect();
             files.sort_by(|a, b| natural_cmp(&a.file_name().unwrap_or_default().to_string_lossy(), &b.file_name().unwrap_or_default().to_string_lossy()));
+            taskbar::sort_like_explorer(&mut files);
             let entries: Vec<PlaylistEntry> = files.into_iter().map(|path| PlaylistEntry { path, title: None, secs: None }).collect();
             self.start_playlist(PathBuf::from("Dropped files"), entries, true);
         } else {

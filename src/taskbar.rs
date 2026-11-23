@@ -1489,3 +1489,179 @@ fn make_icon(g: Glyph) -> Option<isize> {
         (icon != 0).then_some(icon)
     }
 }
+
+// ── Explorer's order for files opened / dropped together ──────────────────────
+// Explorer hands over several files in no useful order (dropped: its own
+// internal order; "Open": one launch per file, a moment apart). The order the
+// user sees is the open Explorer window's (sorted by date, grouped, …), so ask
+// the window whose selection holds those files: its view lists the selected
+// items in the order it shows them.
+
+#[link(name = "ole32")]
+unsafe extern "system" {
+    fn CoUninitialize();
+}
+
+/// A VARIANT holding a 32-bit number (VT_I4); 24 bytes on 64-bit Windows
+#[repr(C)]
+struct VariantI4 {
+    vt: u16,
+    reserved: [u16; 3],
+    value: i64,
+    rest: i64,
+}
+
+/// {9BA05972-F6A8-11CF-A442-00A0C90A8F39}
+const CLSID_SHELL_WINDOWS: Guid = Guid { data1: 0x9BA0_5972, data2: 0xF6A8, data3: 0x11CF, data4: [0xA4, 0x42, 0x00, 0xA0, 0xC9, 0x0A, 0x8F, 0x39] };
+/// {85CB6900-4D95-11CF-960C-0080C7F4EE85}
+const IID_ISHELL_WINDOWS: Guid = Guid { data1: 0x85CB_6900, data2: 0x4D95, data3: 0x11CF, data4: [0x96, 0x0C, 0x00, 0x80, 0xC7, 0xF4, 0xEE, 0x85] };
+/// {6D5140C1-7436-11CE-8034-00AA006009FA}
+const IID_ISERVICE_PROVIDER: Guid = Guid { data1: 0x6D51_40C1, data2: 0x7436, data3: 0x11CE, data4: [0x80, 0x34, 0x00, 0xAA, 0x00, 0x60, 0x09, 0xFA] };
+/// SID_STopLevelBrowser {4C96BE40-915C-11CF-99D3-00AA004AE837}
+const SID_TOP_LEVEL_BROWSER: Guid = Guid { data1: 0x4C96_BE40, data2: 0x915C, data3: 0x11CF, data4: [0x99, 0xD3, 0x00, 0xAA, 0x00, 0x4A, 0xE8, 0x37] };
+/// {000214E2-0000-0000-C000-000000000046}
+const IID_ISHELL_BROWSER: Guid = Guid { data1: 0x0002_14E2, data2: 0x0000, data3: 0x0000, data4: [0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46] };
+/// {CDE725B0-CCC9-4519-917E-325D72FAB4CE}
+const IID_IFOLDER_VIEW: Guid = Guid { data1: 0xCDE7_25B0, data2: 0xCCC9, data3: 0x4519, data4: [0x91, 0x7E, 0x32, 0x5D, 0x72, 0xFA, 0xB4, 0xCE] };
+/// {B63EA76D-1F85-456F-A19C-48159EFA858B}
+const IID_ISHELL_ITEM_ARRAY: Guid = Guid { data1: 0xB63E_A76D, data2: 0x1F85, data3: 0x456F, data4: [0xA1, 0x9C, 0x48, 0x15, 0x9E, 0xFA, 0x85, 0x8B] };
+
+// vtable slots: IShellWindows (IDispatch 3-6) get_Count 7, Item 8;
+// IServiceProvider QueryService 3; IShellBrowser (IOleWindow 3-4)
+// QueryActiveShellView 15; IFolderView Items 8; IShellItemArray GetCount 7,
+// GetItemAt 8
+const SVGIO_SELECTION: u32 = 0x1;
+const SVGIO_FLAG_VIEWORDER: u32 = 0x8000_0000;
+
+/// A COM object that's released when dropped
+struct Com(*mut c_void);
+
+impl Drop for Com {
+    fn drop(&mut self) {
+        unsafe {
+            let release: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(method(self.0, 2));
+            release(self.0);
+        }
+    }
+}
+
+impl Com {
+    fn new(p: *mut c_void) -> Option<Com> {
+        (!p.is_null()).then_some(Com(p))
+    }
+
+    /// QueryInterface
+    unsafe fn query(&self, iid: &Guid) -> Option<Com> {
+        let qi: unsafe extern "system" fn(*mut c_void, *const Guid, *mut *mut c_void) -> i32 = std::mem::transmute(method(self.0, 0));
+        let mut out = std::ptr::null_mut();
+        if qi(self.0, iid, &mut out) < 0 {
+            return None;
+        }
+        Com::new(out)
+    }
+}
+
+/// Sort `files` (several dropped / opened together) the way the Explorer window
+/// they were selected in shows them. Files that window doesn't list keep their
+/// order, after the rest. Leaves them alone if no open Explorer window has them
+/// all selected (e.g. dragged from the desktop).
+pub fn sort_like_explorer(files: &mut [std::path::PathBuf]) {
+    let wanted: Vec<String> = files.iter().map(|f| f.to_string_lossy().to_lowercase()).collect();
+    // (asked on another thread, with a time limit: a busy Explorer mustn't hold
+    // up the player)
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let order = unsafe {
+            CoInitializeEx(std::ptr::null_mut(), 0x0 /* COINIT_MULTITHREADED */);
+            let order = explorer_selection(&wanted);
+            CoUninitialize();
+            order
+        };
+        let _ = tx.send(order);
+    });
+    let Ok(Some(order)) = rx.recv_timeout(Duration::from_millis(700)) else { return };
+    files.sort_by_key(|f| {
+        let f = f.to_string_lossy().to_lowercase();
+        order.iter().position(|o| *o == f).unwrap_or(usize::MAX)
+    });
+}
+
+/// The selection, in view order (paths in lower case), of the first Explorer
+/// window whose selection includes every one of `wanted`
+unsafe fn explorer_selection(wanted: &[String]) -> Option<Vec<String>> {
+    let mut out = std::ptr::null_mut();
+    if CoCreateInstance(&CLSID_SHELL_WINDOWS, std::ptr::null_mut(), 0x17 /* CLSCTX_ALL */, &IID_ISHELL_WINDOWS, &mut out) < 0 {
+        return None;
+    }
+    let windows = Com::new(out)?;
+    let get_count: unsafe extern "system" fn(*mut c_void, *mut i32) -> i32 = std::mem::transmute(method(windows.0, 7));
+    let item: unsafe extern "system" fn(*mut c_void, VariantI4, *mut *mut c_void) -> i32 = std::mem::transmute(method(windows.0, 8));
+    let mut count = 0;
+    if get_count(windows.0, &mut count) < 0 {
+        return None;
+    }
+    for i in 0..count.min(64) {
+        let mut out = std::ptr::null_mut();
+        let index = VariantI4 { vt: 3 /* VT_I4 */, reserved: [0; 3], value: i as i64, rest: 0 };
+        if item(windows.0, index, &mut out) < 0 {
+            continue;
+        }
+        let Some(window) = Com::new(out) else { continue };
+        if let Some(selection) = window_selection(&window) {
+            if wanted.iter().all(|w| selection.contains(w)) {
+                return Some(selection);
+            }
+        }
+    }
+    None
+}
+
+/// One Explorer window's selected items, in the order it shows them
+unsafe fn window_selection(window: &Com) -> Option<Vec<String>> {
+    let services = window.query(&IID_ISERVICE_PROVIDER)?;
+    let query_service: unsafe extern "system" fn(*mut c_void, *const Guid, *const Guid, *mut *mut c_void) -> i32 =
+        std::mem::transmute(method(services.0, 3));
+    let mut out = std::ptr::null_mut();
+    if query_service(services.0, &SID_TOP_LEVEL_BROWSER, &IID_ISHELL_BROWSER, &mut out) < 0 {
+        return None;
+    }
+    let browser = Com::new(out)?;
+    let active_view: unsafe extern "system" fn(*mut c_void, *mut *mut c_void) -> i32 = std::mem::transmute(method(browser.0, 15));
+    let mut out = std::ptr::null_mut();
+    if active_view(browser.0, &mut out) < 0 {
+        return None;
+    }
+    let view = Com::new(out)?;
+    let folder_view = view.query(&IID_IFOLDER_VIEW)?;
+    let items: unsafe extern "system" fn(*mut c_void, u32, *const Guid, *mut *mut c_void) -> i32 = std::mem::transmute(method(folder_view.0, 8));
+    let mut out = std::ptr::null_mut();
+    if items(folder_view.0, SVGIO_SELECTION | SVGIO_FLAG_VIEWORDER, &IID_ISHELL_ITEM_ARRAY, &mut out) < 0 {
+        return None; // (nothing selected)
+    }
+    let array = Com::new(out)?;
+    let get_count: unsafe extern "system" fn(*mut c_void, *mut u32) -> i32 = std::mem::transmute(method(array.0, 7));
+    let get_item: unsafe extern "system" fn(*mut c_void, u32, *mut *mut c_void) -> i32 = std::mem::transmute(method(array.0, 8));
+    let mut count = 0;
+    if get_count(array.0, &mut count) < 0 {
+        return None;
+    }
+    let mut paths = Vec::new();
+    for i in 0..count.min(5000) {
+        let mut out = std::ptr::null_mut();
+        if get_item(array.0, i, &mut out) < 0 {
+            continue;
+        }
+        let Some(item) = Com::new(out) else { continue };
+        let display_name: unsafe extern "system" fn(*mut c_void, u32, *mut *mut u16) -> i32 = std::mem::transmute(method(item.0, VT_GET_DISPLAY_NAME));
+        let mut name: *mut u16 = std::ptr::null_mut();
+        if display_name(item.0, SIGDN_FILESYSPATH, &mut name) >= 0 && !name.is_null() {
+            let mut n = 0;
+            while n < 32768 && *name.add(n) != 0 {
+                n += 1;
+            }
+            paths.push(String::from_utf16_lossy(std::slice::from_raw_parts(name, n)).to_lowercase());
+            CoTaskMemFree(name as *mut c_void);
+        }
+    }
+    Some(paths)
+}
