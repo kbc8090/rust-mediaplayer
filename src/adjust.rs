@@ -1954,7 +1954,7 @@ fn playing_mark(p: &egui::Painter, right: f32, bottom: f32, levels: [f32; 3], co
 /// Width of the playlist's tab on the window's right edge, its height, and the
 /// gap between it and the open panel
 const TAB_W: f32 = 14.0;
-const TAB_H: f32 = 116.0;
+const TAB_H: f32 = 126.0;
 const TAB_GAP: f32 = 6.0;
 
 /// The playlist panel on the right: every entry (click one to play it), and its
@@ -2021,7 +2021,8 @@ pub fn draw_playlist(
         }
         let fill = if hot { Color32::from_rgb(60, 44, 58) } else { Color32::from_rgb(40, 38, 46) };
         p.rect_filled(body, round, fill.gamma_multiply(0.92 * a));
-        let edge = if hot { accent.gamma_multiply(0.8) } else { Color32::from_white_alpha((36.0 * a) as u8) };
+        // (the same grey edge as the menus and panels; the accent colour on hover)
+        let edge = if hot { accent.gamma_multiply(0.8) } else { glass::edge(Color32::from_rgba_premultiplied(30, 30, 30, 30)).gamma_multiply(a) };
         p.with_clip_rect(tab).rect_stroke(body.shrink(0.5), round, Stroke::new(1.0_f32, edge));
         let c = tab.center();
         let d = if ui_state.playlist_open { 1.0 } else { -1.0 };

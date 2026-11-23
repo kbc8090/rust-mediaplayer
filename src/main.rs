@@ -467,6 +467,10 @@ struct FluentMediaPlayer {
     song_artist: String,
     song_album: String,
     song_year: String,
+    /// This song's tags have been read (mpv has opened it), and how many lines
+    /// the last song's details took
+    song_meta_ready: bool,
+    song_lines: usize,
     song_codec: String,
     song_rate: i64,
     /// A variable-bitrate song's bitrate as it plays (kb/s), and when it was last
@@ -777,6 +781,8 @@ impl FluentMediaPlayer {
             song_artist: String::new(),
             song_album: String::new(),
             song_year: String::new(),
+            song_meta_ready: false,
+            song_lines: 0,
             song_codec: String::new(),
             song_rate: 0,
             song_kbps_live: None,
@@ -1009,6 +1015,7 @@ impl FluentMediaPlayer {
         self.time_pos = 0.0;
         self.seek_target = None;
         self.song_kbps_live = None;
+        self.song_meta_ready = false;
         self.eof = false;
         self.chapters = Arc::new(Vec::new());
         self.link_thumbs = None;
@@ -1514,7 +1521,14 @@ impl FluentMediaPlayer {
         // The song's details: its title tag (else the file name), artist, album
         let title = if self.song_title.is_empty() { self.file_name() } else { self.song_title.clone() };
         let position = self.playlist_position();
-        let name = visualizer::SongName { song: &title, artist: &self.song_artist, album: &self.song_album, year: &self.song_year, playlist: position.as_deref() };
+        // (until this song's tags are read, room for as many lines as the last
+        // song had: songs from one album keep the same layout throughout)
+        let min_lines = if self.song_meta_ready { 0 } else { self.song_lines };
+        let name = visualizer::SongName { song: &title, artist: &self.song_artist, album: &self.song_album, year: &self.song_year, playlist: position.as_deref(), min_lines };
+        let lines = name.lines();
+        if self.song_meta_ready {
+            self.song_lines = lines;
+        }
         let p = ui.painter();
         let playing = self.is_playing && !self.eof;
 
@@ -1559,7 +1573,7 @@ impl FluentMediaPlayer {
         }
         if !drawn {
             // (a window too small for the circle gets the bars)
-            let name = visualizer::SongName { song: &title, artist: &self.song_artist, album: &self.song_album, year: &self.song_year, playlist: position.as_deref() };
+            let name = visualizer::SongName { song: &title, artist: &self.song_artist, album: &self.song_album, year: &self.song_year, playlist: position.as_deref(), min_lines };
             self.bars.draw_visualizer(p, rect, name, self.accent, style == adjust::VisStyle::Wave);
         }
         // Keep the bars moving (at the screen's refresh rate; the 6 ms is only a
@@ -1937,6 +1951,9 @@ impl eframe::App for FluentMediaPlayer {
                     if mine != theirs {
                         mine.clone_from(theirs);
                     }
+                }
+                if snap.path == self.current_file && (snap.duration > 0.0 || snap.eof) {
+                    self.song_meta_ready = true;
                 }
                 if self.song_codec != snap.audio_codec {
                     self.song_codec.clone_from(&snap.audio_codec);

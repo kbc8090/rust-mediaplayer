@@ -674,7 +674,7 @@ impl Bars {
         // (smaller than the space allows, so the bars have room to fly out),
         // and the bars up to 1.2 times its radius long; smaller still if the
         // space is short
-        const LONGEST: f32 = 1.2; // (of the ring's radius)
+        const LONGEST: f32 = 1.6; // (of the ring's radius)
         let r = (rect.height() * 0.127).min((side / 2.0 - gap) / (1.0 + LONGEST)).round();
         self.backdrop(&p, rect, accent, c.y);
         let acc = splash::rgb(accent);
@@ -694,7 +694,8 @@ impl Bars {
             let lv = self.level[k] * (1.0 - f) + self.level[(k + 1).min(BARS - 1)] * f;
             let dir = vec2(a.sin(), -a.cos());
             let r0 = r + gap;
-            let len = 4.0 * s + lv * r * LONGEST;
+            // (lifted a little, so middling levels reach further out too)
+            let len = 4.0 * s + lv.powf(0.85) * r * LONGEST;
             let pts = [c + dir * r0, c + dir * (r0 + len * 0.5), c + dir * (r0 + len)];
             let col = splash::ribbon_colour(acc, u);
             let glow = splash::light(col, 0.08 + 0.12 * lv);
@@ -841,6 +842,9 @@ pub(crate) struct SongName<'a> {
     pub(crate) year: &'a str,
     /// "3 of 12" in a playlist
     pub(crate) playlist: Option<&'a str>,
+    /// Lines to make room for at least (the last song's, while this one's
+    /// details are still being read: so the layout doesn't jump twice)
+    pub(crate) min_lines: usize,
 }
 
 impl SongName<'_> {
@@ -859,7 +863,7 @@ impl SongName<'_> {
     }
 
     pub(crate) fn lines(&self) -> usize {
-        self.rows().len()
+        self.rows().len().max(self.min_lines)
     }
 }
 
