@@ -231,6 +231,72 @@ pub fn clipboard_text() -> Option<String> {
 unsafe extern "system" {
     fn CreateMutexW(attributes: *const c_void, initial_owner: i32, name: *const u16) -> isize;
     fn GetLastError() -> u32;
+    fn WaitForSingleObject(handle: isize, ms: u32) -> u32;
+    fn ReleaseMutex(mutex: isize) -> i32;
+    fn CreateFileMappingW(file: isize, attributes: *const c_void, protect: u32, size_high: u32, size_low: u32, name: *const u16) -> isize;
+    fn MapViewOfFile(mapping: isize, access: u32, offset_high: u32, offset_low: u32, bytes: usize) -> *mut u64;
+    fn GetTickCount64() -> u64;
+    fn GetCurrentProcessId() -> u32;
+}
+
+#[link(name = "user32")]
+unsafe extern "system" {
+    fn GetWindowThreadProcessId(hwnd: isize, pid: *mut u32) -> u32;
+}
+
+/// Several launches within this long of each other count as one (Explorer's
+/// "Open" on several selected files starts the player once per file)
+const BURST_MS: u64 = 1500;
+
+/// With multiple windows allowed: is another player starting right now (a burst
+/// of launches)? Then returns its process id, to hand this launch's files to.
+/// Otherwise notes this launch as the start of a possible burst and returns None.
+/// (Shared between launches in a small named memory block: the last launch's
+/// time, and the process that started the burst.)
+unsafe fn burst_receiver() -> Option<u32> {
+    let lock = CreateMutexW(std::ptr::null(), 0, wide("Local\\RustMediaPlayer.LaunchLock").as_ptr());
+    if lock == 0 {
+        return None;
+    }
+    WaitForSingleObject(lock, 2000);
+    // (kept open for as long as this process runs, so later launches find it)
+    let map = CreateFileMappingW(-1, std::ptr::null(), 0x04 /* PAGE_READWRITE */, 0, 16, wide("Local\\RustMediaPlayer.LastLaunch").as_ptr());
+    let view = if map != 0 { MapViewOfFile(map, 0x0002 | 0x0004 /* write | read */, 0, 0, 16) } else { std::ptr::null_mut() };
+    let mut receiver = None;
+    if !view.is_null() {
+        let now = GetTickCount64();
+        let (last, pid) = (*view, *view.add(1) as u32);
+        if pid != 0 && now.saturating_sub(last) < BURST_MS {
+            receiver = Some(pid); // part of a burst: keep it going
+        } else {
+            *view.add(1) = GetCurrentProcessId() as u64; // a new one, started by this player
+        }
+        *view = now;
+    }
+    ReleaseMutex(lock);
+    receiver
+}
+
+/// The player window of process `pid` (0 if none yet)
+unsafe fn find_window_of(pid: u32) -> isize {
+    struct Search {
+        tag: Vec<u16>,
+        pid: u32,
+        found: isize,
+    }
+    unsafe extern "system" fn check(hwnd: isize, lparam: isize) -> i32 {
+        let s = &mut *(lparam as *mut Search);
+        let mut owner = 0u32;
+        GetWindowThreadProcessId(hwnd, &mut owner);
+        if owner == s.pid && GetPropW(hwnd, s.tag.as_ptr()) != 0 {
+            s.found = hwnd;
+            return 0;
+        }
+        1
+    }
+    let mut s = Search { tag: wide(WINDOW_TAG), pid, found: 0 };
+    EnumWindows(check, &mut s as *mut Search as isize);
+    s.found
 }
 
 #[link(name = "comdlg32")]
@@ -501,19 +567,27 @@ pub fn take_forwarded() -> Vec<String> {
 /// Called at startup, before any window exists. If the player is already running,
 /// hand it `files` (it opens them in place of what's playing), bring it to the front and
 /// return true: this process should then just exit.
-/// With `forward` false (multiple windows allowed) it never hands over, but still
-/// marks this player as running for later launches.
+/// With `forward` false (multiple windows allowed) it only hands over when it's
+/// part of a burst of launches (several files opened together from Explorer);
+/// otherwise it still marks this player as running for later launches.
 pub fn forward_to_running_instance(files: &[String], forward: bool) -> bool {
     unsafe {
         // The mutex lives as long as this process; a second process finds it taken
         let mutex = CreateMutexW(std::ptr::null(), 0, wide("Local\\RustMediaPlayer.SingleWindow").as_ptr());
-        if !forward || mutex == 0 || GetLastError() != 183 /* ERROR_ALREADY_EXISTS */ {
+        let running = mutex != 0 && GetLastError() == 183 /* ERROR_ALREADY_EXISTS */;
+        // Multiple windows allowed: still one window for files opened together
+        // from Explorer (a burst of launches), handed to the player that started it
+        let burst = if forward { None } else { burst_receiver() };
+        if !running || (!forward && burst.is_none()) || files.is_empty() && burst.is_some() {
             return false;
         }
         // The other player may still be starting up: give its window a moment
         let mut hwnd = 0;
         for _ in 0..30 {
-            hwnd = find_player_window();
+            hwnd = match burst {
+                Some(pid) => find_window_of(pid),
+                None => find_player_window(),
+            };
             if hwnd != 0 {
                 break;
             }
