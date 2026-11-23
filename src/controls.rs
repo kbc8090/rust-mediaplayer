@@ -495,9 +495,10 @@ pub(crate) fn draw_top_bar(app: &mut FluentMediaPlayer, ctx: &egui::Context, t: 
             let mc = pos2(MENU_X, MENU_Y);
             let menu = hit_at(ui, mc, "menu", "Menu", t, false);
             app.menu_anchor = menu.rect;
-            if app.main_menu && app.menu_at.is_none() && !menu.hovered() {
-                // keep it highlighted while its menu is open
-                p.rect_filled(Rect::from_center_size(mc, vec2(BTN_BOX, BTN_BOX)), 8.0, Color32::from_white_alpha((8.0 * t) as u8));
+            if app.main_menu && app.menu_at.is_none() {
+                // Its menu open: the button stays lit, as if pressed (the same as the
+                // Playlist button with its panel open; plus the hover's own on top)
+                p.rect_filled(Rect::from_center_size(mc, vec2(BTN_BOX, BTN_BOX)), 8.0, Color32::from_white_alpha((13.0 * t) as u8));
             }
             for dy in [-4.5, 0.0, 4.5] {
                 p.line_segment([pos2(mc.x - 7.0, mc.y + dy), pos2(mc.x + 7.0, mc.y + dy)], Stroke::new(SW, white));

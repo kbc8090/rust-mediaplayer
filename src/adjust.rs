@@ -1849,29 +1849,36 @@ fn progress_fill(p: &egui::Painter, r: Rect, frac: f32, accent: Color32) {
     if frac > 0.99 {
         return;
     }
-    // Glow: fading in towards the edge (additive light: alpha 0)
-    let glow_w = (18.0_f32).min(x - r.left());
+    // Glow: fading in towards the edge (additive light: alpha 0), along a smooth
+    // curve over a longer stretch so it has no visible start
+    let glow_w = (36.0_f32).min(x - r.left());
     let light = |k: f32| {
         let [r0, g0, b0, _] = accent.to_array();
         Color32::from_rgba_premultiplied((r0 as f32 * k) as u8, (g0 as f32 * k) as u8, (b0 as f32 * k) as u8, 0)
     };
     let mut m = egui::Mesh::default();
-    let g = Rect::from_min_max(pos2(x - glow_w, r.top() + 1.0), pos2(x, r.bottom() - 1.0));
-    m.colored_vertex(g.left_top(), Color32::TRANSPARENT);
-    m.colored_vertex(g.right_top(), light(0.45));
-    m.colored_vertex(g.right_bottom(), light(0.45));
-    m.colored_vertex(g.left_bottom(), Color32::TRANSPARENT);
-    m.add_triangle(0, 1, 2);
-    m.add_triangle(0, 2, 3);
+    const STEPS: u32 = 12;
+    for i in 0..=STEPS {
+        let s = i as f32 / STEPS as f32;
+        // (eased: barely there for most of the way, then rising to the edge)
+        let k = 0.45 * s * s * s;
+        let gx = x - glow_w * (1.0 - s);
+        m.colored_vertex(pos2(gx, r.top()), light(k));
+        m.colored_vertex(pos2(gx, r.bottom()), light(k));
+        if i > 0 {
+            let v = 2 * i;
+            m.add_triangle(v - 2, v - 1, v);
+            m.add_triangle(v - 1, v, v + 1);
+        }
+    }
     p.add(egui::Shape::mesh(m));
-    // The spark: a bright 1 px line, softer at its ends
+    // The spark: a bright 1 px line, the row's full height
     let spark = Color32::from_rgb(
         (accent.r() as u16 * 2 / 5 + 153) as u8,
         (accent.g() as u16 * 2 / 5 + 153) as u8,
         (accent.b() as u16 * 2 / 5 + 153) as u8,
     );
-    p.rect_filled(Rect::from_min_max(pos2(x - 1.0, r.top() + 3.0), pos2(x, r.bottom() - 3.0)), 0.0, spark);
-    p.rect_filled(Rect::from_min_max(pos2(x - 1.0, r.top() + 1.0), pos2(x, r.bottom() - 1.0)), 0.0, spark.gamma_multiply(0.35));
+    p.rect_filled(Rect::from_min_max(pos2(x - 1.0, r.top()), pos2(x, r.bottom())), 0.0, spark);
 }
 
 /// The little three-bar "playing" mark (heights 0…1)
@@ -1969,10 +1976,12 @@ pub fn draw_playlist(
                     if resp.hovered() {
                         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                     }
+                    // (already played: the title, number and length all a dimmer grey)
+                    let played = !cur && i < current && grey_played;
                     let (font, col) = if cur {
                         (semibold(12.5), TEXT)
-                    } else if i < current && grey_played {
-                        (FontId::proportional(12.5), Color32::from_rgb(140, 142, 150))
+                    } else if played {
+                        (FontId::proportional(12.5), Color32::from_rgb(122, 124, 132))
                     } else {
                         (FontId::proportional(12.5), Color32::from_rgb(222, 222, 226))
                     };
@@ -1980,12 +1989,14 @@ pub fn draw_playlist(
                     if cur {
                         playing_mark(p, num_r, r.center().y + 6.0, playing, accent);
                     } else {
-                        p.text(pos2(num_r, r.center().y), Align2::RIGHT_CENTER, (i + 1).to_string(), FontId::proportional(11.0), Color32::from_rgb(125, 128, 138));
+                        let num_col = if played { Color32::from_rgb(96, 98, 106) } else { Color32::from_rgb(125, 128, 138) };
+                        p.text(pos2(num_r, r.center().y), Align2::RIGHT_CENTER, (i + 1).to_string(), FontId::proportional(11.0), num_col);
                     }
                     let len = row.secs.map(clock).unwrap_or_default();
                     let len_w = if len.is_empty() { 0.0 } else { p.layout_no_wrap(len.clone(), FontId::proportional(11.5), DIM).size().x + 10.0 };
                     if !len.is_empty() {
-                        p.text(pos2(r.right() - 10.0, r.center().y), Align2::RIGHT_CENTER, len, FontId::proportional(11.5), DIM);
+                        let len_col = if played { Color32::from_rgb(112, 114, 122) } else { DIM };
+                        p.text(pos2(r.right() - 10.0, r.center().y), Align2::RIGHT_CENTER, len, FontId::proportional(11.5), len_col);
                     }
                     let g = crate::controls::elide(p, &row.title, font, col, r.right() - 10.0 - len_w - (num_r + 10.0));
                     p.galley(pos2(num_r + 10.0, r.center().y - g.size().y / 2.0), g, col);
