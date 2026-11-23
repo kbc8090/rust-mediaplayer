@@ -772,7 +772,8 @@ pub fn draw_panel(ctx: &egui::Context, ui_state: &mut AdjustUi, a: &mut Adjust, 
     };
     let content_h: f32 = list.iter().map(row_h).sum();
     const TABS_H: f32 = 42.0;
-    let full_h = HEAD_H + TABS_H + content_h + 10.0;
+    // (6 px under the last row, as at its sides)
+    let full_h = HEAD_H + TABS_H + content_h + 6.0;
     let avail = (screen.bottom() - BOTTOM_GAP) - (screen.top() + PANEL_TOP);
     let h = full_h.min(avail.max(HEAD_H + TABS_H + ROW_H * 2.0));
     let w = PANEL_W.min(screen.width() - 16.0);
@@ -842,7 +843,10 @@ pub fn draw_panel(ctx: &egui::Context, ui_state: &mut AdjustUi, a: &mut Adjust, 
                 let p = ui.painter().clone();
                 match row {
                     Row::Sep => {
-                        p.line_segment([pos2(r.left() + 4.0, r.center().y), pos2(r.right() - 4.0, r.center().y)], Stroke::new(1.0_f32, LINE));
+                        // (the panel's full width, like every separator; kept to the
+                        // list's height so one scrolled away doesn't show over the tabs)
+                        let clip = Rect::from_min_max(pos2(rect.left(), list_rect.top()), pos2(rect.right(), list_rect.bottom()));
+                        p.with_clip_rect(clip).line_segment([pos2(rect.left() + 1.0, r.center().y), pos2(rect.right() - 1.0, r.center().y)], Stroke::new(1.0_f32, LINE));
                     }
                     Row::Section(title) => {
                         p.text(pos2(r.left() + 10.0, r.bottom() - 4.0), Align2::LEFT_BOTTOM, title.to_uppercase(), FontId::proportional(10.5), DIM);
@@ -1257,7 +1261,7 @@ pub fn draw_online(ctx: &egui::Context, ui_state: &mut AdjustUi, o: &mut crate::
         }
 
         let r = next_row(9.0);
-        p.line_segment([pos2(r.left() + 4.0, r.center().y), pos2(r.right() - 4.0, r.center().y)], Stroke::new(1.0_f32, LINE));
+        p.line_segment([pos2(rect.left() + 1.0, r.center().y), pos2(rect.right() - 1.0, r.center().y)], Stroke::new(1.0_f32, LINE));
 
         // Audio format
         let r = next_row(ROW_H);
@@ -1855,7 +1859,7 @@ fn progress_fill(p: &egui::Painter, r: Rect, frac: f32, accent: Color32) {
     // Glow: fading in towards the edge (additive light: alpha 0), along a smooth
     // curve so it has no visible start, brightest right at the edge. (No line at
     // the edge: the glow alone marks it.)
-    let glow_w = (36.0_f32).min(x - r.left());
+    let glow_w = (42.0_f32).min(x - r.left());
     let light = |k: f32| {
         let [r0, g0, b0, _] = accent.to_array();
         Color32::from_rgba_premultiplied((r0 as f32 * k) as u8, (g0 as f32 * k) as u8, (b0 as f32 * k) as u8, 0)
@@ -1865,7 +1869,7 @@ fn progress_fill(p: &egui::Painter, r: Rect, frac: f32, accent: Color32) {
     for i in 0..=STEPS {
         let s = i as f32 / STEPS as f32;
         // (eased: barely there for most of the way, then rising to the edge)
-        let k = 0.6 * s * s * s;
+        let k = 0.45 * s * s * s;
         let gx = x - glow_w * (1.0 - s);
         m.colored_vertex(pos2(gx, r.top()), light(k));
         m.colored_vertex(pos2(gx, r.bottom()), light(k));
@@ -1959,16 +1963,21 @@ pub fn draw_playlist(
         ui.allocate_ui_at_rect(list, |ui| {
             egui::ScrollArea::vertical().id_source("playlist_rows").max_height(list.height()).auto_shrink([false, false]).show(ui, |ui| {
                 ui.spacing_mut().item_spacing = vec2(0.0, 0.0);
+                // (short of the right edge, room for the scroll bar, only when it
+                // scrolls: otherwise the same 6 px gap both sides)
+                let scrolls = rows.len() as f32 * ITEM_H > list.height() + 0.5;
                 for (i, row) in rows.iter().enumerate() {
-                    // (a little short of the right edge: room for the scroll bar)
-                    let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width() - 8.0, ITEM_H), Sense::click_and_drag());
+                    let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width() - if scrolls { 8.0 } else { 0.0 }, ITEM_H), Sense::click_and_drag());
                     let p = ui.painter();
                     let cur = i == current;
+                    // (highlights 1 px in from the top and bottom: a 2 px gap between
+                    // a hovered row and the playing one next to it)
+                    let hl = r.shrink2(vec2(0.0, 1.0));
                     if cur {
-                        p.rect_filled(r, 5.0, accent.gamma_multiply(0.22));
-                        progress_fill(p, r, progress, accent);
+                        p.rect_filled(hl, 5.0, accent.gamma_multiply(0.22));
+                        progress_fill(p, hl, progress, accent);
                     } else if let Some(c) = state_fill(&resp) {
-                        p.rect_filled(r, 5.0, c);
+                        p.rect_filled(hl, 5.0, c);
                     }
                     if resp.hovered() {
                         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
@@ -2009,7 +2018,7 @@ pub fn draw_playlist(
 
         // The options
         let mut top = rect.top() + HEAD_H + list_h;
-        p.line_segment([pos2(rect.left() + 10.0, top + 4.5), pos2(rect.right() - 10.0, top + 4.5)], Stroke::new(1.0_f32, LINE));
+        p.line_segment([pos2(rect.left() + 1.0, top + 4.5), pos2(rect.right() - 1.0, top + 4.5)], Stroke::new(1.0_f32, LINE));
         top += 9.0;
         let mut shuffle = shuffle;
         let has_shuffle = shuffle.is_some();

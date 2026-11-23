@@ -178,7 +178,9 @@ pub(crate) const POPUP: egui::Order = egui::Order::Debug;
 
 pub(crate) const MENU_ITEM_H: f32 = 28.0;
 
-pub(crate) const MENU_PAD: f32 = 3.0;
+/// Gap between a menu's edge and its rows' highlights (the same all round as
+/// in the panels)
+pub(crate) const MENU_PAD: f32 = 6.0;
 
 pub(crate) const MENU_SEP_H: f32 = 7.0;
 
