@@ -400,6 +400,11 @@ struct FluentMediaPlayer {
     /// last one came
     arriving: Vec<String>,
     arriving_last: Option<std::time::Instant>,
+    /// A playlist started straight from Explorer's selection when the first of
+    /// several opened files arrived (the rest are on their way), and when
+    explorer_plan: Option<(Vec<String>, std::time::Instant)>,
+    /// That playlist still to be checked against the files that really came
+    plan_unchecked: bool,
     /// The window was maximized when last closed: re-apply it at startup
     start_max: bool,
     start_max_done: bool,
@@ -464,7 +469,7 @@ struct FluentMediaPlayer {
     song_codec: String,
     song_rate: i64,
     /// A variable-bitrate song's bitrate as it plays (kb/s), and when it was last
-    /// taken: shown afresh every 2.5 s, slow enough to read
+    /// taken: shown afresh every second (about as often as mpv works it out)
     song_kbps_live: Option<u32>,
     song_kbps_at: std::time::Instant,
     /// The top bar's song details: their widest so far for this song (and which
@@ -734,6 +739,8 @@ impl FluentMediaPlayer {
             // (several on the command line: a playlist of them too)
             arriving_last: startup_file.as_ref().map(|_| std::time::Instant::now()),
             arriving: startup_files,
+            explorer_plan: None,
+            plan_unchecked: false,
             startup_file,
             start_max: saved.maximized,
             start_max_done: false,
@@ -1046,7 +1053,40 @@ impl FluentMediaPlayer {
             }
             return;
         }
+        // (one of a playlist just started from Explorer's selection, only
+        // arriving late: already in it)
+        let lower = path.to_lowercase();
+        if self.explorer_plan.as_ref().is_some_and(|(files, at)| at.elapsed() < std::time::Duration::from_secs(10) && files.iter().any(|f| f.to_lowercase() == lower)) {
+            return;
+        }
         self.arriving = vec![path.clone()];
+        if self.render_ctx_initialized {
+            self.open_first_arrival(path);
+        } else {
+            self.startup_file = Some(path);
+        }
+    }
+
+    /// The first file opened from outside. When it's one of several selected
+    /// in Explorer (its "Open" starts the player once per file, a moment
+    /// apart), the playlist of them all starts at once, from the first in
+    /// Explorer's order: rather than this file playing for a moment and then
+    /// the playlist starting over from its first.
+    fn open_first_arrival(&mut self, path: String) {
+        if !is_url(&path) {
+            if let Some(selection) = taskbar::explorer_selection_with(vec![path.clone()]) {
+                let media: Vec<String> = selection.into_iter().filter(|s| is_media_file(s)).collect();
+                if media.len() > 1 {
+                    let entries: Vec<PlaylistEntry> = media.iter().map(|p| PlaylistEntry { path: PathBuf::from(p), title: None, secs: None }).collect();
+                    self.start_playlist(PathBuf::from("Selected files"), entries, true);
+                    self.explorer_plan = Some((media, std::time::Instant::now()));
+                    self.plan_unchecked = true;
+                    return;
+                }
+            }
+        }
+        self.explorer_plan = None;
+        self.plan_unchecked = false;
         self.open_external(path);
     }
 
@@ -1879,7 +1919,7 @@ impl eframe::App for FluentMediaPlayer {
                 }
                 self.song_rate = snap.audio_rate;
                 if snap.path == self.current_file && snap.audio_bitrate > 0.0 && !snap.paused {
-                    let due = now.saturating_duration_since(self.song_kbps_at) >= std::time::Duration::from_millis(2500);
+                    let due = now.saturating_duration_since(self.song_kbps_at) >= std::time::Duration::from_millis(1000);
                     if self.song_kbps_live.is_none() || due {
                         self.song_kbps_live = Some((snap.audio_bitrate / 1000.0).round() as u32);
                         self.song_kbps_at = now;
@@ -2053,7 +2093,26 @@ impl eframe::App for FluentMediaPlayer {
             if t.elapsed() > std::time::Duration::from_millis(450) && self.render_ctx_initialized {
                 self.arriving_last = None;
                 let mut files: Vec<PathBuf> = std::mem::take(&mut self.arriving).into_iter().filter(|s| is_media_file(s)).map(PathBuf::from).collect();
-                if files.len() > 1 {
+                // Already started from Explorer's selection: only if the files that
+                // really came are different (some selected ones open in other
+                // programs) does it change: to just those, or to the one alone
+                let mut planned_ok = false;
+                if std::mem::take(&mut self.plan_unchecked) {
+                    if let Some((plan, _)) = &self.explorer_plan {
+                        let key = |s: String| s.to_lowercase();
+                        let mut a: Vec<String> = files.iter().map(|f| key(f.to_string_lossy().into_owned())).collect();
+                        let mut b: Vec<String> = plan.iter().cloned().map(key).collect();
+                        a.sort();
+                        b.sort();
+                        planned_ok = a == b;
+                        if !planned_ok && files.len() == 1 {
+                            let one = files[0].to_string_lossy().into_owned();
+                            self.explorer_plan = None;
+                            self.open_external(one);
+                        }
+                    }
+                }
+                if !planned_ok && files.len() > 1 {
                     files.sort_by(|a, b| natural_cmp(&a.file_name().unwrap_or_default().to_string_lossy(), &b.file_name().unwrap_or_default().to_string_lossy()));
                     // (in the order the Explorer window shows them, when it can tell us)
                     taskbar::sort_like_explorer(&mut files);
@@ -2179,7 +2238,7 @@ impl eframe::App for FluentMediaPlayer {
 
         if self.render_ctx_initialized {
             if let Some(path) = self.startup_file.take() {
-                self.open_file(&path);
+                self.open_first_arrival(path);
             }
             if frame.gl().is_some() {
                 self.thumbs.init_gl(ctx, gl_proc_address);

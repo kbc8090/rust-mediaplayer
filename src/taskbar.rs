@@ -1566,9 +1566,21 @@ impl Com {
 /// order, after the rest. Leaves them alone if no open Explorer window has them
 /// all selected (e.g. dragged from the desktop).
 pub fn sort_like_explorer(files: &mut [std::path::PathBuf]) {
-    let wanted: Vec<String> = files.iter().map(|f| f.to_string_lossy().to_lowercase()).collect();
-    // (asked on another thread, with a time limit: a busy Explorer mustn't hold
-    // up the player)
+    let wanted: Vec<String> = files.iter().map(|f| f.to_string_lossy().into_owned()).collect();
+    let Some(order) = explorer_selection_with(wanted) else { return };
+    let order: Vec<String> = order.iter().map(|o| o.to_lowercase()).collect();
+    files.sort_by_key(|f| {
+        let f = f.to_string_lossy().to_lowercase();
+        order.iter().position(|o| *o == f).unwrap_or(usize::MAX)
+    });
+}
+
+/// Everything selected, in the order it shows them, in the open Explorer window
+/// whose selection includes all of `files` (None if there's no such window).
+/// Asked on another thread, with a time limit: a busy Explorer mustn't hold up
+/// the player.
+pub fn explorer_selection_with(files: Vec<String>) -> Option<Vec<String>> {
+    let wanted: Vec<String> = files.iter().map(|f| f.to_lowercase()).collect();
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let order = unsafe {
@@ -1579,15 +1591,11 @@ pub fn sort_like_explorer(files: &mut [std::path::PathBuf]) {
         };
         let _ = tx.send(order);
     });
-    let Ok(Some(order)) = rx.recv_timeout(Duration::from_millis(700)) else { return };
-    files.sort_by_key(|f| {
-        let f = f.to_string_lossy().to_lowercase();
-        order.iter().position(|o| *o == f).unwrap_or(usize::MAX)
-    });
+    rx.recv_timeout(Duration::from_millis(700)).ok().flatten()
 }
 
-/// The selection, in view order (paths in lower case), of the first Explorer
-/// window whose selection includes every one of `wanted`
+/// The selection, in view order, of the first Explorer window whose selection
+/// includes every one of `wanted` (given in lower case)
 unsafe fn explorer_selection(wanted: &[String]) -> Option<Vec<String>> {
     let mut out = std::ptr::null_mut();
     if CoCreateInstance(&CLSID_SHELL_WINDOWS, std::ptr::null_mut(), 0x17 /* CLSCTX_ALL */, &IID_ISHELL_WINDOWS, &mut out) < 0 {
@@ -1608,7 +1616,8 @@ unsafe fn explorer_selection(wanted: &[String]) -> Option<Vec<String>> {
         }
         let Some(window) = Com::new(out) else { continue };
         if let Some(selection) = window_selection(&window) {
-            if wanted.iter().all(|w| selection.contains(w)) {
+            let lower: Vec<String> = selection.iter().map(|s| s.to_lowercase()).collect();
+            if wanted.iter().all(|w| lower.contains(w)) {
                 return Some(selection);
             }
         }
@@ -1659,7 +1668,7 @@ unsafe fn window_selection(window: &Com) -> Option<Vec<String>> {
             while n < 32768 && *name.add(n) != 0 {
                 n += 1;
             }
-            paths.push(String::from_utf16_lossy(std::slice::from_raw_parts(name, n)).to_lowercase());
+            paths.push(String::from_utf16_lossy(std::slice::from_raw_parts(name, n)));
             CoTaskMemFree(name as *mut c_void);
         }
     }
