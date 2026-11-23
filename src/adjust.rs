@@ -59,14 +59,17 @@ pub enum VisStyle {
     Bars,
     /// The start screen's ribbon of lines, moved by the music
     Wave,
+    /// Bars round a ring, the song's cover inside it
+    Circle,
 }
 
 impl VisStyle {
-    const ALL: [VisStyle; 2] = [VisStyle::Bars, VisStyle::Wave];
+    const ALL: [VisStyle; 3] = [VisStyle::Bars, VisStyle::Wave, VisStyle::Circle];
     fn key(self) -> &'static str {
         match self {
             VisStyle::Bars => "bars",
             VisStyle::Wave => "wave",
+            VisStyle::Circle => "circle",
         }
     }
 }
@@ -778,8 +781,8 @@ fn rows(a: &Adjust, normalize: bool, hq: bool, tab: Tab, denoise_skipped: bool) 
                 let style = VisStyle::ALL.iter().position(|s| *s == a.vis_style).unwrap_or(0);
                 rows.push(Row::Choice(
                     "Style",
-                    "Bars: glowing bars, lows to highs from left to right. Wave: flowing lines that swell with the music, bass in the middle and highs out to the sides.",
-                    &["Bars", "Wave"],
+                    "Bars: glowing bars, lows to highs from left to right. Wave: flowing lines that swell with the music, bass in the middle and highs out to the sides. Circle: bars round a ring with the song's cover inside.",
+                    &["Bars", "Wave", "Circle"],
                     style,
                     ChoiceKey::Style,
                 ));

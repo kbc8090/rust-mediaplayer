@@ -466,6 +466,7 @@ struct FluentMediaPlayer {
     song_title: String,
     song_artist: String,
     song_album: String,
+    song_year: String,
     song_codec: String,
     song_rate: i64,
     /// A variable-bitrate song's bitrate as it plays (kb/s), and when it was last
@@ -775,6 +776,7 @@ impl FluentMediaPlayer {
             song_title: String::new(),
             song_artist: String::new(),
             song_album: String::new(),
+            song_year: String::new(),
             song_codec: String::new(),
             song_rate: 0,
             song_kbps_live: None,
@@ -1507,7 +1509,7 @@ impl FluentMediaPlayer {
         // The song's details: its title tag (else the file name), artist, album
         let title = if self.song_title.is_empty() { self.file_name() } else { self.song_title.clone() };
         let position = self.playlist_position();
-        let name = visualizer::SongName { song: &title, artist: &self.song_artist, album: &self.song_album, playlist: position.as_deref() };
+        let name = visualizer::SongName { song: &title, artist: &self.song_artist, album: &self.song_album, year: &self.song_year, playlist: position.as_deref() };
         let p = ui.painter();
         let playing = self.is_playing && !self.eof;
 
@@ -1538,7 +1540,23 @@ impl FluentMediaPlayer {
             }
             return;
         }
-        self.bars.draw_visualizer(p, rect, name, self.accent, self.adjust.vis_style == adjust::VisStyle::Wave);
+        let style = self.adjust.vis_style;
+        let mut drawn = false;
+        if style == adjust::VisStyle::Circle {
+            // (the cover inside the ring, drawn by mpv like on the album-art screen)
+            let has_cover = self.video_kind == VideoKind::Cover && self.render_ctx_initialized;
+            if let Some(cover) = self.bars.draw_circle(p, rect, name, self.accent, has_cover.then_some(self.cover_aspect)) {
+                if let Some(c) = cover {
+                    p.add(video_callback(c));
+                }
+                drawn = true;
+            }
+        }
+        if !drawn {
+            // (a window too small for the circle gets the bars)
+            let name = visualizer::SongName { song: &title, artist: &self.song_artist, album: &self.song_album, year: &self.song_year, playlist: position.as_deref() };
+            self.bars.draw_visualizer(p, rect, name, self.accent, style == adjust::VisStyle::Wave);
+        }
         // Keep the bars moving (at the screen's refresh rate; the 6 ms is only a
         // limit in case vsync is off). Paused, they settle and the redrawing stops.
         if moving {
@@ -1909,6 +1927,7 @@ impl eframe::App for FluentMediaPlayer {
                     (&mut self.song_title, &snap.media_title),
                     (&mut self.song_artist, &snap.artist),
                     (&mut self.song_album, &snap.album),
+                    (&mut self.song_year, &snap.year),
                 ] {
                     if mine != theirs {
                         mine.clone_from(theirs);

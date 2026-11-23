@@ -55,6 +55,8 @@ pub struct Snapshot {
     /// A song's artist and album tags ("" if it has none)
     pub artist: String,
     pub album: String,
+    /// The year it came out, from its date tag ("" if none)
+    pub year: String,
     /// The sound's codec ("flac", "mp3"...) and sample rate, for the FORMAT line
     pub audio_codec: String,
     pub audio_rate: i64,
@@ -288,6 +290,12 @@ fn run(mpv: Arc<Mutex<Mpv>>, rx: mpsc::Receiver<Job>, state: Arc<Mutex<Snapshot>
             },
             artist: m.get_property::<String>("metadata/by-key/artist").unwrap_or_default(),
             album: m.get_property::<String>("metadata/by-key/album").unwrap_or_default(),
+            // (MP3s and most others call it "date" ("2010" or "2010-03-07"), some
+            // FLACs "year"; the first four-digit year in it)
+            year: ["date", "year", "originaldate"]
+                .iter()
+                .find_map(|k| m.get_property::<String>(&format!("metadata/by-key/{k}")).ok().and_then(|d| year_in(&d)))
+                .unwrap_or_default(),
             audio_codec: m.get_property::<String>("audio-codec-name").unwrap_or_default(),
             audio_rate: m.get_property::<i64>("audio-params/samplerate").unwrap_or(0),
             audio_bitrate: m.get_property::<f64>("audio-bitrate").unwrap_or(0.0),
@@ -584,4 +592,20 @@ fn bitrate(bits_per_sec: f64) -> String {
 fn short_num(v: f64) -> String {
     let s = format!("{v:.3}");
     s.trim_end_matches('0').trim_end_matches('.').to_owned()
+}
+
+/// The first plausible year (1000-2999) written in a date tag
+fn year_in(date: &str) -> Option<String> {
+    let b = date.as_bytes();
+    (0..b.len().saturating_sub(3)).find_map(|i| {
+        let w = &b[i..i + 4];
+        let digits = w.iter().all(u8::is_ascii_digit);
+        let alone = (i == 0 || !b[i - 1].is_ascii_digit()) && b.get(i + 4).is_none_or(|c| !c.is_ascii_digit());
+        (digits && alone && (w[0] == b'1' || w[0] == b'2')).then(|| date[i..i + 4].to_owned())
+    })
+    // ("20100307": the year at the front)
+    .or_else(|| {
+        let w = b.get(..4)?;
+        (w.iter().all(u8::is_ascii_digit) && (w[0] == b'1' || w[0] == b'2')).then(|| date[..4].to_owned())
+    })
 }

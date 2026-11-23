@@ -65,7 +65,7 @@ pub(crate) fn strip(mesh: &mut Mesh, pts: &[Pos2], half_w: f32, cols: &[Color32]
 }
 
 /// Concentric rings around `c` (radii rx·d, ry·d); `ring(d)` gives each ring's colour
-fn rings(mesh: &mut Mesh, c: Pos2, rx: f32, ry: f32, ds: &[f32], ring: impl Fn(f32) -> Color32) {
+pub(crate) fn rings(mesh: &mut Mesh, c: Pos2, rx: f32, ry: f32, ds: &[f32], ring: impl Fn(f32) -> Color32) {
     const SEG: u32 = 72;
     let base = mesh.vertices.len() as u32;
     for &d in ds {

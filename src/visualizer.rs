@@ -567,7 +567,8 @@ impl Bars {
     /// The wave: the start screen's ribbon (one bright line and ten fainter ones
     /// woven round it, teal → accent → violet), swelling with the music: the
     /// bass in the middle, the highs out towards the sides. Centred on `cy`.
-    fn draw_wave(&self, p: &egui::Painter, rect: Rect, cy: f32, accent: Color32) {
+    /// `reach`: how far up and down the lines can go.
+    fn draw_wave(&self, p: &egui::Painter, rect: Rect, cy: f32, reach: f32, accent: Color32) {
         let (w, h) = (rect.width(), rect.height());
         let acc = splash::rgb(accent);
         let s = (h / 720.0).clamp(0.45, 2.0);
@@ -580,6 +581,7 @@ impl Bars {
             self.level[i] * (1.0 - f) + self.level[b] * f
         };
         let npts = ((w / 3.5) as usize).clamp(100, 600);
+        let reach = reach.max(8.0);
         let mut m = Mesh::default();
         let mut pts = Vec::with_capacity(npts + 1);
         let mut core = Vec::with_capacity(npts + 1);
@@ -597,13 +599,16 @@ impl Bars {
             for (i, &lv) in levels.iter().enumerate() {
                 let x = i as f32 / npts as f32;
                 let u = (x - 0.5) * 2.0;
-                let env = (-(u.abs() / 0.78).powf(3.2)).exp();
+                // (tapering only near the ends, so the sides move too)
+                let env = (-(u.abs() / 0.92).powi(4)).exp();
                 // (calm when quiet; the louder, the bigger the swell)
-                let wave = amp * (0.22 + 1.05 * lv) * (u * 8.5 + ph * 1.3).sin() * (u * 2.7 + ph).cos()
-                    + 34.0 * (0.35 + 0.9 * lv) * (u * 19.0 + ph * 2.6).sin()
-                    + 12.0 * (u * 41.0 + ph).sin();
-                // (0.85: room above for the top bar and below for the song's details)
-                pts.push(pos2(rect.left() + w * x, cy + env * wave * s * 0.85));
+                let wave = amp * (0.15 + 1.9 * lv) * (u * 8.5 + ph * 1.3).sin() * (u * 2.7 + ph).cos()
+                    + 34.0 * (0.3 + 1.4 * lv) * (u * 19.0 + ph * 2.6).sin()
+                    + (12.0 + 10.0 * lv) * (u * 41.0 + ph).sin();
+                // (eased off as it nears `reach`, so the biggest peaks stay clear
+                // of the top bar and the song's details)
+                let off = env * wave * s;
+                pts.push(pos2(rect.left() + w * x, cy + reach * (off / reach).tanh()));
                 let c = splash::ribbon_colour(acc, x);
                 // (brighter where it's loud)
                 let b = a * (0.75 + 0.35 * lv);
@@ -624,11 +629,19 @@ impl Bars {
         // (the bars stand above the song's details, also in a small window)
         let base = (rect.top() + h * 0.58).min(l.name_top - 16.0 * l.scale).round();
         let s = (h / 720.0).clamp(0.45, 2.0);
+        // The details: just above the seek bar in a small window; with more room,
+        // partway up towards the bars (so they don't sit far down on their own)
+        let gap = 16.0 * l.scale;
+        let spare = (l.name_top - (base + gap)).max(0.0);
+        let top = l.name_top - spare * 0.55;
         if wave {
-            // (the wave in the middle of where the bars stand)
+            // (the wave in the middle of where the bars stand; reaching up to
+            // about 30 % of the height either way, but staying clear of the top
+            // bar and of the song's details)
             let cy = (base - h * 0.17).round();
+            let reach = (h * 0.29).min(top - 10.0 - cy).min(cy - rect.top() - 30.0);
             self.backdrop(&p, rect, accent, cy);
-            self.draw_wave(&p, rect, cy, accent);
+            self.draw_wave(&p, rect, cy, reach, accent);
         } else {
             self.backdrop(&p, rect, accent, base);
             // (edge to edge)
@@ -636,12 +649,71 @@ impl Bars {
             self.draw_bars(&p, area, accent, true, 14.0 * s);
         }
         self.vignette(&p);
-        // The details: just above the seek bar in a small window; with more room,
-        // partway up towards the bars (so they don't sit far down on their own)
-        let gap = 16.0 * l.scale;
-        let spare = (l.name_top - (base + gap)).max(0.0);
-        let top = l.name_top - spare * 0.55;
         song_name(&p, rect.center().x, top.round(), rect.width() * 0.8, &name, l.scale);
+    }
+
+    /// The circle: bars standing out round a glowing ring (the bass at the top,
+    /// mirrored left and right; teal → accent → violet going down), the song's
+    /// cover inside it and its name underneath, laid out like the album-art
+    /// screen. `cover_aspect`: the cover's width / height when there is one: mpv
+    /// draws it into the returned rect afterwards. None: too small for the
+    /// circle (show the bars instead).
+    pub(crate) fn draw_circle(&mut self, p: &egui::Painter, rect: Rect, name: SongName, accent: Color32, cover_aspect: Option<f32>) -> Option<Option<Rect>> {
+        use std::f32::consts::{PI, TAU};
+        let p = p.with_clip_rect(rect);
+        let l = CoverLayout::new(rect, name.lines());
+        // (the bars at their longest just fill the album-art screen's cover square)
+        let side = (l.cover_bottom - l.cover_top).min(rect.width() * 0.6);
+        if side < 90.0 {
+            return None;
+        }
+        let s = (rect.height() / 720.0).clamp(0.45, 2.0);
+        let c = pos2(rect.center().x, l.cover_bottom - side / 2.0).round();
+        let gap = 7.0 * s;
+        const LONGEST: f32 = 0.62; // (of the ring's radius)
+        let r = ((side / 2.0 - gap) / (1.0 + LONGEST)).round();
+        self.backdrop(&p, rect, accent, c.y);
+        let acc = splash::rgb(accent);
+        let white: Rgb = [1.0, 1.0, 1.0];
+
+        let mut m = Mesh::default();
+        // Inside the ring: a faint accent glow (it's what shows without a cover)
+        splash::rings(&mut m, c, r, r, &[0.0, 0.5, 1.0], |d| splash::light(acc, 0.10 * (1.0 - d)));
+        // The bars, one every 7 px or so round the ring (an even number, so the
+        // two halves mirror)
+        let n = (((TAU * r / 7.0) / 2.0).round() as usize * 2).clamp(48, 128);
+        for i in 0..n {
+            let a = i as f32 / n as f32 * TAU; // 0 at the top, clockwise
+            let u = (if a <= PI { a } else { TAU - a }) / PI; // 0 top … 1 bottom
+            let x = u * (BARS - 1) as f32;
+            let (k, f) = (x.floor() as usize, x.fract());
+            let lv = self.level[k] * (1.0 - f) + self.level[(k + 1).min(BARS - 1)] * f;
+            let dir = vec2(a.sin(), -a.cos());
+            let r0 = r + gap;
+            let len = 4.0 * s + lv * r * LONGEST;
+            let pts = [c + dir * r0, c + dir * (r0 + len * 0.5), c + dir * (r0 + len)];
+            let col = splash::ribbon_colour(acc, u);
+            let glow = splash::light(col, 0.08 + 0.12 * lv);
+            splash::strip(&mut m, &pts, 9.0 * s, &[glow; 3]);
+            let core = splash::light(splash::mix(col, white, 0.15), 0.95);
+            splash::strip(&mut m, &pts, (2.2 * s).max(1.6), &[core; 3]);
+        }
+        // The ring: a thin bright line in a soft accent glow
+        let ring: Vec<egui::Pos2> = (0..=120).map(|i| c + vec2((i as f32 / 120.0 * TAU).sin(), -(i as f32 / 120.0 * TAU).cos()) * r).collect();
+        splash::strip(&mut m, &ring, 10.0 * s, &[splash::light(acc, 0.22); 121]);
+        splash::strip(&mut m, &ring, 1.3, &[splash::light([0.85, 0.9, 1.0], 0.9); 121]);
+        p.add(egui::Shape::mesh(m));
+        self.vignette(&p);
+        song_name(&p, rect.center().x, l.name_top, rect.width() * 0.8, &name, l.scale);
+
+        // The cover: inside the ring, clear of it all round
+        Some(cover_aspect.map(|aspect| {
+            let box_side = r * 1.28;
+            let aspect = if aspect.is_finite() && aspect > 0.2 { aspect.clamp(0.5, 2.0) } else { 1.0 };
+            let size = if aspect >= 1.0 { vec2(box_side, box_side / aspect) } else { vec2(box_side * aspect, box_side) };
+            let cr = Rect::from_center_size(c, size);
+            Rect::from_min_max(cr.min.round(), cr.max.round())
+        }))
     }
 
     /// Where the cover goes on the album-art screen (None: the window is too small
@@ -762,6 +834,7 @@ pub(crate) struct SongName<'a> {
     pub(crate) song: &'a str,
     pub(crate) artist: &'a str,
     pub(crate) album: &'a str,
+    pub(crate) year: &'a str,
     /// "3 of 12" in a playlist
     pub(crate) playlist: Option<&'a str>,
 }
@@ -772,6 +845,7 @@ impl SongName<'_> {
             ("Song", self.song),
             ("Artist", self.artist),
             ("Album", self.album),
+            ("Year", self.year),
             ("Playlist", self.playlist.unwrap_or("")),
         ]
             .into_iter()
@@ -1038,7 +1112,13 @@ pub(crate) fn song_format(path: &str, codec: &str, rate: Option<u32>, info: Opti
     let kbps = if variable { live_kbps.or(info.and_then(|i| i.kbps)) } else { info.and_then(|i| i.kbps) };
     if let Some(k) = kbps {
         let k = if k >= 1000 { format!("{},{:03}", k / 1000, k % 1000) } else { k.to_string() };
-        parts.push(if vbr { format!("{k} kb/s (VBR)") } else { format!("{k} kb/s") });
+        // (an MP3 says which kind of bitrate: in front of the number, so a VBR
+        // song's changing number doesn't move it)
+        parts.push(match (name == "MP3", vbr) {
+            (true, true) => format!("(VBR) {k} kb/s"),
+            (true, false) => format!("(CBR) {k} kb/s"),
+            _ => format!("{k} kb/s"),
+        });
     }
     // the details, longest first, ending with none
     let mut details = vec![parts.join(" \u{b7} ")];
