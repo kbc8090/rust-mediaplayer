@@ -2220,6 +2220,9 @@ impl eframe::App for FluentMediaPlayer {
         let near_edge = inp.pointer
             .is_some_and(|p| p.y < TOP_H || p.y > screen.bottom() - BOTTOM_H || self.adjust_ui.contains(p));
         let menu_open = self.main_menu || self.show_keys || self.speed_menu;
+        // (the playlist panel keeps the bar up too, so its lit Playlist button shows
+        // where the panel came from and how to close it)
+        let list_open = self.adjust_ui.playlist_open && self.playlist.is_some();
         let idle = self.last_mouse_move.elapsed().as_secs_f32();
         let settling = self.fs_settle.is_some_and(|t0| t0.elapsed().as_secs_f32() < FS_SETTLE);
         if !settling {
@@ -2246,13 +2249,13 @@ impl eframe::App for FluentMediaPlayer {
             let over_bottom = inp.pointer.is_some_and(|p| p.y > screen.bottom() - BOTTOM_H);
             let speed_menu = self.speed_menu;
             // (setting up a clip: its ends are on the seek bar, so it stays)
-            self.show_controls = speed_menu || self.clip.is_some() || (armed && over_bottom);
+            self.show_controls = speed_menu || list_open || self.clip.is_some() || (armed && over_bottom);
             self.show_top = self.main_menu || (armed && over_top);
         } else if settling {
             self.show_controls = true;
             self.show_top = true;
         } else {
-            self.show_controls = !self.has_file || !self.is_playing || menu_open || near_edge || idle < HIDE_AFTER || self.clip.is_some();
+            self.show_controls = !self.has_file || !self.is_playing || menu_open || list_open || near_edge || idle < HIDE_AFTER || self.clip.is_some();
             self.show_top = self.show_controls;
         }
         // Hide the mouse cursor too once it has been still for a moment

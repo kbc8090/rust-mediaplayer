@@ -1924,18 +1924,30 @@ pub fn draw_playlist(
         ui.allocate_rect(rect, Sense::click_and_drag());
         let p = ui.painter().clone();
         panel_frame(&p, rect);
-        let (_, close) = header_with(ui, &p, rect, title, "playlist", false);
+        // (the title after the Playlist button's own icon, in the accent colour
+        // the button lights up in: shows which button this panel belongs to)
+        let (_, close) = header_with(ui, &p, rect, "", "playlist", false);
         if close {
             ui_state.playlist_open = false;
         }
+        let cy = rect.top() + HEAD_H / 2.0;
+        crate::controls::icon_playlist(&p, pos2(rect.left() + 25.0, cy), accent, None);
+        let title_x = rect.left() + 42.0;
+        p.text(pos2(title_x, cy), Align2::LEFT_CENTER, title, semibold(14.5), TEXT);
         // "3 of 12 · 46:00" after the title (the total only once every length is known)
         let title_w = p.layout_no_wrap(title.to_owned(), semibold(14.5), TEXT).size().x;
         let total: Option<f64> = rows.iter().map(|r| r.secs).sum();
-        let count = match total {
-            Some(t) => format!("{} of {} \u{b7} {}", current + 1, rows.len(), clock(t)),
-            None => format!("{} of {}", current + 1, rows.len()),
+        let short = format!("{} of {}", current + 1, rows.len());
+        let mut count = match total {
+            Some(t) => format!("{short} \u{b7} {}", clock(t)),
+            None => short.clone(),
         };
-        p.text(pos2(rect.left() + 16.0 + title_w + 9.0, rect.top() + HEAD_H / 2.0 + 0.5), Align2::LEFT_CENTER, count, FontId::proportional(11.5), DIM);
+        // (without the total when it would run into the close button)
+        let count_x = title_x + title_w + 9.0;
+        if count_x + p.layout_no_wrap(count.clone(), FontId::proportional(11.5), DIM).size().x > rect.right() - 42.0 {
+            count = short;
+        }
+        p.text(pos2(count_x, cy + 0.5), Align2::LEFT_CENTER, count, FontId::proportional(11.5), DIM);
 
         // The entries (scrolling when they don't fit)
         let list = Rect::from_min_size(pos2(rect.left() + 6.0, rect.top() + HEAD_H + 4.0), vec2(w - 12.0, list_h - 8.0));
