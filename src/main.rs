@@ -852,11 +852,9 @@ impl FluentMediaPlayer {
         self.playlist_selected = selected;
         self.playlist_shuffle = false;
         self.play_order.clear();
-        // (files dropped / opened together: show what's in it straight away)
-        if selected {
-            self.adjust_ui.playlist_open = true;
-            self.adjust_ui.playlist_scroll = true;
-        }
+        // (show what's in it straight away)
+        self.adjust_ui.playlist_open = true;
+        self.adjust_ui.playlist_scroll = true;
         // (already playing the first one, e.g. the first of several opened from
         // Explorer: carry on, don't start it again)
         let playing_it = self.has_file && self.current_file == first;
