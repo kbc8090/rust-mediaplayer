@@ -740,14 +740,31 @@ pub(crate) fn draw_bottom_bar(app: &mut FluentMediaPlayer, ctx: &egui::Context, 
                 && !live
                 && (seek.dragged_by(egui::PointerButton::Primary)
                     || (seek.is_pointer_button_down_on() && ctx.input(|i| i.pointer.primary_down())));
+            // Seeking with the bar: the press seeks exactly there. Moving while
+            // held seeks to the nearest keyframe (quick, so the picture keeps up
+            // with the drag), and letting go then seeks exactly to where it ended.
+            // Only when the spot changes: this used to seek again every frame
+            // while the button was held, even standing still, and each new seek
+            // started mpv's over, so the picture waited until the button was let go.
             if dragging {
                 if let Some(pos) = seek.interact_pointer_pos() {
                     let f = frac_at(pos.x);
+                    let pressed_now = app.drag_frac.is_none();
+                    let moved = app.drag_frac != Some(f);
                     app.drag_frac = Some(f);
-                    if duration > 0.0 { app.seek_to(to_secs(f)); }
+                    if duration > 0.0 && moved {
+                        if pressed_now {
+                            app.seek_to(to_secs(f));
+                        } else {
+                            app.seek_keyframe(to_secs(f));
+                            app.drag_rough = true;
+                        }
+                    }
                 }
-            } else {
-                app.drag_frac = None;
+            } else if let Some(f) = app.drag_frac.take() {
+                if std::mem::take(&mut app.drag_rough) && duration > 0.0 {
+                    app.seek_to(to_secs(f));
+                }
             }
             let frac = if live { 1.0 } else { app.drag_frac.unwrap_or(if duration > 0.0 { to_frac(app.time_pos) } else { 0.0 }) };
             let hot = !live && (seek.hovered() || dragging || end_drag.is_some());

@@ -178,9 +178,15 @@ fn run(mpv: Arc<Mutex<Mpv>>, rx: mpsc::Receiver<Job>, state: Arc<Mutex<Snapshot>
         // For repeated settings of the same property (e.g. dragging the seek bar)
         // only the last one matters
         let mut last_set: HashMap<String, usize> = HashMap::new();
+        // (the same for seeks: only the last one waiting)
+        let mut last_seek: Option<usize> = None;
         for (i, job) in jobs.iter().enumerate() {
-            if let Job::Set(name, _) = job {
-                last_set.insert(name.clone(), i);
+            match job {
+                Job::Set(name, _) => {
+                    last_set.insert(name.clone(), i);
+                }
+                Job::Command(name, _) if name == "seek" => last_seek = Some(i),
+                _ => {}
             }
         }
 
@@ -196,6 +202,7 @@ fn run(mpv: Arc<Mutex<Mpv>>, rx: mpsc::Receiver<Job>, state: Arc<Mutex<Snapshot>
                         fallback_check = (String::new(), Instant::now(), false);
                     }
                 }
+                Job::Command(name, _) if name == "seek" && last_seek != Some(i) => {}
                 Job::Command(name, args) => {
                     if name == "loadfile" {
                         quick_until = Some(Instant::now() + Duration::from_millis(1500));

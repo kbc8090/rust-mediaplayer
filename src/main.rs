@@ -348,6 +348,9 @@ struct FluentMediaPlayer {
     show_controls: bool,
     /// Fraction of the seek bar while the user is dragging it
     drag_frac: Option<f32>,
+    /// The drag along the seek bar has seeked to keyframes only (an exact seek
+    /// follows when it ends)
+    pub(crate) drag_rough: bool,
     /// Wall-clock instant of last user activity, used for auto-hide
     last_mouse_move: std::time::Instant,
     has_file: bool,
@@ -696,6 +699,7 @@ impl FluentMediaPlayer {
             speed: 1.0,
             show_controls: true,
             drag_frac: None,
+            drag_rough: false,
             last_mouse_move: std::time::Instant::now(),
             has_file: false,
             repaint_tx: tx,
@@ -1522,6 +1526,16 @@ impl FluentMediaPlayer {
         self.link.set("time-pos", secs);
         self.time_pos = secs;
         self.seek_target = Some((secs, std::time::Instant::now()));
+        self.touch();
+    }
+
+    /// A quick seek to the keyframe nearest `secs` (while dragging along the seek
+    /// bar; an exact seek follows when the drag ends)
+    pub(crate) fn seek_keyframe(&mut self, secs: f64) {
+        self.link.command("seek", &[&format!("{secs:.3}"), "absolute+keyframes"]);
+        self.time_pos = secs;
+        // (it lands on a keyframe, not exactly there: nothing to wait for)
+        self.seek_target = None;
         self.touch();
     }
 
