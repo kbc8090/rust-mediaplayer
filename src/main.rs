@@ -928,7 +928,9 @@ impl FluentMediaPlayer {
         self.link_thumbs = None;
         self.live = false;
         self.video_kind = VideoKind::Unknown;
-        self.bars.reset();
+        // (the bars carry on from the last song and settle by themselves: no
+        // jump to nothing between songs)
+        self.bars.soften();
         self.clip = None;
         if is_url(path) {
             self.thumbs.forget();
@@ -1284,6 +1286,33 @@ impl FluentMediaPlayer {
         }
     }
 
+    /// A song is playing (no picture, or just its cover): the visualizer /
+    /// album-art screen, and no rotate, mirror or subtitle buttons. While a new
+    /// file opens, its extension decides (so going from song to song doesn't
+    /// flash anything in between).
+    pub(crate) fn is_music(&self) -> bool {
+        self.has_file
+            && match self.video_kind {
+                VideoKind::None | VideoKind::Cover => true,
+                VideoKind::Video => false,
+                VideoKind::Unknown => media_kind(&self.current_file) == Some(MediaKind::Music),
+            }
+    }
+
+    /// What previous / next go to: "song", "video", "picture" (or "file")
+    pub(crate) fn item_noun(&self) -> &'static str {
+        if self.playlist.is_some() {
+            let n = self.playlist_noun();
+            return n.strip_suffix('s').unwrap_or(n);
+        }
+        match media_kind(&self.current_file) {
+            Some(MediaKind::Music) => "song",
+            Some(MediaKind::Video) => "video",
+            Some(MediaKind::Image) => "picture",
+            None => "file",
+        }
+    }
+
     /// What the playlist holds: "songs", "videos", or "files" if it's a mix
     pub(crate) fn playlist_noun(&self) -> &'static str {
         let one = self.folder_files.len() == 1;
@@ -1311,7 +1340,8 @@ impl FluentMediaPlayer {
 
         // The song's name: its title tag (else the file name), then "artist · album"
         let title = if self.song_title.is_empty() { self.file_name() } else { self.song_title.clone() };
-        let sub = [self.song_artist.trim(), self.song_album.trim()].iter().filter(|t| !t.is_empty()).copied().collect::<Vec<_>>().join(" \u{b7} ");
+        let position = self.playlist_position();
+        let name = visualizer::SongName { song: &title, artist: &self.song_artist, album: &self.song_album, playlist: position.as_deref() };
         let p = ui.painter();
 
         // Album art: the cover with the song's name; nothing moves, so nothing
@@ -1319,11 +1349,11 @@ impl FluentMediaPlayer {
         // for one, get the visualizer.)
         let has_cover = self.video_kind == VideoKind::Cover && self.render_ctx_initialized;
         if self.adjust.music == MusicShow::AlbumArt && has_cover {
-            if let Some(c) = visualizer::Bars::cover_rect(rect, self.cover_aspect, self.playlist.is_some()) {
+            if let Some(c) = visualizer::Bars::cover_rect(rect, self.cover_aspect, name.lines()) {
                 self.scope.stop();
                 self.bars.draw_cover_back(p, rect, c, self.accent);
                 p.add(video_callback(c));
-                self.bars.draw_cover_front(p, rect, (&title, &sub, self.playlist_position().as_deref()));
+                self.bars.draw_cover_front(p, rect, name);
                 return;
             }
         }
@@ -1333,10 +1363,10 @@ impl FluentMediaPlayer {
         let moving = self.bars.update(&self.scope, &self.current_file, self.time_pos, playing, dt);
         if self.bars.state == visualizer::State::Unsupported {
             // (a file the bars can't read: Opus, WMA, a link...)
-            self.bars.draw_still(p, rect, (&title, &sub, self.playlist_position().as_deref()), self.accent);
+            self.bars.draw_still(p, rect, name, self.accent);
             return;
         }
-        self.bars.draw_visualizer(p, rect, (&title, &sub, self.playlist_position().as_deref()), self.accent);
+        self.bars.draw_visualizer(p, rect, name, self.accent);
         // Keep the bars moving (at the screen's refresh rate; the 6 ms is only a
         // limit in case vsync is off). Paused, they settle and the redrawing stops.
         if moving {
@@ -1454,19 +1484,29 @@ impl FluentMediaPlayer {
         self.link.set("speed", speed);
     }
 
+    /// A playlist set to replay goes round: next after the last is the first
+    fn wraps(&self) -> bool {
+        self.playlist.is_some() && self.playlist_replay && self.folder_files.len() > 1
+    }
+
     fn has_prev(&self) -> bool {
-        self.folder_index.is_some_and(|i| i > 0)
+        self.wraps() || self.folder_index.is_some_and(|i| i > 0)
     }
 
     fn has_next(&self) -> bool {
-        self.folder_index.is_some_and(|i| i + 1 < self.folder_files.len())
+        self.wraps() || self.folder_index.is_some_and(|i| i + 1 < self.folder_files.len())
     }
 
-    /// Open the previous (-1) or next (+1) video in the current file's folder
+    /// Open the previous (-1) or next (+1) entry: of the playlist when one is
+    /// playing, else of the current file's folder
     fn play_adjacent(&mut self, delta: isize) {
         let Some(i) = self.folder_index else { return };
-        let target = i as isize + delta;
-        if target < 0 || target as usize >= self.folder_files.len() { return; }
+        let n = self.folder_files.len() as isize;
+        let mut target = i as isize + delta;
+        if self.wraps() {
+            target = target.rem_euclid(n);
+        }
+        if target < 0 || target >= n { return; }
         let path = self.folder_files[target as usize].to_string_lossy().into_owned();
         self.folder_index = Some(target as usize);
         self.load_entry(&path);
@@ -2181,7 +2221,7 @@ impl eframe::App for FluentMediaPlayer {
                     ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
                 }
 
-                let music = self.has_file && matches!(self.video_kind, VideoKind::None | VideoKind::Cover);
+                let music = self.is_music();
                 if !music {
                     self.scope.stop();
                 }

@@ -12,7 +12,7 @@
 //! size and reused, so a frame is only the bars: a few thousand vertices.
 
 use crate::splash::{self, Rgb};
-use eframe::egui::{self, pos2, vec2, Color32, FontFamily, FontId, Mesh, Pos2, Rect};
+use eframe::egui::{self, pos2, vec2, Color32, FontFamily, FontId, Mesh, Rect};
 use realfft::num_complex::Complex;
 use realfft::{RealFftPlanner, RealToComplex};
 use std::collections::VecDeque;
@@ -358,12 +358,9 @@ impl Bars {
         &self.level
     }
 
-    /// Forget the last song's bars (a new song starts from nothing)
-    pub(crate) fn reset(&mut self) {
-        self.level = [0.0; BARS];
-        self.peak = [0.0; BARS];
-        self.hold = [0.0; BARS];
-        self.fall = [0.0; BARS];
+    /// A new song: the bars stay where they are and settle by themselves (the
+    /// loudness is measured afresh)
+    pub(crate) fn soften(&mut self) {
         self.reference = -20.0;
         self.state = State::Waiting;
     }
@@ -562,14 +559,15 @@ impl Bars {
         let area = Rect::from_min_max(pos2(rect.left(), base - h * 0.34), pos2(rect.right(), base));
         self.draw_bars(&p, area, accent, true, 14.0 * s);
         self.vignette(&p);
-        let l = CoverLayout::new(rect, name.2.is_some());
-        song_name(&p, pos2(rect.center().x, l.title_y), rect.width() * 0.8, name, l.scale);
+        let l = CoverLayout::new(rect, name.lines());
+        song_name(&p, rect.center().x, l.name_top, rect.width() * 0.8, &name, l.scale);
     }
 
     /// Where the cover goes on the album-art screen (None: the window is too small
     /// for it, show the visualizer instead). `aspect` = the cover's width / height.
-    pub(crate) fn cover_rect(rect: Rect, aspect: f32, extra_line: bool) -> Option<Rect> {
-        let l = CoverLayout::new(rect, extra_line);
+    /// `lines`: how many lines the song's name takes (SongName::lines)
+    pub(crate) fn cover_rect(rect: Rect, aspect: f32, lines: usize) -> Option<Rect> {
+        let l = CoverLayout::new(rect, lines);
         let side = (l.cover_bottom - l.cover_top).min(rect.width() * 0.6);
         if side < 90.0 {
             return None;
@@ -594,8 +592,8 @@ impl Bars {
     /// The album-art screen, around the cover: the song's name under it
     pub(crate) fn draw_cover_front(&mut self, p: &egui::Painter, rect: Rect, name: SongName) {
         let p = p.with_clip_rect(rect);
-        let l = CoverLayout::new(rect, name.2.is_some());
-        song_name(&p, pos2(rect.center().x, l.title_y), rect.width() * 0.8, name, l.scale);
+        let l = CoverLayout::new(rect, name.lines());
+        song_name(&p, rect.center().x, l.name_top, rect.width() * 0.8, &name, l.scale);
         self.vignette(&p);
     }
 
@@ -604,8 +602,9 @@ impl Bars {
         let p = p.with_clip_rect(rect);
         let cy = rect.top() + rect.height() * 0.46;
         self.backdrop(&p, rect, accent, cy);
-        let s = (rect.height() / 720.0).clamp(0.6, 1.6);
-        song_name(&p, pos2(rect.center().x, cy - 12.0 * s), rect.width() * 0.8, name, s);
+        let s = (rect.height() / 720.0).clamp(0.9, 1.6);
+        let top = cy - name.lines() as f32 * LINE_H * s / 2.0;
+        song_name(&p, rect.center().x, top, rect.width() * 0.8, &name, s);
         self.vignette(&p);
     }
 }
@@ -616,44 +615,74 @@ struct CoverLayout {
     scale: f32,
     cover_top: f32,
     cover_bottom: f32,
-    title_y: f32,
+    /// Top of the song's name
+    name_top: f32,
 }
 
 impl CoverLayout {
-    /// `extra_line`: a third line under the name ("3 of 12" in a playlist)
-    fn new(rect: Rect, extra_line: bool) -> Self {
-        let scale = (rect.height() / 720.0).clamp(0.6, 1.6);
-        let extra = if extra_line { EXTRA_GAP * scale } else { 0.0 };
-        let title_y = rect.bottom() - 120.0 - SUB_GAP * scale - extra;
-        Self { scale, cover_top: rect.top() + 56.0, cover_bottom: title_y - 34.0 * scale, title_y }
+    fn new(rect: Rect, lines: usize) -> Self {
+        // (the text stays readable in a small window)
+        let scale = (rect.height() / 720.0).clamp(0.9, 1.6);
+        let name_top = rect.bottom() - 118.0 - lines as f32 * LINE_H * scale;
+        Self { scale, cover_top: rect.top() + 56.0, cover_bottom: name_top - 22.0 * scale, name_top }
     }
 }
 
-/// Distance from the title's middle to the "artist · album" line's middle, and
-/// from there to the playlist line's
-const SUB_GAP: f32 = 27.0;
-const EXTRA_GAP: f32 = 21.0;
+/// Height of a line of the song's name (at the 720 p size)
+const LINE_H: f32 = 23.0;
 
-/// The song's title, "artist · album" ("" if no tags), and in a playlist "3 of 12"
-pub(crate) type SongName<'a> = (&'a str, &'a str, Option<&'a str>);
+/// What's shown about the playing song: each line labelled ("Song: The Tourist",
+/// "Artist: Radiohead"...), empty ones left out
+pub(crate) struct SongName<'a> {
+    pub(crate) song: &'a str,
+    pub(crate) artist: &'a str,
+    pub(crate) album: &'a str,
+    /// "3 of 12" in a playlist
+    pub(crate) playlist: Option<&'a str>,
+}
 
-/// The song's title, with "artist · album" (and "3 of 12") under it, centred on `at`
-fn song_name(p: &egui::Painter, at: Pos2, max_w: f32, (title, sub, extra): SongName, s: f32) {
-    let title_font = FontId::new(21.0 * s, FontFamily::Name("semibold".into()));
-    let shadow = crate::controls::elide(p, title, title_font.clone(), Color32::from_black_alpha(150), max_w);
-    let galley = crate::controls::elide(p, title, title_font, Color32::from_rgb(240, 242, 248), max_w);
-    let pos = at - galley.size() / 2.0;
-    p.galley(pos + vec2(1.0, 1.0), shadow, Color32::TRANSPARENT);
-    p.galley(pos, galley, Color32::TRANSPARENT);
-    let mut y = at.y + SUB_GAP * s;
-    if !sub.is_empty() {
-        let g = crate::controls::elide(p, sub, FontId::proportional(14.0 * s), Color32::from_rgb(175, 180, 194), max_w);
-        p.galley(pos2(at.x, y) - g.size() / 2.0, g, Color32::TRANSPARENT);
-        y += EXTRA_GAP * s;
+impl SongName<'_> {
+    fn rows(&self) -> Vec<(&'static str, &str)> {
+        [("Song", self.song), ("Artist", self.artist), ("Album", self.album), ("Playlist", self.playlist.unwrap_or(""))]
+            .into_iter()
+            .map(|(k, v)| (k, v.trim()))
+            .filter(|(_, v)| !v.is_empty())
+            .collect()
     }
-    if let Some(extra) = extra {
-        let g = crate::controls::elide(p, extra, FontId::proportional(12.5 * s), Color32::from_rgb(135, 141, 158), max_w);
-        p.galley(pos2(at.x, y) - g.size() / 2.0, g, Color32::TRANSPARENT);
+
+    pub(crate) fn lines(&self) -> usize {
+        self.rows().len()
+    }
+}
+
+/// The song's name as labelled lines: small labels right-aligned in a column
+/// ("SONG", "ARTIST"...), the values left-aligned after it; the block centred on
+/// `cx` with its top at `top`
+fn song_name(p: &egui::Painter, cx: f32, top: f32, max_w: f32, name: &SongName, s: f32) {
+    let rows = name.rows();
+    let label_font = FontId::proportional(11.5 * s);
+    let value_font = |first: bool| if first { FontId::new(15.5 * s, FontFamily::Name("semibold".into())) } else { FontId::proportional(15.0 * s) };
+    let label_col = Color32::from_rgb(128, 136, 156);
+    let value_col = Color32::from_rgb(236, 238, 245);
+    let gap = 12.0 * s;
+    let labels: Vec<_> = rows.iter().map(|(k, _)| p.layout_no_wrap(k.to_uppercase(), label_font.clone(), label_col)).collect();
+    let label_w = labels.iter().map(|g| g.size().x).fold(0.0, f32::max);
+    let values: Vec<_> = rows
+        .iter()
+        .enumerate()
+        .map(|(i, (_, v))| crate::controls::elide(p, v, value_font(i == 0), value_col, (max_w - label_w - gap).max(40.0)))
+        .collect();
+    let block_w = label_w + gap + values.iter().map(|g| g.size().x).fold(0.0, f32::max);
+    let gutter = (cx - block_w / 2.0 + label_w).round();
+    for (i, (l, v)) in labels.into_iter().zip(values).enumerate() {
+        let cy = top + (i as f32 + 0.5) * LINE_H * s;
+        let lp = pos2(gutter - l.size().x, cy - l.size().y / 2.0 + 1.0 * s);
+        let vp = pos2(gutter + gap, cy - v.size().y / 2.0);
+        for (pos, g) in [(lp, &l), (vp, &v)] {
+            p.galley_with_override_text_color(pos + vec2(1.0, 1.0), g.clone(), Color32::from_black_alpha(140));
+        }
+        p.galley(lp, l, label_col);
+        p.galley(vp, v, value_col);
     }
 }
 

@@ -73,7 +73,10 @@ fn chapter_box(p: &egui::Painter, title: &str, left: f32, w: f32, bottom: f32, t
 /// A button that's greyed out: does nothing, but is still a button (so a
 /// right-click on it doesn't count as the blank bar)
 pub(crate) fn inert(ui: &mut egui::Ui, centre: Pos2, id: &str) {
-    let _ = ui.interact(Rect::from_center_size(centre, vec2(BTN_STEP, 34.0)), ui.id().with(id), Sense::click());
+    // (Sense drags too, like the real buttons: egui finds the topmost widget for
+    // clicks and for drags separately, and with clicks only, the bar behind still
+    // counted as hovered for drags, which made a right-click here open the menu.)
+    let _ = ui.interact(Rect::from_center_size(centre, vec2(BTN_STEP, 34.0)), ui.id().with(id), Sense::click_and_drag());
 }
 
 /// `hit` with the tooltip above (`above`) or below the button
@@ -768,7 +771,7 @@ pub(crate) fn draw_bottom_bar(app: &mut FluentMediaPlayer, ctx: &egui::Context, 
             const LIVE_DOT: f32 = 4.0;
             let live_g = live.then(|| p.layout_no_wrap("Live".to_owned(), time_font.clone(), white));
             let time_w = clock_w + live_g.as_ref().map_or(0.0, |g| LIVE_GAP + LIVE_DOT * 2.0 + 6.0 + g.size().x);
-            let lay = row_layout(left, right, time_w);
+            let lay = row_layout(left, right, time_w, app.is_music());
 
             // Play / pause
             let c = pos2(lay.play, row_y);
@@ -779,9 +782,10 @@ pub(crate) fn draw_bottom_bar(app: &mut FluentMediaPlayer, ctx: &egui::Context, 
 
             // Previous / next file in the same folder (dimmed when there isn't one)
             let dim = white.gamma_multiply(0.4);
+            let thing = app.item_noun();
             let c = pos2(lay.prev, row_y);
             if app.has_prev() {
-                if hit(ui, c, "prev", "Previous file (P)", t).activated() { app.play_adjacent(-1); }
+                if hit(ui, c, "prev", &format!("Previous {thing} (P)"), t).activated() { app.play_adjacent(-1); }
             } else {
                 inert(ui, c, "prev");
             }
@@ -789,7 +793,7 @@ pub(crate) fn draw_bottom_bar(app: &mut FluentMediaPlayer, ctx: &egui::Context, 
 
             let c = pos2(lay.next, row_y);
             if app.has_next() {
-                if hit(ui, c, "next", "Next file (N)", t).activated() { app.play_adjacent(1); }
+                if hit(ui, c, "next", &format!("Next {thing} (N)"), t).activated() { app.play_adjacent(1); }
             } else {
                 inert(ui, c, "next");
             }
@@ -888,9 +892,11 @@ pub(crate) fn draw_bottom_bar(app: &mut FluentMediaPlayer, ctx: &egui::Context, 
                 icon_repeat(&p, c, tint(app.repeat));
             }
 
-            let c = pos2(lay.captions, row_y);
-            if hit(ui, c, "captions", "Cycle subtitles", t).activated() { app.cycle_captions(); }
-            icon_captions(&p, c, white);
+            if let Some(cx) = lay.captions {
+                let c = pos2(cx, row_y);
+                if hit(ui, c, "captions", "Cycle subtitles", t).activated() { app.cycle_captions(); }
+                icon_captions(&p, c, white);
+            }
 
             let c = pos2(lay.ontop, row_y);
             if hit(ui, c, "ontop", "Always on top", t).activated() { app.toggle_on_top(ctx); }
@@ -928,14 +934,16 @@ pub(crate) struct RowLayout {
     pub(crate) rotate: Option<f32>,
     pub(crate) mirror: Option<f32>,
     pub(crate) repeat: f32,
-    pub(crate) captions: f32,
+    /// None for songs (no picture to turn, no subtitles), as rotate / mirror
+    pub(crate) captions: Option<f32>,
     pub(crate) ontop: f32,
     pub(crate) speed: f32,
     /// The last button, flush with the seek bar's right end
     pub(crate) fullscreen: f32,
 }
 
-pub(crate) fn row_layout(left: f32, right: f32, time_w: f32) -> RowLayout {
+/// `music`: a song is playing, so rotate, mirror and subtitles are left out
+pub(crate) fn row_layout(left: f32, right: f32, time_w: f32, music: bool) -> RowLayout {
     let half = BTN_BOX / 2.0;
     let play = left + SIDE + half;
     let prev = play + BTN_STEP;
@@ -947,7 +955,15 @@ pub(crate) fn row_layout(left: f32, right: f32, time_w: f32) -> RowLayout {
     let speed = fullscreen - BTN_STEP;
     let ontop = speed - BTN_STEP;
     let captions = ontop - BTN_STEP;
-    let repeat = captions - BTN_STEP;
+    let repeat = if music { ontop - BTN_STEP } else { captions - BTN_STEP };
+    if music {
+        let (mute, vol_x) = {
+            let vol_x = repeat - half - 12.0 - VOL_W;
+            let m = vol_x - VOL_GAP - half;
+            if m - half >= time_end + 14.0 { (m, Some(vol_x)) } else { (repeat - BTN_STEP, None) }
+        };
+        return RowLayout { play, prev, next, time_x, mute, vol_x, rotate: None, mirror: None, repeat, captions: None, ontop, speed, fullscreen };
+    }
 
     // Then, right to left: mirror, rotate, the volume slider, the volume icon.
     // When the window is too narrow the slider goes first (the wheel and arrow
@@ -969,7 +985,7 @@ pub(crate) fn row_layout(left: f32, right: f32, time_w: f32) -> RowLayout {
             (repeat - BTN_STEP, None, None, None)
         }
     };
-    RowLayout { play, prev, next, time_x, mute, vol_x, rotate, mirror, repeat, captions, ontop, speed, fullscreen }
+    RowLayout { play, prev, next, time_x, mute, vol_x, rotate, mirror, repeat, captions: Some(captions), ontop, speed, fullscreen }
 }
 
 // ── Pop-ups ───────────────────────────────────────────────────────────────────
