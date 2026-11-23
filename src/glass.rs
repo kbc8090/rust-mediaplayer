@@ -19,8 +19,13 @@ use std::sync::Arc;
 static ENABLED: AtomicBool = AtomicBool::new(true);
 /// Set false if the shaders can't be built on this PC
 static GL_OK: AtomicBool = AtomicBool::new(true);
-/// Hairline around glass panels: Windows 11's own flyout outline (a 40 % grey)
-const EDGE: Color32 = Color32::from_rgba_premultiplied(47, 47, 47, 102);
+/// Hairline around glass panels: like Windows 11's own flyout outline (40 %),
+/// in a cool, slightly blue grey
+const EDGE: Color32 = Color32::from_rgba_premultiplied(44, 47, 53, 102);
+/// Menus, panels and tooltips without glass: a cool dark grey background, its
+/// border, and the separators inside it (the same cool grey)
+pub const MENU_BG: Color32 = Color32::from_rgb(0x2A, 0x2D, 0x33);
+pub const BORDER: Color32 = Color32::from_rgb(0x45, 0x4B, 0x55);
 
 /// Dark tint over the blur: (grey level, strength)
 const TINT: (f32, f32) = (32.0 / 255.0, 0.64);

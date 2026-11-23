@@ -168,8 +168,8 @@ pub(crate) fn draw_tooltip(ctx: &egui::Context, anchor: Rect, text: &str, above:
 pub(crate) fn tip_frame(p: &egui::Painter, rect: Rect, alpha: f32) {
     let r = TIP_R;
     glass::shadow(p, rect, r, alpha * 0.6);
-    glass::fill(p, rect, r, Color32::from_rgba_unmultiplied(43, 43, 43, 245), alpha);
-    let edge = glass::edge(Color32::from_white_alpha(20));
+    glass::fill(p, rect, r, glass::MENU_BG.gamma_multiply(0.96), alpha);
+    let edge = glass::edge(glass::BORDER);
     p.rect_stroke(rect.shrink(0.5), r, Stroke::new(1.0_f32, edge.gamma_multiply(alpha)));
 }
 

@@ -69,8 +69,8 @@ pub(crate) fn draw_shortcuts(app: &mut FluentMediaPlayer, ctx: &egui::Context) {
             let p = ui.painter().clone();
             let r = 8.0;
             glass::shadow(&p, rect, r, 1.0);
-            glass::fill(&p, rect, r, Color32::from_rgb(44, 44, 44), 1.0);
-            p.rect_stroke(rect.shrink(0.5), r, Stroke::new(1.0_f32, glass::edge(Color32::from_rgba_premultiplied(30, 30, 30, 30))));
+            glass::fill(&p, rect, r, glass::MENU_BG, 1.0);
+            p.rect_stroke(rect.shrink(0.5), r, Stroke::new(1.0_f32, glass::edge(glass::BORDER)));
             ui.interact(rect, ui.id().with("panel"), Sense::click_and_drag());
 
             let text = Color32::from_rgb(240, 240, 240);
@@ -97,7 +97,7 @@ pub(crate) fn draw_shortcuts(app: &mut FluentMediaPlayer, ctx: &egui::Context) {
             }
             p.line_segment(
                 [pos2(rect.left() + 1.0, rect.top() + HEAD_H - 0.5), pos2(rect.right() - 1.0, rect.top() + HEAD_H - 0.5)],
-                Stroke::new(1.0_f32, Color32::from_rgba_premultiplied(26, 26, 26, 26)),
+                Stroke::new(1.0_f32, glass::BORDER),
             );
 
             // The list (scrolls if the window is too short for all of it)
@@ -229,8 +229,8 @@ pub(crate) fn draw_menu_rows(
     let p = ui.painter().clone();
     let r = 8.0;
     glass::shadow(&p, rect, r, 1.0);
-    glass::fill(&p, rect, r, Color32::from_rgb(44, 44, 44), 1.0);
-    p.rect_stroke(rect.shrink(0.5), r, Stroke::new(1.0_f32, glass::edge(Color32::from_rgba_premultiplied(30, 30, 30, 30))));
+    glass::fill(&p, rect, r, glass::MENU_BG, 1.0);
+    p.rect_stroke(rect.shrink(0.5), r, Stroke::new(1.0_f32, glass::edge(glass::BORDER)));
 
     let text = Color32::from_rgb(240, 240, 240);
     let dim = Color32::from_rgb(160, 160, 160);
@@ -249,7 +249,7 @@ pub(crate) fn draw_menu_rows(
             MenuRow::Sep => {
                 p.line_segment(
                     [pos2(rect.left() + 1.0, cy), pos2(rect.right() - 1.0, cy)],
-                    Stroke::new(1.0_f32, Color32::from_rgba_premultiplied(26, 26, 26, 26)),
+                    Stroke::new(1.0_f32, glass::BORDER),
                 );
             }
             MenuRow::Title(label) => {
@@ -667,11 +667,11 @@ pub(crate) fn draw_info_overlay(ctx: &egui::Context, rows: &[InfoRow], alpha: f3
         vec2(width, PAD_Y * 2.0 + content_h + FOOT_H),
     );
     glass::shadow(&p, rect, 8.0, alpha);
-    glass::fill(&p, rect, 8.0, Color32::from_rgb(43, 43, 43), alpha);
+    glass::fill(&p, rect, 8.0, glass::MENU_BG, alpha);
     p.rect_stroke(
         rect.shrink(0.5),
         8.0,
-        Stroke::new(1.0_f32, glass::edge(Color32::from_rgba_premultiplied(26, 26, 26, 26)).gamma_multiply(alpha)),
+        Stroke::new(1.0_f32, glass::edge(glass::BORDER).gamma_multiply(alpha)),
     );
 
     let x = rect.left() + PAD_X;
@@ -696,7 +696,7 @@ pub(crate) fn draw_info_overlay(ctx: &egui::Context, rows: &[InfoRow], alpha: f3
     let line_y = y + PAD_Y - 2.0;
     p.line_segment(
         [pos2(rect.left() + 1.0, line_y), pos2(rect.right() - 1.0, line_y)],
-        Stroke::new(1.0_f32, Color32::from_rgba_premultiplied(26, 26, 26, 26).gamma_multiply(alpha)),
+        Stroke::new(1.0_f32, glass::BORDER.gamma_multiply(alpha)),
     );
     p.text(pos2(x, (line_y + rect.bottom()) / 2.0), Align2::LEFT_CENTER, footer, foot_font, dim);
 }

@@ -452,7 +452,7 @@ impl AdjustUi {
 
 // ── Drawing helpers (the menu / shortcuts style) ──────────────────────────────
 
-const BG: Color32 = Color32::from_rgb(44, 44, 44);
+const BG: Color32 = glass::MENU_BG;
 const TEXT: Color32 = Color32::from_rgb(240, 240, 240);
 const DIM: Color32 = Color32::from_rgb(160, 160, 160);
 const CAP: Color32 = Color32::from_rgb(64, 64, 66);
@@ -528,7 +528,7 @@ pub fn state_fill(resp: &egui::Response) -> Option<Color32> {
         None
     }
 }
-const LINE: Color32 = Color32::from_rgba_premultiplied(26, 26, 26, 26);
+const LINE: Color32 = glass::BORDER;
 const NAME_SIZE: f32 = 13.5;
 const VALUE_SIZE: f32 = 12.5;
 const ROW_H: f32 = 30.0;
@@ -552,7 +552,7 @@ fn panel_frame(p: &egui::Painter, rect: Rect) {
     let r = 8.0;
     glass::shadow(p, rect, r, 1.0);
     glass::fill(p, rect, r, BG, 1.0);
-    p.rect_stroke(rect.shrink(0.5), r, Stroke::new(1.0_f32, glass::edge(Color32::from_rgba_premultiplied(30, 30, 30, 30))));
+    p.rect_stroke(rect.shrink(0.5), r, Stroke::new(1.0_f32, glass::edge(glass::BORDER)));
 }
 
 /// Title, "Reset" link and an X. Returns (reset clicked, close clicked).
@@ -646,8 +646,8 @@ fn description(ctx: &egui::Context, row: Rect, panel: Rect, text: &str) {
     let y = (row.center().y - size.y / 2.0).clamp(screen.top() + 4.0, (screen.bottom() - 4.0 - size.y).max(screen.top() + 4.0));
     let r = Rect::from_min_size(pos2(x, y), size);
     glass::shadow(&p, r, 6.0, 0.8);
-    glass::fill(&p, r, 6.0, Color32::from_rgb(43, 43, 43), 1.0);
-    p.rect_stroke(r.shrink(0.5), 6.0, Stroke::new(1.0_f32, glass::edge(Color32::from_rgba_premultiplied(26, 26, 26, 26))));
+    glass::fill(&p, r, 6.0, glass::MENU_BG, 1.0);
+    p.rect_stroke(r.shrink(0.5), 6.0, Stroke::new(1.0_f32, glass::edge(glass::BORDER)));
     p.galley(r.min + vec2(10.0, 8.0), g, Color32::from_rgb(232, 232, 232));
 }
 
@@ -1980,7 +1980,7 @@ fn playing_mark(p: &egui::Painter, right: f32, bottom: f32, levels: [f32; 3], co
 /// Width of the playlist's tab on the window's right edge, its height, and the
 /// gap between it and the open panel
 const TAB_W: f32 = 14.0;
-const TAB_H: f32 = 126.0;
+const TAB_H: f32 = 146.0;
 const TAB_GAP: f32 = 6.0;
 
 /// The playlist panel on the right: every entry (click one to play it), and its
@@ -2040,17 +2040,15 @@ pub fn draw_playlist(
         // (its right side runs off the window, so only three sides show a border)
         let body = Rect::from_min_max(tab.min, pos2(tab.right() + 8.0, tab.bottom()));
         let round = egui::Rounding { nw: 7.0, sw: 7.0, ne: 0.0, se: 0.0 };
-        if hot {
-            let glow = egui::epaint::Shadow { offset: vec2(-1.0, 0.0), blur: 12.0, spread: 0.0, color: accent.gamma_multiply(0.45) };
-            p.add(glow.tessellate(tab, round));
-        } else {
-            let shadow = egui::epaint::Shadow { offset: vec2(-2.0, 0.0), blur: 8.0, spread: 0.0, color: Color32::from_black_alpha((100.0 * a) as u8) };
-            p.add(shadow.tessellate(tab, round));
+        let shadow = egui::epaint::Shadow { offset: vec2(-2.0, 0.0), blur: 8.0, spread: 0.0, color: Color32::from_black_alpha((100.0 * a) as u8) };
+        p.add(shadow.tessellate(tab, round));
+        // (the menus' background, with the usual hover / pressed highlight over it)
+        p.rect_filled(body, round, BG.gamma_multiply(0.94 * a));
+        if let Some(c) = state_fill(&resp) {
+            p.rect_filled(body, round, c);
         }
-        let fill = if hot { Color32::from_rgb(60, 44, 58) } else { Color32::from_rgb(40, 38, 46) };
-        p.rect_filled(body, round, fill.gamma_multiply(0.92 * a));
-        // (the same grey edge as the menus and panels; the accent colour on hover)
-        let edge = if hot { accent.gamma_multiply(0.8) } else { glass::edge(Color32::from_rgba_premultiplied(30, 30, 30, 30)).gamma_multiply(a) };
+        // (the same grey edge as the menus and panels)
+        let edge = glass::edge(glass::BORDER).gamma_multiply(a);
         p.with_clip_rect(tab).rect_stroke(body.shrink(0.5), round, Stroke::new(1.0_f32, edge));
         let c = tab.center();
         let d = if ui_state.playlist_open { 1.0 } else { -1.0 };
