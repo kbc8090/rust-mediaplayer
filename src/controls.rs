@@ -61,13 +61,18 @@ pub(crate) fn elide(p: &egui::Painter, text: &str, font: FontId, color: Color32,
     p.layout_job(job)
 }
 
-/// A chapter title in a box like a tooltip, `w` wide at `left`, its bottom at `bottom`
+/// A chapter title in a box like a tooltip, `w` wide at `left`, its bottom at
+/// `bottom`: up to two centred lines, wrapped at words, then cut with "…"
 fn chapter_box(p: &egui::Painter, title: &str, left: f32, w: f32, bottom: f32, t: f32) {
     let col = TIP_TEXT.gamma_multiply(t);
-    let g = elide(p, title, FontId::proportional(12.5), col, w - 18.0);
+    let mut job = egui::text::LayoutJob::simple(title.to_owned(), FontId::proportional(12.5), col, (w - 18.0).max(10.0));
+    job.wrap = egui::text::TextWrapping { max_width: (w - 18.0).max(10.0), max_rows: 2, break_anywhere: false, overflow_character: Some('\u{2026}') };
+    job.halign = egui::Align::Center;
+    let g = p.layout_job(job);
     let r = Rect::from_min_max(pos2(left, bottom - g.size().y - 10.0), pos2(left + w, bottom));
     tip_frame(p, r, t);
-    p.galley(pos2(r.center().x - g.size().x / 2.0, r.top() + 5.0), g, col);
+    // (centred rows are laid out around x = 0)
+    p.galley(pos2(r.center().x, r.top() + 5.0), g, col);
 }
 
 /// A button that's greyed out: does nothing, but is still a button (so a
@@ -385,7 +390,8 @@ const HEAT_H: f32 = 30.0;
 
 /// The "most replayed" hill along the seek bar from `ends.0` to `ends.1`, standing
 /// on `base`. `secs_at`: the video time at a point of the bar. `played_to`: where
-/// the played part ends (its outline is in the accent colour up to there).
+/// the played part ends (up to there the hill and its outline are in the accent
+/// colour).
 #[allow(clippy::too_many_arguments)]
 fn draw_heatmap(
     p: &egui::Painter,
@@ -406,10 +412,15 @@ fn draw_heatmap(
             pos2(x, base - HEAT_H * h.at(secs_at(x)))
         })
         .collect();
-    // The hill: white, fading from 40 % at the graph's full height to 12 % at the bar
-    let shade = |y: f32| {
+    // The hill: white, fading from 40 % at the graph's full height to 12 % at the
+    // bar; under the part already played, the accent colour (50 % to 8 %)
+    let shade = |x: f32, y: f32| {
         let f = ((base - y) / HEAT_H).clamp(0.0, 1.0);
-        Color32::from_white_alpha(((0.12 + 0.28 * f) * 255.0 * alpha) as u8)
+        if played_to.is_some_and(|px| x <= px) {
+            accent.gamma_multiply((0.08 + 0.42 * f) * alpha)
+        } else {
+            Color32::from_white_alpha(((0.12 + 0.28 * f) * 255.0 * alpha) as u8)
+        }
     };
     // (a mesh has no anti-aliasing of its own, which left the hill's top edge
     // stair-stepped: so it gets its own soft edge, a 1-pixel strip fading out
@@ -425,8 +436,8 @@ fn draw_heatmap(
             n = -n;
         }
         let half = n * (feather / 2.0);
-        m.colored_vertex(*q - half, shade(q.y)); // inside edge: full
-        m.colored_vertex(pos2(q.x, base), shade(base));
+        m.colored_vertex(*q - half, shade(q.x, q.y)); // inside edge: full
+        m.colored_vertex(pos2(q.x, base), shade(q.x, base));
         m.colored_vertex(*q + half, Color32::TRANSPARENT); // outside edge: none
         if i > 0 {
             let (top0, base0, out0) = (3 * i as u32 - 3, 3 * i as u32 - 2, 3 * i as u32 - 1);
