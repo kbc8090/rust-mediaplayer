@@ -2741,11 +2741,14 @@ fn install_fonts(ctx: &egui::Context) -> CaptionFont {
     let mut fonts = egui::FontDefinitions::default();
 
     // The exact icon font Windows draws its own title-bar buttons with
+    // (Segoe Fluent Icons comes with Windows 11, and can be installed on Windows
+    // 10, often just for the one user, which puts it in that user's own font
+    // folder rather than Windows' one: found through the registry)
     let mut caption = CaptionFont::None;
-    for (path, kind) in [
-        (r"C:\Windows\Fonts\SegoeIcons.ttf", CaptionFont::Fluent),
-        (r"C:\Windows\Fonts\segmdl2.ttf", CaptionFont::Mdl2),
-    ] {
+    let fluent = fluent_icons_paths();
+    let mdl2 = [std::path::PathBuf::from(r"C:\Windows\Fonts\segmdl2.ttf")];
+    let candidates = fluent.iter().map(|p| (p, CaptionFont::Fluent)).chain(mdl2.iter().map(|p| (p, CaptionFont::Mdl2)));
+    for (path, kind) in candidates {
         if let Ok(bytes) = std::fs::read(path) {
             fonts.font_data.insert("caption".into(), egui::FontData::from_owned(bytes));
             caption = kind;
@@ -2850,6 +2853,86 @@ fn hit_edge(p: Pos2, screen: Rect) -> Option<(egui::viewport::ResizeDirection, e
 // ── Windows accent colour ─────────────────────────────────────────────────────
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+/// Where Segoe Fluent Icons may be: the registry's font lists (all users', then
+/// this user's: any entry named "Segoe Fluent Icons…", as installing it by hand
+/// names it "Segoe Fluent Icons Regular (TrueType)", in a file of its own name),
+/// then the usual places and file names
+fn fluent_icons_paths() -> Vec<std::path::PathBuf> {
+    use std::path::PathBuf;
+    let windows_fonts = PathBuf::from(std::env::var("WINDIR").unwrap_or_else(|_| r"C:\Windows".into())).join("Fonts");
+    let user_fonts = std::env::var("LOCALAPPDATA").ok().map(|l| PathBuf::from(l).join(r"Microsoft\Windows\Fonts"));
+    let mut out = Vec::new();
+    const FONTS_KEY: &str = r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts";
+    // HKEY_LOCAL_MACHINE, HKEY_CURRENT_USER
+    for root in [0x8000_0002_u32, 0x8000_0001_u32] {
+        for (name, file) in reg_strings(root, FONTS_KEY) {
+            if name.to_lowercase().starts_with("segoe fluent icons") {
+                let p = PathBuf::from(&file);
+                // (a bare file name is in Windows' font folder)
+                out.push(if p.is_absolute() { p } else { windows_fonts.join(p) });
+            }
+        }
+    }
+    for file in ["SegoeIcons.ttf", "Segoe Fluent Icons.ttf"] {
+        out.push(windows_fonts.join(file));
+        if let Some(u) = &user_fonts {
+            out.push(u.join(file));
+        }
+    }
+    out
+}
+
+#[link(name = "advapi32")]
+unsafe extern "system" {
+    fn RegOpenKeyExW(hkey: isize, sub_key: *const u16, options: u32, sam: u32, result: *mut isize) -> i32;
+    fn RegEnumValueW(
+        hkey: isize,
+        index: u32,
+        name: *mut u16,
+        name_len: *mut u32,
+        reserved: *mut u32,
+        value_type: *mut u32,
+        data: *mut u8,
+        data_len: *mut u32,
+    ) -> i32;
+    fn RegCloseKey(hkey: isize) -> i32;
+}
+
+/// Every text value (name, text) under a registry key (`root`:
+/// HKEY_LOCAL_MACHINE 0x80000002 or HKEY_CURRENT_USER 0x80000001)
+fn reg_strings(root: u32, sub_key: &str) -> Vec<(String, String)> {
+    let key = wide(sub_key);
+    let mut h: isize = 0;
+    // KEY_READ = 0x20019
+    if unsafe { RegOpenKeyExW(root as i32 as isize, key.as_ptr(), 0, 0x20019, &mut h) } != 0 {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let mut name = vec![0u16; 512];
+    let mut data = vec![0u8; 2048];
+    for index in 0..4096 {
+        let mut name_len = name.len() as u32;
+        let mut data_len = data.len() as u32;
+        let mut kind = 0u32;
+        let rc = unsafe {
+            RegEnumValueW(h, index, name.as_mut_ptr(), &mut name_len, std::ptr::null_mut(), &mut kind, data.as_mut_ptr(), &mut data_len)
+        };
+        if rc == 259 {
+            break; // ERROR_NO_MORE_ITEMS
+        }
+        // (REG_SZ 1 / REG_EXPAND_SZ 2 only; a value too long for the buffers is skipped)
+        if rc != 0 || !(kind == 1 || kind == 2) {
+            continue;
+        }
+        let text: Vec<u16> = data[..data_len as usize].chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).take_while(|&c| c != 0).collect();
+        out.push((String::from_utf16_lossy(&name[..name_len as usize]), String::from_utf16_lossy(&text)));
+    }
+    unsafe {
+        RegCloseKey(h);
+    }
+    out
 }
 
 fn reg_dword(sub_key: &str, value: &str) -> Option<u32> {
