@@ -826,6 +826,8 @@ pub(crate) struct SongInfo {
     pub(crate) bits: Option<u32>,
     /// Average bitrate (kb/s): the sound's share of the file over its length
     pub(crate) kbps: Option<u32>,
+    /// An MP3 encoded at a variable bitrate
+    pub(crate) vbr: bool,
 }
 
 pub(crate) fn song_info(path: &str) -> SongInfo {
@@ -836,6 +838,9 @@ pub(crate) fn song_info(path: &str) -> SongInfo {
     use symphonia::core::meta::{MetadataOptions, StandardTag};
 
     let mut info = SongInfo::default();
+    if std::path::Path::new(path).extension().is_some_and(|e| e.eq_ignore_ascii_case("mp3")) {
+        info.vbr = mp3_is_vbr(path);
+    }
     let Ok(file) = std::fs::File::open(path) else { return info };
     let size = file.metadata().map(|m| m.len()).unwrap_or(0);
     let mss = MediaSourceStream::new(Box::new(file), Default::default());
@@ -876,11 +881,60 @@ pub(crate) fn song_info(path: &str) -> SongInfo {
     info
 }
 
+/// Is this MP3 variable-bitrate? Encoders say so in the first frame: a "Xing" or
+/// "VBRI" header means variable, "Info" means constant (no header: constant).
+/// Reads only the file's first 128 KB.
+fn mp3_is_vbr(path: &str) -> bool {
+    use std::io::Read;
+    let Ok(mut f) = std::fs::File::open(path) else { return false };
+    let mut head = [0u8; 10];
+    if f.read_exact(&mut head).is_err() {
+        return false;
+    }
+    // Skip an ID3v2 tag (its size: 4 × 7 bits, plus a footer if flagged)
+    let mut skip = 0u64;
+    if &head[..3] == b"ID3" {
+        let n = head[6..10].iter().fold(0u64, |a, &b| (a << 7) | (b & 0x7f) as u64);
+        skip = 10 + n + if head[5] & 0x10 != 0 { 10 } else { 0 };
+    }
+    use std::io::Seek;
+    if f.seek(std::io::SeekFrom::Start(skip)).is_err() {
+        return false;
+    }
+    let mut buf = Vec::with_capacity(128 * 1024);
+    if f.take(128 * 1024).read_to_end(&mut buf).is_err() {
+        return false;
+    }
+    // The first MPEG audio Layer III frame header
+    let Some(at) = (0..buf.len().saturating_sub(4)).find(|&i| {
+        buf[i] == 0xff && buf[i + 1] & 0xe0 == 0xe0 && (buf[i + 1] >> 1) & 3 == 1 && (buf[i + 1] >> 3) & 3 != 1 && buf[i + 2] >> 4 != 0xf
+    }) else {
+        return false;
+    };
+    let mpeg1 = (buf[at + 1] >> 3) & 3 == 3;
+    let mono = buf[at + 3] >> 6 == 3;
+    // (the Xing / Info header comes after the frame's side information)
+    let side = match (mpeg1, mono) {
+        (true, false) => 32,
+        (true, true) | (false, false) => 17,
+        (false, true) => 9,
+    };
+    let tag = |off: usize| buf.get(at + off..at + off + 4);
+    match tag(4 + side) {
+        Some(b"Xing") => true,
+        Some(b"Info") => false,
+        _ => tag(36) == Some(b"VBRI"),
+    }
+}
+
 /// The song's format for the top bar: its name ("FLAC") and the details,
 /// longest first with shorter ones for less room ("16-bit · 44.1 kHz · 1,012
 /// kb/s", "16-bit · 44.1 kHz", ""). `codec`: mpv's name for the sound's codec;
 /// `rate`: mpv's sample rate, used when the file's own details aren't known.
-pub(crate) fn song_format(path: &str, codec: &str, rate: Option<u32>, info: Option<&SongInfo>) -> Option<(String, Vec<String>)> {
+/// `live_kbps`: the bitrate as it plays, shown instead of the average for
+/// a variable bitrate (VBR MP3s, which also say "VBR"; FLAC and the other
+/// lossless formats, always variable).
+pub(crate) fn song_format(path: &str, codec: &str, rate: Option<u32>, info: Option<&SongInfo>, live_kbps: Option<u32>) -> Option<(String, Vec<String>)> {
     let ext = std::path::Path::new(path).extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
     let (name, lossless) = match codec {
         "flac" => ("FLAC", true),
@@ -910,9 +964,12 @@ pub(crate) fn song_format(path: &str, codec: &str, rate: Option<u32>, info: Opti
         parts.push(if (khz - khz.round()).abs() < 0.05 { format!("{} kHz", khz.round()) } else { format!("{khz:.1} kHz") });
     }
     let short = parts.len();
-    if let Some(k) = info.and_then(|i| i.kbps) {
+    let vbr = name == "MP3" && info.is_some_and(|i| i.vbr);
+    let variable = vbr || (lossless && !codec.starts_with("pcm"));
+    let kbps = if variable { live_kbps.or(info.and_then(|i| i.kbps)) } else { info.and_then(|i| i.kbps) };
+    if let Some(k) = kbps {
         let k = if k >= 1000 { format!("{},{:03}", k / 1000, k % 1000) } else { k.to_string() };
-        parts.push(format!("{k} kb/s"));
+        parts.push(if vbr { format!("{k} kb/s (VBR)") } else { format!("{k} kb/s") });
     }
     // the details, longest first, ending with none
     let mut details = vec![parts.join(" \u{b7} ")];

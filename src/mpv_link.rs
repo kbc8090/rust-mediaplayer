@@ -58,6 +58,9 @@ pub struct Snapshot {
     /// The sound's codec ("flac", "mp3"...) and sample rate, for the FORMAT line
     pub audio_codec: String,
     pub audio_rate: i64,
+    /// The sound's bitrate as it plays (bits/s; mpv works it out from the
+    /// packets and refreshes it about once a second), for variable-bitrate songs
+    pub audio_bitrate: f64,
 }
 
 /// What is in the current file's picture
@@ -287,6 +290,7 @@ fn run(mpv: Arc<Mutex<Mpv>>, rx: mpsc::Receiver<Job>, state: Arc<Mutex<Snapshot>
             album: m.get_property::<String>("metadata/by-key/album").unwrap_or_default(),
             audio_codec: m.get_property::<String>("audio-codec-name").unwrap_or_default(),
             audio_rate: m.get_property::<i64>("audio-params/samplerate").unwrap_or(0),
+            audio_bitrate: m.get_property::<f64>("audio-bitrate").unwrap_or(0.0),
         };
         let key = (
             m.get_property::<String>("path").unwrap_or_default(),

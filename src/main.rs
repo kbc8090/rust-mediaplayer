@@ -463,6 +463,13 @@ struct FluentMediaPlayer {
     song_album: String,
     song_codec: String,
     song_rate: i64,
+    /// A variable-bitrate song's bitrate as it plays (kb/s), and when it was last
+    /// taken: shown afresh every 2.5 s, slow enough to read
+    song_kbps_live: Option<u32>,
+    song_kbps_at: std::time::Instant,
+    /// The top bar's song details: their widest so far for this song (and which
+    /// length of them), so a changing bitrate doesn't shift the "FLAC" tag about
+    pub(crate) format_w: (String, usize, f32),
     /// The playing song's own details (bit depth, average bitrate...), read on
     /// another thread when it starts: (its path, the details)
     song_info: Arc<Mutex<Option<(String, visualizer::SongInfo)>>>,
@@ -763,6 +770,9 @@ impl FluentMediaPlayer {
             song_album: String::new(),
             song_codec: String::new(),
             song_rate: 0,
+            song_kbps_live: None,
+            song_kbps_at: std::time::Instant::now(),
+            format_w: (String::new(), 0, 0.0),
             song_info: Arc::new(Mutex::new(None)),
             cover_aspect: 1.0,
             scope: visualizer::Scope::new(),
@@ -989,6 +999,7 @@ impl FluentMediaPlayer {
         self.is_playing = true;
         self.time_pos = 0.0;
         self.seek_target = None;
+        self.song_kbps_live = None;
         self.eof = false;
         self.chapters = Arc::new(Vec::new());
         self.link_thumbs = None;
@@ -1502,7 +1513,7 @@ impl FluentMediaPlayer {
             return None;
         }
         let info = self.song_info.lock().ok().and_then(|s| s.as_ref().filter(|(p, _)| *p == self.current_file).map(|(_, i)| i.clone()));
-        visualizer::song_format(&self.current_file, &self.song_codec, u32::try_from(self.song_rate).ok(), info.as_ref())
+        visualizer::song_format(&self.current_file, &self.song_codec, u32::try_from(self.song_rate).ok(), info.as_ref(), self.song_kbps_live)
     }
 
     fn quit(&mut self) -> ! {
@@ -1867,6 +1878,13 @@ impl eframe::App for FluentMediaPlayer {
                     self.song_codec.clone_from(&snap.audio_codec);
                 }
                 self.song_rate = snap.audio_rate;
+                if snap.path == self.current_file && snap.audio_bitrate > 0.0 && !snap.paused {
+                    let due = now.saturating_duration_since(self.song_kbps_at) >= std::time::Duration::from_millis(2500);
+                    if self.song_kbps_live.is_none() || due {
+                        self.song_kbps_live = Some((snap.audio_bitrate / 1000.0).round() as u32);
+                        self.song_kbps_at = now;
+                    }
+                }
                 if snap.dwidth > 0 && snap.dheight > 0 {
                     self.cover_aspect = snap.dwidth as f32 / snap.dheight as f32;
                 }

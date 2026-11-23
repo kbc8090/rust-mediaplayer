@@ -556,7 +556,14 @@ pub(crate) fn draw_top_bar(app: &mut FluentMediaPlayer, ctx: &egui::Context, t: 
                     let w = tag_size.x + if d.is_empty() { 0.0 } else { 8.0 + g.size().x };
                     (w <= room).then_some((g, w))
                 };
-                if let Some((g, w)) = details.iter().find_map(fits) {
+                if let Some((i, g, w)) = details.iter().enumerate().find_map(|(i, d)| fits(d).map(|(g, w)| (i, g, w))) {
+                    // (placed by the widest these details have been for this song,
+                    // so a bitrate that changes as it plays doesn't move the tag)
+                    let same = app.format_w.1 == i && app.format_w.0 == app.current_file;
+                    let w = if same { w.max(app.format_w.2) } else { w };
+                    if !same || w > app.format_w.2 {
+                        app.format_w = (app.current_file.clone(), i, w);
+                    }
                     let left = right_limit - w;
                     let tr = Rect::from_min_size(pos2(left, y - tag_size.y / 2.0), tag_size);
                     p.rect_stroke(tr.shrink(0.5), 4.0, Stroke::new(1.0_f32, accent.gamma_multiply(0.6)));
