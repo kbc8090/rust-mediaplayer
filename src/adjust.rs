@@ -470,6 +470,32 @@ pub fn activated(resp: &egui::Response) -> bool {
         || (resp.drag_stopped() && resp.ctx.input(|i| i.pointer.latest_pos()).is_some_and(|p| resp.rect.contains(p)))
 }
 
+/// The accent colour lightened a little, for an icon or text on a dark ground
+fn accent_text(accent: Color32) -> Color32 {
+    Color32::from_rgb(accent.r() / 4 * 3 + 64, accent.g() / 4 * 3 + 64, accent.b() / 4 * 3 + 64)
+}
+
+/// Shuffle: two crossing arrows
+fn icon_shuffle(p: &egui::Painter, c: Pos2, col: Color32) {
+    let st = Stroke::new(1.3_f32, col);
+    // (each path: flat, an eased crossing, flat; its arrow at the right end)
+    for (y0, y1) in [(-4.0_f32, 4.0_f32), (4.0, -4.0)] {
+        let pts: Vec<Pos2> = (0..=16)
+            .map(|i| {
+                let t = i as f32 / 16.0;
+                let x = -7.0 + 13.0 * t;
+                let k = ((x + 3.5) / 7.0).clamp(0.0, 1.0);
+                let e = k * k * (3.0 - 2.0 * k);
+                c + vec2(x, y0 + (y1 - y0) * e)
+            })
+            .collect();
+        p.add(egui::Shape::line(pts, st));
+        let tip = c + vec2(6.5, y1);
+        p.line_segment([tip + vec2(-2.8, -2.8), tip], st);
+        p.line_segment([tip + vec2(-2.8, 2.8), tip], st);
+    }
+}
+
 /// Number of points for a round curve of radius `r` points, so each straight piece
 /// is about 1.5 screen pixels long whatever the display scaling (egui's own circles
 /// choose from the size in points, and small ones look like polygons above 100 %)
@@ -1960,7 +1986,8 @@ const TAB_GAP: f32 = 6.0;
 /// The playlist panel on the right: every entry (click one to play it), and its
 /// two options. `playing`: heights for the playing entry's three-bar mark;
 /// `progress`: how far into it (0…1), shown as a fill along its row. `shuffle`:
-/// for a playlist of files dropped together ("Selected playlist"), a Shuffle switch.
+/// `selected`: a playlist of files dropped / opened together ("Selected playlist").
+/// `shuffle`: the Shuffle button in the header.
 /// With it, its tab on the window's right edge: click to slide the panel out
 /// from behind it, or back in (`tab_alpha`: the tab's strength, fainter while
 /// the controls are hidden).
@@ -1974,7 +2001,8 @@ pub fn draw_playlist(
     progress: f32,
     replay: &mut bool,
     summary: &mut bool,
-    shuffle: Option<&mut bool>,
+    selected: bool,
+    shuffle: &mut bool,
     accent: Color32,
     tab_alpha: f32,
 ) -> PlaylistAction {
@@ -1986,10 +2014,10 @@ pub fn draw_playlist(
     const ITEM_H: f32 = 28.0;
     let screen = ctx.screen_rect();
     let w = PANEL_W.min(screen.width() - 16.0);
-    let title = if shuffle.is_some() { "Selected playlist" } else { "Playlist" };
+    let title = if selected { "Selected playlist" } else { "Playlist" };
     // (shuffled, "already played" isn't the ones above: no greyed-out rows then)
-    let grey_played = !shuffle.as_deref().copied().unwrap_or(false);
-    let switches = if shuffle.is_some() { 3.0 } else { 2.0 };
+    let grey_played = !*shuffle;
+    let switches = 2.0;
     // (the separator right under the list, 4 px from the rows on each side of it)
     let foot_h = 5.0 + ROW_H * switches + EDGE;
     let max_h = (screen.height() - PANEL_TOP - BOTTOM_GAP).max(HEAD_H + foot_h + ITEM_H * 2.0);
@@ -2068,20 +2096,31 @@ pub fn draw_playlist(
         crate::controls::icon_playlist(&p, pos2(rect.left() + 25.0, cy), accent, None);
         let title_x = rect.left() + 42.0;
         p.text(pos2(title_x, cy), Align2::LEFT_CENTER, title, semibold(14.5), TEXT);
-        // "3 of 12 · 46:00" after the title (the total only once every length is known)
+        // Shuffle, left of the close button: lit in the accent colour while on
+        let sr = Rect::from_center_size(pos2(rect.right() - 54.0, cy), vec2(28.0, 28.0));
+        let sresp = ui.interact(sr, ui.id().with("playlist_shuffle"), Sense::click_and_drag());
+        if *shuffle {
+            p.rect_filled(sr, 4.0, accent.gamma_multiply(0.22));
+        }
+        if let Some(c) = state_fill(&sresp) {
+            p.rect_filled(sr, 4.0, c);
+        }
+        icon_shuffle(&p, sr.center(), if *shuffle { accent_text(accent) } else { TEXT });
+        crate::controls::hover_tooltip(ui.ctx(), &sresp, sr, if *shuffle { "Shuffle: on" } else { "Shuffle: off" }, false);
+        if activated(&sresp) {
+            *shuffle = !*shuffle;
+        }
+        // The total length after the title (once every length is known; left
+        // out when it would run into the buttons)
         let title_w = p.layout_no_wrap(title.to_owned(), semibold(14.5), TEXT).size().x;
         let total: Option<f64> = rows.iter().map(|r| r.secs).sum();
-        let short = format!("{} of {}", current + 1, rows.len());
-        let mut count = match total {
-            Some(t) => format!("{short} \u{b7} {}", clock(t)),
-            None => short.clone(),
-        };
-        // (without the total when it would run into the close button)
-        let count_x = title_x + title_w + 9.0;
-        if count_x + p.layout_no_wrap(count.clone(), FontId::proportional(11.5), DIM).size().x > rect.right() - 42.0 {
-            count = short;
+        if let Some(t) = total {
+            let count = clock(t);
+            let count_x = title_x + title_w + 9.0;
+            if count_x + p.layout_no_wrap(count.clone(), FontId::proportional(11.5), DIM).size().x <= sr.left() - 6.0 {
+                p.text(pos2(count_x, cy + 0.5), Align2::LEFT_CENTER, count, FontId::proportional(11.5), DIM);
+            }
         }
-        p.text(pos2(count_x, cy + 0.5), Align2::LEFT_CENTER, count, FontId::proportional(11.5), DIM);
 
         // The entries (scrolling when they don't fit)
         let list = Rect::from_min_size(pos2(rect.left() + EDGE, rect.top() + HEAD_H + 3.0), vec2(w - 2.0 * EDGE, list_h - 6.0));
@@ -2147,12 +2186,7 @@ pub fn draw_playlist(
         let mut top = rect.top() + HEAD_H + list_h;
         p.line_segment([pos2(rect.left() + 1.0, top + 0.5), pos2(rect.right() - 1.0, top + 0.5)], Stroke::new(1.0_f32, LINE));
         top += 5.0;
-        let mut shuffle = shuffle;
-        let has_shuffle = shuffle.is_some();
-        for (label, key) in [("Shuffle", 2), ("Replay when it ends", 0), ("Always show \u{201c}Up next\u{201d}", 1)] {
-            if key == 2 && !has_shuffle {
-                continue;
-            }
+        for (label, key) in [("Replay when it ends", 0), ("Always show \u{201c}Up next\u{201d}", 1)] {
             let r = Rect::from_min_size(pos2(rect.left() + EDGE, top), vec2(w - 2.0 * EDGE, ROW_H));
             top += ROW_H;
             let resp = ui.interact(r, ui.id().with(("playlist_switch", key)), Sense::click_and_drag());
@@ -2160,21 +2194,13 @@ pub fn draw_playlist(
                 p.rect_filled(r, 4.0, c);
             }
             p.text(pos2(r.left() + 10.0, r.center().y), Align2::LEFT_CENTER, label, FontId::proportional(NAME_SIZE), TEXT);
-            let on = match key {
-                0 => *replay,
-                1 => *summary,
-                _ => shuffle.as_deref().copied().unwrap_or(false),
-            };
+            let on = if key == 0 { *replay } else { *summary };
             switch(&p, Rect::from_center_size(pos2(r.right() - 28.0, r.center().y), vec2(38.0, 19.0)), on, accent);
             if activated(&resp) {
-                match key {
-                    0 => *replay = !*replay,
-                    1 => *summary = !*summary,
-                    _ => {
-                        if let Some(sh) = shuffle.as_deref_mut() {
-                            *sh = !*sh;
-                        }
-                    }
+                if key == 0 {
+                    *replay = !*replay;
+                } else {
+                    *summary = !*summary;
                 }
             }
         }
@@ -2182,7 +2208,7 @@ pub fn draw_playlist(
     action
 }
 
-/// The "Up next" card, bottom right: the next three entries (click one to play
+/// The "Up next" card, bottom right: the next two entries (click one to play
 /// it) and a link to the whole list
 /// `noun`: "songs", "videos" or "files", for its "All 12 songs…" link
 /// (`next`: the next entries in playing order: shuffled, or going round to the

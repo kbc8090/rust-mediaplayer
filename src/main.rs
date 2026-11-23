@@ -1431,17 +1431,17 @@ impl FluentMediaPlayer {
             // (the playing row's progress fill moves on)
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
-        let shuffle_opt = self.playlist_selected.then_some(&mut shuffle);
+
         // (the tab on the right edge: full strength with the controls, faint
         // while they're hidden, so it doesn't sit bright over a video)
         let controls = ctx.animate_bool_with_time(egui::Id::new("overlay_vis"), self.show_controls, 0.2);
         let tab_alpha = 0.45 + 0.55 * controls;
-        let mut action = adjust::draw_playlist(ctx, &mut self.adjust_ui, &self.playlist_rows, current, mark, progress, &mut replay, &mut summary, shuffle_opt, self.accent, tab_alpha);
+        let mut action = adjust::draw_playlist(ctx, &mut self.adjust_ui, &self.playlist_rows, current, mark, progress, &mut replay, &mut summary, self.playlist_selected, &mut shuffle, self.accent, tab_alpha);
         if summary && !self.adjust_ui.playlist_open {
             let noun = self.playlist_noun();
-            // the next three in playing order
+            // the next two in playing order
             let mut next = Vec::new();
-            for d in 1..=3 {
+            for d in 1..=2 {
                 match self.step_index(d) {
                     Some(k) if k != current && !next.contains(&k) => next.push(k),
                     _ => break,
