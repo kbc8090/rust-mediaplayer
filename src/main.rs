@@ -1396,6 +1396,7 @@ impl FluentMediaPlayer {
         if self.playlist.is_none() || self.playlist_rows.is_empty() {
             self.adjust_ui.playlist_open = false;
             self.adjust_ui.playlist_rect = Rect::NOTHING;
+            self.adjust_ui.playlist_tab = Rect::NOTHING;
             self.adjust_ui.summary_rect = Rect::NOTHING;
             return;
         }
@@ -1424,7 +1425,11 @@ impl FluentMediaPlayer {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
         let shuffle_opt = self.playlist_selected.then_some(&mut shuffle);
-        let mut action = adjust::draw_playlist(ctx, &mut self.adjust_ui, &self.playlist_rows, current, mark, progress, &mut replay, &mut summary, shuffle_opt, self.accent);
+        // (the tab on the right edge: full strength with the controls, faint
+        // while they're hidden, so it doesn't sit bright over a video)
+        let controls = ctx.animate_bool_with_time(egui::Id::new("overlay_vis"), self.show_controls, 0.2);
+        let tab_alpha = 0.45 + 0.55 * controls;
+        let mut action = adjust::draw_playlist(ctx, &mut self.adjust_ui, &self.playlist_rows, current, mark, progress, &mut replay, &mut summary, shuffle_opt, self.accent, tab_alpha);
         if summary && !self.adjust_ui.playlist_open {
             let noun = self.playlist_noun();
             // the next three in playing order
@@ -2539,7 +2544,8 @@ impl eframe::App for FluentMediaPlayer {
         let edge = if self.is_fullscreen || maximized {
             None
         } else {
-            inp.pointer.and_then(|p| hit_edge(p, screen))
+            // (not on the playlist's tab, which sits on the right edge)
+            inp.pointer.filter(|p| !self.adjust_ui.playlist_tab.contains(*p)).and_then(|p| hit_edge(p, screen))
         };
         if let Some((dir, _)) = edge {
             if inp.pressed {

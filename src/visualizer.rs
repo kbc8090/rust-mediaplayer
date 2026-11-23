@@ -670,8 +670,12 @@ impl Bars {
         let s = (rect.height() / 720.0).clamp(0.45, 2.0);
         let c = pos2(rect.center().x, l.cover_bottom - side / 2.0).round();
         let gap = 7.0 * s;
-        const LONGEST: f32 = 0.62; // (of the ring's radius)
-        let r = ((side / 2.0 - gap) / (1.0 + LONGEST)).round();
+        // The ring: about an eighth of the window's height across its radius
+        // (smaller than the space allows, so the bars have room to fly out),
+        // and the bars up to 1.2 times its radius long; smaller still if the
+        // space is short
+        const LONGEST: f32 = 1.2; // (of the ring's radius)
+        let r = (rect.height() * 0.127).min((side / 2.0 - gap) / (1.0 + LONGEST)).round();
         self.backdrop(&p, rect, accent, c.y);
         let acc = splash::rgb(accent);
         let white: Rgb = [1.0, 1.0, 1.0];

@@ -408,6 +408,8 @@ pub struct AdjustUi {
     /// The playlist panel (right side) and the "Up next" card (bottom right)
     pub playlist_open: bool,
     pub playlist_rect: Rect,
+    /// The tab on the window's right edge that slides the playlist in and out
+    pub playlist_tab: Rect,
     pub summary_rect: Rect,
     /// Scroll the playlist to the playing entry (set when it opens)
     pub playlist_scroll: bool,
@@ -432,6 +434,7 @@ impl AdjustUi {
             lang_scroll: false,
             playlist_open: false,
             playlist_rect: Rect::NOTHING,
+            playlist_tab: Rect::NOTHING,
             summary_rect: Rect::NOTHING,
             playlist_scroll: false,
         }
@@ -442,6 +445,7 @@ impl AdjustUi {
             || (self.eq_open && self.eq_rect.contains(p))
             || (self.online_open && (self.online_rect.contains(p) || (self.lang_open && self.lang_rect.contains(p))))
             || (self.playlist_open && self.playlist_rect.contains(p))
+            || self.playlist_tab.contains(p)
             || self.summary_rect.contains(p)
     }
 }
@@ -1947,10 +1951,19 @@ fn playing_mark(p: &egui::Painter, right: f32, bottom: f32, levels: [f32; 3], co
     }
 }
 
+/// Width of the playlist's tab on the window's right edge, its height, and the
+/// gap between it and the open panel
+const TAB_W: f32 = 14.0;
+const TAB_H: f32 = 116.0;
+const TAB_GAP: f32 = 6.0;
+
 /// The playlist panel on the right: every entry (click one to play it), and its
 /// two options. `playing`: heights for the playing entry's three-bar mark;
 /// `progress`: how far into it (0…1), shown as a fill along its row. `shuffle`:
 /// for a playlist of files dropped together ("Selected playlist"), a Shuffle switch.
+/// With it, its tab on the window's right edge: click to slide the panel out
+/// from behind it, or back in (`tab_alpha`: the tab's strength, fainter while
+/// the controls are hidden).
 #[allow(clippy::too_many_arguments)]
 pub fn draw_playlist(
     ctx: &egui::Context,
@@ -1963,9 +1976,11 @@ pub fn draw_playlist(
     summary: &mut bool,
     shuffle: Option<&mut bool>,
     accent: Color32,
+    tab_alpha: f32,
 ) -> PlaylistAction {
-    if !ui_state.playlist_open || rows.is_empty() {
+    if rows.is_empty() {
         ui_state.playlist_rect = Rect::NOTHING;
+        ui_state.playlist_tab = Rect::NOTHING;
         return PlaylistAction::None;
     }
     const ITEM_H: f32 = 28.0;
@@ -1981,12 +1996,64 @@ pub fn draw_playlist(
     // (3 px above and below the rows: with their highlights 1 px in, 4 px gaps)
     let list_h = (rows.len() as f32 * ITEM_H + 6.0).min(max_h - HEAD_H - foot_h);
     let h = HEAD_H + list_h + foot_h;
-    let rect = Rect::from_min_size(pos2(screen.right() - 8.0 - w, screen.top() + PANEL_TOP), vec2(w, h));
-    ui_state.playlist_rect = rect;
-
+    let open_rect = Rect::from_min_size(pos2(screen.right() - TAB_W - TAB_GAP - w, screen.top() + PANEL_TOP), vec2(w, h));
     let mut action = PlaylistAction::None;
+
+    // The tab: on the right edge, level with the middle of the panel; ‹ while
+    // the panel is in, › while it's out
+    let tab = Rect::from_min_size(pos2(screen.right() - TAB_W, (open_rect.center().y - TAB_H / 2.0).round()), vec2(TAB_W, TAB_H));
+    ui_state.playlist_tab = tab;
+    let tab_id = egui::Id::new("playlist_tab");
+    egui::Area::new(tab_id).order(egui::Order::Foreground).fixed_pos(tab.min).show(ctx, |ui| {
+        let resp = ui.interact(tab, ui.id().with("tab"), Sense::click_and_drag());
+        let hot = resp.hovered() || resp.is_pointer_button_down_on();
+        let a = if hot { 1.0 } else { tab_alpha };
+        let p = ui.painter();
+        // (its right side runs off the window, so only three sides show a border)
+        let body = Rect::from_min_max(tab.min, pos2(tab.right() + 8.0, tab.bottom()));
+        let round = egui::Rounding { nw: 7.0, sw: 7.0, ne: 0.0, se: 0.0 };
+        if hot {
+            let glow = egui::epaint::Shadow { offset: vec2(-1.0, 0.0), blur: 12.0, spread: 0.0, color: accent.gamma_multiply(0.45) };
+            p.add(glow.tessellate(tab, round));
+        } else {
+            let shadow = egui::epaint::Shadow { offset: vec2(-2.0, 0.0), blur: 8.0, spread: 0.0, color: Color32::from_black_alpha((100.0 * a) as u8) };
+            p.add(shadow.tessellate(tab, round));
+        }
+        let fill = if hot { Color32::from_rgb(60, 44, 58) } else { Color32::from_rgb(40, 38, 46) };
+        p.rect_filled(body, round, fill.gamma_multiply(0.92 * a));
+        let edge = if hot { accent.gamma_multiply(0.8) } else { Color32::from_white_alpha((36.0 * a) as u8) };
+        p.with_clip_rect(tab).rect_stroke(body.shrink(0.5), round, Stroke::new(1.0_f32, edge));
+        let c = tab.center();
+        let d = if ui_state.playlist_open { 1.0 } else { -1.0 };
+        let col = Color32::from_rgb(235, 235, 240).gamma_multiply(a);
+        p.line_segment([c + vec2(-1.5 * d, -4.5), c + vec2(2.0 * d, 0.0)], Stroke::new(1.3_f32, col));
+        p.line_segment([c + vec2(2.0 * d, 0.0), c + vec2(-1.5 * d, 4.5)], Stroke::new(1.3_f32, col));
+        if hot {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        let tip = if ui_state.playlist_open { "Hide playlist (L)" } else { "Show playlist (L)" };
+        crate::controls::hover_tooltip(ui.ctx(), &resp, tab, tip, true);
+        if activated(&resp) {
+            action = PlaylistAction::Open;
+        }
+    });
+    ctx.move_to_top(egui::LayerId::new(egui::Order::Foreground, tab_id));
+
+    // The panel slides out from behind the tab (and back in): eased, a fifth of
+    // a second
+    let slide = ctx.animate_bool_with_time(egui::Id::new("playlist_slide"), ui_state.playlist_open, 0.2);
+    if slide <= 0.0 {
+        ui_state.playlist_rect = Rect::NOTHING;
+        return action;
+    }
+    let ease = 1.0 - (1.0 - slide).powi(3);
+    let rect = open_rect.translate(vec2(((1.0 - ease) * (w + TAB_GAP + 2.0)).round(), 0.0));
+    ui_state.playlist_rect = rect;
     let id = egui::Id::new("playlist_panel");
     egui::Area::new(id).order(egui::Order::Foreground).fixed_pos(rect.min).show(ctx, |ui| {
+        // (hidden past the tab's left edge while it slides)
+        let clip = ui.clip_rect().intersect(Rect::from_min_max(pos2(screen.left(), screen.top()), pos2(tab.left(), screen.bottom())));
+        ui.set_clip_rect(clip);
         ui.allocate_rect(rect, Sense::click_and_drag());
         let p = ui.painter().clone();
         panel_frame(&p, rect);
@@ -2126,7 +2193,8 @@ pub fn draw_playlist_summary(ctx: &egui::Context, ui_state: &mut AdjustUi, rows:
     let w = 240.0_f32.min(screen.width() - 16.0);
     let body = if next.is_empty() { ITEM_H } else { next.len() as f32 * ITEM_H };
     let h = 34.0 + body + 22.0 + EDGE;
-    let rect = Rect::from_min_size(pos2(screen.right() - 12.0 - w, screen.bottom() - BOTTOM_GAP - h), vec2(w, h));
+    // (clear of the playlist's tab on the right edge)
+    let rect = Rect::from_min_size(pos2(screen.right() - TAB_W - TAB_GAP - w, screen.bottom() - BOTTOM_GAP - h), vec2(w, h));
     ui_state.summary_rect = rect;
 
     let mut action = PlaylistAction::None;
