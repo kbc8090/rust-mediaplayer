@@ -325,6 +325,11 @@ struct FluentMediaPlayer {
     /// After a user action, keep our own values for a moment instead of the
     /// (slightly older) snapshot, so buttons and the seek bar don't flicker back
     hold_until: std::time::Instant,
+    /// A seek mpv may not have finished yet (where to, when asked): until mpv
+    /// reports a position there, the bar stays at the new place rather than
+    /// jumping back to the old one in between (a file on a slow or sleeping
+    /// drive can take a second or two)
+    seek_target: Option<(f64, std::time::Instant)>,
     /// mpv sits on the last frame of a finished video
     eof: bool,
     /// Decoder / video lines from the mpv thread for the info overlay
@@ -675,6 +680,7 @@ impl FluentMediaPlayer {
             mpv: mpv.clone(),
             link,
             hold_until: std::time::Instant::now(),
+            seek_target: None,
             eof: false,
             mpv_info: Vec::new(),
             render_ctx_initialized: false,
@@ -978,6 +984,7 @@ impl FluentMediaPlayer {
         self.link.set("pause", "no");
         self.is_playing = true;
         self.time_pos = 0.0;
+        self.seek_target = None;
         self.eof = false;
         self.chapters = Arc::new(Vec::new());
         self.link_thumbs = None;
@@ -1514,6 +1521,7 @@ impl FluentMediaPlayer {
     fn seek_to(&mut self, secs: f64) {
         self.link.set("time-pos", secs);
         self.time_pos = secs;
+        self.seek_target = Some((secs, std::time::Instant::now()));
         self.touch();
     }
 
@@ -1861,6 +1869,29 @@ impl eframe::App for FluentMediaPlayer {
                 self.apply_vf();
             }
             self.adjust_ui.denoise_skipped = self.adjust.denoise > 0 && pixels > 1920 * 1088;
+            // Still waiting on a seek? Done once mpv reports a position near
+            // where it was sent (in a reading taken after the seek was asked
+            // for), or after 3 seconds whatever happens, or on another file
+            let seek_waiting = match self.seek_target {
+                Some((to, since)) => {
+                    let waited = now.saturating_duration_since(since).as_secs_f64();
+                    let fresh = snap.taken.is_some_and(|t| t > since);
+                    let arrived = fresh && (snap.time_pos - to).abs() < 1.5 + waited * self.speed;
+                    if arrived || waited > 3.0 || !same_file {
+                        self.seek_target = None;
+                        false
+                    } else {
+                        true
+                    }
+                }
+                None => false,
+            };
+            if now >= self.hold_until && seek_waiting {
+                // (mpv still on the old position: carry on from the new one)
+                if self.is_playing {
+                    self.time_pos += dt * self.speed;
+                }
+            }
             if now >= self.hold_until {
                 // The mpv thread reads the time only ~10x a second. While playing,
                 // move on by the elapsed time every frame and ease toward mpv's value,
@@ -1868,7 +1899,9 @@ impl eframe::App for FluentMediaPlayer {
                 let playing = !snap.paused && !snap.eof;
                 let age = snap.taken.map_or(0.0, |t| now.saturating_duration_since(t).as_secs_f64());
                 let target = if playing { snap.time_pos + age * self.speed } else { snap.time_pos };
-                if playing && (target - self.time_pos).abs() < 0.5 {
+                if seek_waiting {
+                    // (moved on above)
+                } else if playing && (target - self.time_pos).abs() < 0.5 {
                     self.time_pos += dt * self.speed;
                     self.time_pos += (target - self.time_pos) * 0.15;
                 } else {
