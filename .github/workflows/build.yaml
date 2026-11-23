@@ -254,7 +254,15 @@ jobs:
           $dir = "$env:RUNNER_TEMP\fftest"
           New-Item -ItemType Directory -Force -Path $dir | Out-Null
           Set-Location $dir
-          & "C:\Program Files\Git\usr\bin\openssl.exe" req -x509 -newkey rsa:2048 -nodes -keyout key.pem -out cert.pem -days 1 -subj "/CN=localhost" 2>$null
+          # (If the test itself can't be set up, that says nothing about ffmpeg: the
+          # small one is kept, with a warning, rather than swapped for the 130 MB one)
+          $openssl = "C:\Program Files\Git\usr\bin\openssl.exe"
+          if (-not (Test-Path $openssl)) { $openssl = (Get-Command openssl -ErrorAction SilentlyContinue).Source }
+          if ($openssl) { & $openssl req -x509 -newkey rsa:2048 -nodes -keyout key.pem -out cert.pem -days 1 -subj "/CN=localhost" 2>&1 | Out-Null }
+          if (-not (Test-Path cert.pem)) {
+            Write-Warning "Couldn't make the test certificate (no openssl?); clip download test skipped, keeping the small ffmpeg"
+            exit 0
+          }
           Set-Content -Path serve.py -Encoding ascii -Value @'
           import http.server, ssl, os, re, wave
           with wave.open("t.wav", "wb") as w:
@@ -286,8 +294,27 @@ jobs:
           srv.socket = ctx.wrap_socket(srv.socket, server_side=True)
           srv.serve_forever()
           '@
-          $server = Start-Process python -ArgumentList "serve.py" -WorkingDirectory $dir -PassThru -WindowStyle Hidden
-          Start-Sleep -Seconds 3
+          $server = Start-Process python -ArgumentList "serve.py" -WorkingDirectory $dir -PassThru -NoNewWindow -RedirectStandardOutput "$dir\server.out" -RedirectStandardError "$dir\server.err"
+          # Wait (up to 20 s) until the server is really listening; a fixed pause
+          # was sometimes too short on a slow runner
+          $ready = $false
+          for ($i = 0; $i -lt 40 -and -not $ready; $i++) {
+            if ($server.HasExited) { break }
+            try {
+              $probe = [System.Net.Sockets.TcpClient]::new()
+              $probe.Connect("127.0.0.1", 8443)
+              $probe.Close()
+              $ready = $true
+            } catch {
+              Start-Sleep -Milliseconds 500
+            }
+          }
+          if (-not $ready) {
+            Get-Content "$dir\server.err" -ErrorAction SilentlyContinue | Write-Host
+            Stop-Process -Id $server.Id -Force -ErrorAction SilentlyContinue
+            Write-Warning "The local test server didn't start; clip download test skipped, keeping the small ffmpeg"
+            exit 0
+          }
           $test = Start-Process $ff -ArgumentList "-hide_banner -v error -y -tls_verify 0 -ss 40 -t 2 -i https://127.0.0.1:8443/t.wav -c copy out.wav" -WorkingDirectory $dir -PassThru -NoNewWindow
           $null = $test.Handle   # (keeps the exit code readable)
           $finished = $test.WaitForExit(30000)
