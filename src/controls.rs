@@ -449,8 +449,35 @@ pub(crate) fn draw_top_bar(app: &mut FluentMediaPlayer, ctx: &egui::Context, t: 
 
             // (text centred on its line box sits a little low next to the icon)
             let y = MENU_Y - 1.0;
-            let right_limit = if fullscreen { screen.right() - 20.0 } else { screen.right() - WIN_BTN_W * 3.0 - 10.0 };
+            let mut right_limit = if fullscreen { screen.right() - 20.0 } else { screen.right() - WIN_BTN_W * 3.0 - 10.0 };
             let tx = TITLE_X;
+
+            // A song's format on the right, before the window buttons: an outlined
+            // "FLAC" tag in the accent colour, then quiet details (shorter, then
+            // left out, when the window is narrow; the title keeps 160 px)
+            if let Some((name, details)) = app.song_format() {
+                let accent = app.accent.gamma_multiply(t);
+                let tag_font = FontId::new(10.5, FontFamily::Name("semibold".into()));
+                let det_font = FontId::proportional(12.0);
+                let tag = p.layout_no_wrap(name, tag_font, accent);
+                let tag_size = tag.size() + vec2(10.0, 3.0);
+                let room = right_limit - (tx + 160.0);
+                let fits = |d: &String| {
+                    let g = p.layout_no_wrap(d.clone(), det_font.clone(), Color32::from_rgb(141, 148, 166).gamma_multiply(t));
+                    let w = tag_size.x + if d.is_empty() { 0.0 } else { 8.0 + g.size().x };
+                    (w <= room).then_some((g, w))
+                };
+                if let Some((g, w)) = details.iter().find_map(fits) {
+                    let left = right_limit - w;
+                    let tr = Rect::from_min_size(pos2(left, y - tag_size.y / 2.0), tag_size);
+                    p.rect_stroke(tr.shrink(0.5), 4.0, Stroke::new(1.0_f32, accent.gamma_multiply(0.6)));
+                    p.galley(tr.center() - tag.size() / 2.0, tag, accent);
+                    if g.size().x > 0.0 {
+                        p.galley(pos2(tr.right() + 8.0, y - g.size().y / 2.0), g, Color32::from_rgb(141, 148, 166));
+                    }
+                    right_limit = left - 14.0;
+                }
+            }
             let clip = p.with_clip_rect(Rect::from_min_max(pos2(tx, 0.0), pos2(right_limit, TOP_H)));
             let font = FontId::new(14.5, FontFamily::Name("semibold".into()));
             clip.text(pos2(tx + 1.0, y + 1.0), Align2::LEFT_CENTER, &title, font.clone(), black(170, t));
@@ -806,23 +833,6 @@ pub(crate) fn draw_bottom_bar(app: &mut FluentMediaPlayer, ctx: &egui::Context, 
                 p.circle_filled(dot, LIVE_DOT, Color32::from_rgb(232, 17, 35).gamma_multiply(t));
                 p.galley(pos2(dot.x + LIVE_DOT + 6.0, row_y - 1.0 - g.size().y / 2.0), g, white);
             }
-            // A song's format in a small box after the time ("FLAC — 16-bit ·
-            // 44.1 kHz · 932 kb/s"; shorter, or left out, when there's less room)
-            let formats = if chapter_at(&app.chapters, app.time_pos).is_none() { app.song_format() } else { Vec::new() };
-            if !formats.is_empty() {
-                let x = lay.time_x + time_w + 14.0;
-                let room = lay.mute - BTN_BOX / 2.0 - 12.0 - x;
-                let font = FontId::proportional(12.0);
-                let col = Color32::from_rgb(205, 210, 222).gamma_multiply(t);
-                let pad = vec2(9.0, 4.0);
-                if let Some(g) = formats.iter().map(|f| p.layout_no_wrap(f.clone(), font.clone(), col)).find(|g| g.size().x + pad.x * 2.0 <= room) {
-                    let r = Rect::from_min_size(pos2(x, row_y - 1.0 - g.size().y / 2.0 - pad.y), g.size() + pad * 2.0);
-                    p.rect_filled(r, 6.0, Color32::from_white_alpha((14.0 * t) as u8));
-                    p.rect_stroke(r.shrink(0.5), 6.0, Stroke::new(1.0_f32, Color32::from_white_alpha((22.0 * t) as u8)));
-                    p.galley(r.min + pad, g, col);
-                }
-            }
-
             // The chapter playing (videos with chapters): "12:41 / 33:07 | Title",
             // cut short to the room before the buttons on the right
             if let Some(title) = chapter_at(&app.chapters, app.time_pos) {

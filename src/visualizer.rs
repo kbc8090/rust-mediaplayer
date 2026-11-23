@@ -607,7 +607,7 @@ impl Bars {
     /// No cover and no bars: the song's details in a frosted box that drifts
     /// slowly round the window, bouncing off its edges (like the old DVD
     /// screensaver), over the faint grid. It only moves while the song plays.
-    /// Returns true while it moves (redraw about 30 times a second).
+    /// Returns true while it moves (redraw about 60 times a second).
     pub(crate) fn draw_floating(&mut self, p: &egui::Painter, rect: Rect, name: SongName, accent: Color32, playing: bool, dt: f32) -> bool {
         let p = p.with_clip_rect(rect);
         self.backdrop(&p, rect, accent, rect.center().y);
@@ -618,9 +618,9 @@ impl Bars {
         // The room it moves in (a little in from the edges)
         let room = rect.shrink(10.0);
         let free = (room.size() - size).max(vec2(0.0, 0.0));
-        // Move: about 16 px a second (at the 720 p size), bouncing at the edges
+        // Move: about 24 px a second (at the 720 p size), bouncing at the edges
         if playing && free.x + free.y > 0.0 {
-            let speed = 16.0 * s * dt.clamp(0.0, 0.1);
+            let speed = 24.0 * s * dt.clamp(0.0, 0.1);
             for (at, dir, room) in [(&mut self.float_at.x, &mut self.float_dir.x, free.x), (&mut self.float_at.y, &mut self.float_dir.y, free.y)] {
                 if room <= 1.0 {
                     *at = 0.5;
@@ -871,11 +871,11 @@ pub(crate) fn song_info(path: &str) -> SongInfo {
     info
 }
 
-/// The song's format for the controls row, longest first, then shorter ones for
-/// less room: "FLAC — 16-bit · 44.1 kHz · 1,012 kb/s", "FLAC — 16-bit · 44.1 kHz",
-/// "FLAC". `codec`: mpv's name for the sound's codec; `rate`: mpv's sample rate,
-/// used when the file's own details aren't known.
-pub(crate) fn format_lines(path: &str, codec: &str, rate: Option<u32>, info: Option<&SongInfo>) -> Vec<String> {
+/// The song's format for the top bar: its name ("FLAC") and the details,
+/// longest first with shorter ones for less room ("16-bit · 44.1 kHz · 1,012
+/// kb/s", "16-bit · 44.1 kHz", ""). `codec`: mpv's name for the sound's codec;
+/// `rate`: mpv's sample rate, used when the file's own details aren't known.
+pub(crate) fn song_format(path: &str, codec: &str, rate: Option<u32>, info: Option<&SongInfo>) -> Option<(String, Vec<String>)> {
     let ext = std::path::Path::new(path).extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
     let (name, lossless) = match codec {
         "flac" => ("FLAC", true),
@@ -891,8 +891,8 @@ pub(crate) fn format_lines(path: &str, codec: &str, rate: Option<u32>, info: Opt
         "ac3" | "eac3" => ("Dolby Digital", false),
         "dts" => ("DTS", false),
         c if c.starts_with("pcm") => (if ext == "aif" || ext == "aiff" { "AIFF" } else { "WAV" }, true),
-        _ if !ext.is_empty() => return vec![ext.to_uppercase()],
-        _ => return Vec::new(),
+        _ if !ext.is_empty() => return Some((ext.to_uppercase(), vec![String::new()])),
+        _ => return None,
     };
     let mut parts = Vec::new();
     if lossless {
@@ -909,13 +909,13 @@ pub(crate) fn format_lines(path: &str, codec: &str, rate: Option<u32>, info: Opt
         let k = if k >= 1000 { format!("{},{:03}", k / 1000, k % 1000) } else { k.to_string() };
         parts.push(format!("{k} kb/s"));
     }
-    let line = |n: usize| if n == 0 { name.to_owned() } else { format!("{name} \u{2014} {}", parts[..n].join(" \u{b7} ")) };
-    let mut out = vec![line(parts.len())];
+    // the details, longest first, ending with none
+    let mut details = vec![parts.join(" \u{b7} ")];
     if short > 0 && short < parts.len() {
-        out.push(line(short));
+        details.push(parts[..short].join(" \u{b7} "));
     }
     if !parts.is_empty() {
-        out.push(line(0));
+        details.push(String::new());
     }
-    out
+    Some((name.to_owned(), details))
 }

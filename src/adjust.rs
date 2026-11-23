@@ -1864,14 +1864,14 @@ fn progress_fill(p: &egui::Painter, r: Rect, frac: f32, accent: Color32) {
     m.add_triangle(0, 1, 2);
     m.add_triangle(0, 2, 3);
     p.add(egui::Shape::mesh(m));
-    // The spark: a bright 2 px line, softer at its ends
+    // The spark: a bright 1 px line, softer at its ends
     let spark = Color32::from_rgb(
         (accent.r() as u16 * 2 / 5 + 153) as u8,
         (accent.g() as u16 * 2 / 5 + 153) as u8,
         (accent.b() as u16 * 2 / 5 + 153) as u8,
     );
-    p.rect_filled(Rect::from_min_max(pos2(x - 2.0, r.top() + 3.0), pos2(x, r.bottom() - 3.0)), 1.0, spark);
-    p.rect_filled(Rect::from_min_max(pos2(x - 2.0, r.top() + 1.0), pos2(x, r.bottom() - 1.0)), 1.0, spark.gamma_multiply(0.35));
+    p.rect_filled(Rect::from_min_max(pos2(x - 1.0, r.top() + 3.0), pos2(x, r.bottom() - 3.0)), 0.0, spark);
+    p.rect_filled(Rect::from_min_max(pos2(x - 1.0, r.top() + 1.0), pos2(x, r.bottom() - 1.0)), 0.0, spark.gamma_multiply(0.35));
 }
 
 /// The little three-bar "playing" mark (heights 0…1)
@@ -1908,6 +1908,8 @@ pub fn draw_playlist(
     let screen = ctx.screen_rect();
     let w = PANEL_W.min(screen.width() - 16.0);
     let title = if shuffle.is_some() { "Selected playlist" } else { "Playlist" };
+    // (shuffled, "already played" isn't the ones above: no greyed-out rows then)
+    let grey_played = !shuffle.as_deref().copied().unwrap_or(false);
     let switches = if shuffle.is_some() { 3.0 } else { 2.0 };
     let foot_h = 9.0 + ROW_H * switches + 6.0;
     let max_h = (screen.height() - PANEL_TOP - BOTTOM_GAP).max(HEAD_H + foot_h + ITEM_H * 2.0);
@@ -1957,7 +1959,7 @@ pub fn draw_playlist(
                     }
                     let (font, col) = if cur {
                         (semibold(12.5), TEXT)
-                    } else if i < current {
+                    } else if i < current && grey_played {
                         (FontId::proportional(12.5), Color32::from_rgb(140, 142, 150))
                     } else {
                         (FontId::proportional(12.5), Color32::from_rgb(222, 222, 226))

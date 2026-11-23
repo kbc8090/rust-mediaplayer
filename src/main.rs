@@ -1417,7 +1417,7 @@ impl FluentMediaPlayer {
             } else {
                 // No cover (or no room for one): the details drift round in their box
                 if self.bars.draw_floating(p, rect, name, self.accent, playing, dt) {
-                    ui.ctx().request_repaint_after(std::time::Duration::from_millis(33));
+                    ui.ctx().request_repaint_after(std::time::Duration::from_millis(16));
                 }
             }
             return;
@@ -1428,7 +1428,7 @@ impl FluentMediaPlayer {
         if self.bars.state == visualizer::State::Unsupported {
             // (a file the bars can't read: WMA, a link...): the drifting box
             if self.bars.draw_floating(p, rect, name, self.accent, playing, dt) {
-                ui.ctx().request_repaint_after(std::time::Duration::from_millis(33));
+                ui.ctx().request_repaint_after(std::time::Duration::from_millis(16));
             }
             return;
         }
@@ -1440,14 +1440,14 @@ impl FluentMediaPlayer {
         }
     }
 
-    /// The playing song's format for the controls row: "FLAC — 16-bit · 44.1 kHz ·
-    /// 1,012 kb/s", and shorter versions to fall back on when there's less room
-    pub(crate) fn song_format(&self) -> Vec<String> {
+    /// The playing song's format for the top bar: "FLAC", then its details
+    /// (longest first, shorter ones for less room)
+    pub(crate) fn song_format(&self) -> Option<(String, Vec<String>)> {
         if !self.is_music() {
-            return Vec::new();
+            return None;
         }
         let info = self.song_info.lock().ok().and_then(|s| s.as_ref().filter(|(p, _)| *p == self.current_file).map(|(_, i)| i.clone()));
-        visualizer::format_lines(&self.current_file, &self.song_codec, u32::try_from(self.song_rate).ok(), info.as_ref())
+        visualizer::song_format(&self.current_file, &self.song_codec, u32::try_from(self.song_rate).ok(), info.as_ref())
     }
 
     fn quit(&mut self) -> ! {
