@@ -2442,6 +2442,12 @@ impl eframe::App for FluentMediaPlayer {
             self.show_controls = !self.has_file || !self.is_playing || menu_open || list_open || near_edge || idle < HIDE_AFTER || self.clip.is_some();
             self.show_top = self.show_controls;
         }
+        // (files being dragged over the window: the title bar and controls show,
+        // framing the drop area between them)
+        if ctx.input(|i| !i.raw.hovered_files.is_empty()) {
+            self.show_controls = true;
+            self.show_top = true;
+        }
         // Hide the mouse cursor too once it has been still for a moment
         if !self.show_controls && !self.show_top && self.has_file && idle > 2.0 {
             ctx.set_cursor_icon(egui::CursorIcon::None);
@@ -2682,6 +2688,7 @@ impl eframe::App for FluentMediaPlayer {
             self.apply_adjust_changes(&before, before_norm);
         }
         draw_shortcuts(self, ctx);
+        draw_drop_overlay(self, ctx);
 
         // Online video settings panel, the Open URL box, and a link opening / failed
         let online_before = self.online;

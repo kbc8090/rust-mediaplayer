@@ -2126,6 +2126,9 @@ pub fn draw_playlist(
         let list = Rect::from_min_size(pos2(rect.left() + EDGE, rect.top() + HEAD_H + 3.0), vec2(w - 2.0 * EDGE, list_h - 6.0));
         let scroll_to_current = std::mem::take(&mut ui_state.playlist_scroll);
         ui.allocate_ui_at_rect(list, |ui| {
+            // (a slimmer scroll bar than egui's: 6 px instead of 10 when hovered)
+            ui.spacing_mut().scroll.bar_width = 6.0;
+            ui.spacing_mut().scroll.bar_inner_margin = 2.0;
             egui::ScrollArea::vertical().id_source("playlist_rows").max_height(list.height()).auto_shrink([false, false]).show(ui, |ui| {
                 ui.spacing_mut().item_spacing = vec2(0.0, 0.0);
                 // (short of the right edge, room for the scroll bar, only when it

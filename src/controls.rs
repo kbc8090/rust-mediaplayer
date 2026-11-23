@@ -1215,3 +1215,234 @@ pub(crate) fn icon_seek(p: &egui::Painter, c: Pos2, col: Color32, forward: bool)
         ));
     }
 }
+
+// ── Dropping files: what's coming ─────────────────────────────────────────────
+/// What's being dragged over the window, worked out from the file names
+/// (Windows says which files they are while they're still being dragged)
+struct DropPreview {
+    icon: DropIcon,
+    /// In big letters: "FLAC", "MP4", "8 SONGS"…
+    big: String,
+    /// Under it: the file name, or how many of each format
+    detail: String,
+    /// "Drop to play", "Drop to play as a playlist", "Can't play this file"
+    action: &'static str,
+    playable: bool,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum DropIcon {
+    Music,
+    Video,
+    Picture,
+    Playlist,
+    Unknown,
+}
+
+fn drop_preview(paths: &[String]) -> Option<DropPreview> {
+    if paths.is_empty() {
+        return None;
+    }
+    let ext = |p: &str| Path::new(p).extension().map(|e| e.to_string_lossy().to_uppercase()).unwrap_or_default();
+    let name = |p: &str| Path::new(p).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let media: Vec<&String> = paths.iter().filter(|p| is_media_file(p)).collect();
+    // One thing to play: that file (or a playlist file on its own)
+    let single = match (paths.len(), media.len()) {
+        (_, 1) => Some(media[0].as_str()),
+        (1, 0) => Some(paths[0].as_str()),
+        _ => None,
+    };
+    if let Some(p) = single {
+        let (icon, playable) = match media_kind(p) {
+            Some(MediaKind::Music) => (DropIcon::Music, true),
+            Some(MediaKind::Video) => (DropIcon::Video, true),
+            Some(MediaKind::Image) => (DropIcon::Picture, true),
+            None if is_playlist_file(p) => (DropIcon::Playlist, true),
+            None => (DropIcon::Unknown, false),
+        };
+        let big = match ext(p) {
+            e if e.is_empty() && Path::new(p).is_dir() => "FOLDER".to_owned(),
+            e if e.is_empty() => "?".to_owned(),
+            e => e,
+        };
+        let action = if playable { "Drop to play" } else { "Can't play this file" };
+        return Some(DropPreview { icon, big, detail: name(p), action, playable });
+    }
+    if media.is_empty() {
+        return Some(DropPreview { icon: DropIcon::Unknown, big: format!("{} FILES", paths.len()), detail: String::new(), action: "Can't play these files", playable: false });
+    }
+    // Several: a playlist of them ("8 SONGS", or videos, or just files when mixed)
+    let n = media.len();
+    let kinds: Vec<Option<MediaKind>> = media.iter().map(|p| media_kind(p)).collect();
+    let all = |k: MediaKind| kinds.iter().all(|x| *x == Some(k));
+    let noun = if all(MediaKind::Music) { "SONGS" } else if all(MediaKind::Video) { "VIDEOS" } else if all(MediaKind::Image) { "PICTURES" } else { "FILES" };
+    // "FLAC ×6 · MP3 ×2", most first
+    let mut counts: Vec<(String, usize)> = Vec::new();
+    for p in &media {
+        let e = ext(p);
+        match counts.iter_mut().find(|(x, _)| *x == e) {
+            Some((_, c)) => *c += 1,
+            None => counts.push((e, 1)),
+        }
+    }
+    counts.sort_by_key(|c| std::cmp::Reverse(c.1));
+    let detail = counts.iter().take(4).map(|(e, c)| format!("{e} \u{d7}{c}")).collect::<Vec<_>>().join(" \u{b7} ");
+    Some(DropPreview { icon: DropIcon::Playlist, big: format!("{n} {noun}"), detail, action: "Drop to play as a playlist", playable: true })
+}
+
+/// Text whose colour runs across it along `colour(0…1)` (each glyph's
+/// vertices recoloured by where they are)
+fn gradient_text(p: &egui::Painter, centre: Pos2, text: &str, font: FontId, colour: &dyn Fn(f32) -> Color32) {
+    let g = p.layout_no_wrap(text.to_owned(), font, Color32::WHITE);
+    let ppp = p.ctx().pixels_per_point();
+    let origin = ((centre - g.size() / 2.0) * ppp).round() / ppp;
+    let w = g.size().x.max(1.0);
+    // (a galley's vertices are relative to it, their texture coordinates in
+    // font-atlas pixels: the same conversion egui makes when it draws text)
+    let [tw, th] = p.ctx().fonts(|f| f.font_image_size());
+    let uv_scale = vec2(1.0 / tw as f32, 1.0 / th as f32);
+    for row in &g.rows {
+        let mut m = row.visuals.mesh.clone();
+        for v in &mut m.vertices {
+            v.pos = origin + v.pos.to_vec2();
+            v.uv = (v.uv.to_vec2() * uv_scale).to_pos2();
+            let f = ((v.pos.x - origin.x) / w).clamp(0.0, 1.0);
+            v.color = colour(f);
+        }
+        p.add(egui::Shape::mesh(m));
+    }
+}
+
+/// The kind-of-file icon, drawn with lines `size` across; each piece coloured
+/// by where it is across the icon
+fn drop_icon(p: &egui::Painter, c: Pos2, size: f32, icon: DropIcon, colour: &dyn Fn(f32) -> Color32) {
+    let k = size / 24.0;
+    let w = (1.6 * k).max(1.5);
+    let at = |x: f32, y: f32| pos2(c.x + (x - 12.0) * k, c.y + (y - 12.0) * k);
+    let col_at = |x: f32| colour((x / 24.0).clamp(0.0, 1.0));
+    let line = |pts: &[(f32, f32)]| {
+        for s in pts.windows(2) {
+            let mid = (s[0].0 + s[1].0) / 2.0;
+            p.line_segment([at(s[0].0, s[0].1), at(s[1].0, s[1].1)], Stroke::new(w, col_at(mid)));
+        }
+    };
+    let circle = |cx: f32, cy: f32, r: f32| {
+        let pts: Vec<(f32, f32)> = (0..=32).map(|i| {
+            let a = i as f32 / 32.0 * std::f32::consts::TAU;
+            (cx + r * a.cos(), cy + r * a.sin())
+        }).collect();
+        line(&pts);
+    };
+    let rrect = |x0: f32, y0: f32, x1: f32, y1: f32, r: f32| {
+        let mut pts = Vec::new();
+        for (cx, cy, a0) in [(x1 - r, y0 + r, -90.0_f32), (x1 - r, y1 - r, 0.0), (x0 + r, y1 - r, 90.0), (x0 + r, y0 + r, 180.0)] {
+            for i in 0..=6 {
+                let a = (a0 + i as f32 * 15.0).to_radians();
+                pts.push((cx + r * a.cos(), cy + r * a.sin()));
+            }
+        }
+        pts.push(pts[0]);
+        line(&pts);
+    };
+    match icon {
+        DropIcon::Music => {
+            line(&[(9.0, 18.0), (9.0, 6.0), (19.0, 4.0), (19.0, 16.0)]);
+            circle(6.5, 18.0, 2.5);
+            circle(16.5, 16.0, 2.5);
+        }
+        DropIcon::Video => {
+            rrect(3.0, 6.0, 16.0, 18.0, 2.5);
+            line(&[(16.0, 10.5), (21.0, 7.5), (21.0, 16.5), (16.0, 13.5)]);
+        }
+        DropIcon::Picture => {
+            rrect(3.0, 5.0, 21.0, 19.0, 2.5);
+            line(&[(3.5, 17.0), (9.0, 11.5), (13.0, 15.5), (15.5, 13.0), (20.5, 18.0)]);
+            circle(15.5, 9.0, 1.6);
+        }
+        DropIcon::Playlist => {
+            line(&[(4.0, 6.0), (16.0, 6.0)]);
+            line(&[(4.0, 11.0), (16.0, 11.0)]);
+            line(&[(4.0, 16.0), (11.0, 16.0)]);
+            let tri = vec![at(15.0, 13.5), at(15.0, 19.5), at(20.0, 16.5)];
+            p.add(egui::Shape::convex_polygon(tri, col_at(17.5), Stroke::NONE));
+        }
+        DropIcon::Unknown => {
+            circle(12.0, 12.0, 8.5);
+            line(&[(6.0, 6.0), (18.0, 18.0)]);
+        }
+    }
+}
+
+/// While files are dragged over the window: between the title bar and the
+/// controls, the video blurs behind a glowing frame (teal → accent → violet,
+/// like the start screen's ribbon; grey for something it can't play), with an
+/// icon for the kind of file, its format in big letters, and what dropping it
+/// will do
+pub(crate) fn draw_drop_overlay(app: &FluentMediaPlayer, ctx: &egui::Context) {
+    let paths: Vec<String> = ctx.input(|i| {
+        i.raw.hovered_files.iter().filter_map(|f| f.path.as_ref().map(|p| p.to_string_lossy().into_owned())).collect()
+    });
+    let Some(d) = drop_preview(&paths) else { return };
+    let screen = ctx.screen_rect();
+    let area = Rect::from_min_max(
+        pos2(screen.left(), screen.top() + WIN_BTN_H + 6.0),
+        pos2(screen.right(), screen.bottom() - SEEK_FROM_BOTTOM - 22.0),
+    );
+    if area.height() < 60.0 {
+        return;
+    }
+    let p = ctx.layer_painter(egui::LayerId::new(egui::Order::Tooltip, egui::Id::new("drop_overlay")));
+    let acc = crate::splash::rgb(app.accent);
+    let grey = |_: f32| Color32::from_rgb(128, 128, 136);
+    let ribbon = |f: f32| {
+        let [r, g, b] = crate::splash::ribbon_colour(acc, f);
+        Color32::from_rgb((r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8)
+    };
+    let colour: &dyn Fn(f32) -> Color32 = if d.playable { &ribbon } else { &grey };
+
+    // The blur (the frosted glass the menus use; a dark veil without it)
+    crate::glass::fill(&p, area, 0.0, Color32::from_black_alpha(170), 1.0);
+
+    // The frame: a rounded outline 10 px in, glowing inwards
+    let fr = area.shrink(10.0);
+    let r = 16.0;
+    let mut pts = Vec::new();
+    for (cx, cy, a0) in [(fr.right() - r, fr.top() + r, -90.0_f32), (fr.right() - r, fr.bottom() - r, 0.0), (fr.left() + r, fr.bottom() - r, 90.0), (fr.left() + r, fr.top() + r, 180.0)] {
+        for i in 0..=8 {
+            let a = (a0 + i as f32 * 11.25).to_radians();
+            pts.push(pos2(cx + r * a.cos(), cy + r * a.sin()));
+        }
+    }
+    pts.push(pts[0]);
+    let x_frac = |q: &Pos2| ((q.x - fr.left()) / fr.width()).clamp(0.0, 1.0);
+    let light = |q: &Pos2, k: f32| {
+        let c = colour(x_frac(q));
+        crate::splash::light([c.r() as f32 / 255.0, c.g() as f32 / 255.0, c.b() as f32 / 255.0], k)
+    };
+    let glow: Vec<Color32> = pts.iter().map(|q| light(q, 0.22)).collect();
+    let line: Vec<Color32> = pts.iter().map(|q| light(q, 1.0)).collect();
+    let mut m = egui::Mesh::default();
+    crate::splash::strip(&mut m, &pts, 16.0, &glow);
+    crate::splash::strip(&mut m, &pts, 1.8, &line);
+    p.add(egui::Shape::mesh(m));
+
+    // The icon, the format, the details and what dropping does: centred
+    let s = (area.height() / 560.0).clamp(0.55, 1.4);
+    let big = FontId::new((96.0 * s).round(), FontFamily::Name("semibold".into()));
+    let icon_size = (64.0 * s).round();
+    let gap = 14.0 * s;
+    let big_h = big.size;
+    let block = icon_size + gap + big_h + 14.0 * s + 18.0 + 8.0 + 20.0;
+    let mut y = area.center().y - block / 2.0;
+    drop_icon(&p, pos2(area.center().x, y + icon_size / 2.0), icon_size, d.icon, colour);
+    y += icon_size + gap;
+    gradient_text(&p, pos2(area.center().x, y + big_h / 2.0), &d.big, big, colour);
+    y += big_h + 14.0 * s;
+    if !d.detail.is_empty() {
+        let g = elide(&p, &d.detail, FontId::proportional(14.0), Color32::from_rgb(214, 214, 222), area.width() * 0.8);
+        p.galley(pos2(area.center().x - g.size().x / 2.0, y), g, Color32::from_rgb(214, 214, 222));
+    }
+    y += 18.0 + 8.0;
+    let col = if d.playable { Color32::WHITE } else { Color32::from_rgb(200, 200, 206) };
+    p.text(pos2(area.center().x, y), Align2::CENTER_TOP, d.action, FontId::new(16.0, FontFamily::Name("semibold".into())), col);
+}
