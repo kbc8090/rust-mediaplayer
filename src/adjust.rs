@@ -1842,7 +1842,10 @@ fn progress_fill(p: &egui::Painter, r: Rect, frac: f32, accent: Color32) {
     if frac <= 0.0 {
         return;
     }
-    let x = r.left() + r.width() * frac;
+    // The edge on a whole pixel: between two pixels it was blended across both,
+    // so as it crept along it kept flickering between crisp and soft
+    let ppp = p.ctx().pixels_per_point();
+    let x = ((r.left() + r.width() * frac) * ppp).round() / ppp;
     let fill = Rect::from_min_max(r.min, pos2(x, r.bottom()));
     let round = egui::Rounding { nw: 5.0, sw: 5.0, ne: if frac > 0.99 { 5.0 } else { 0.0 }, se: if frac > 0.99 { 5.0 } else { 0.0 } };
     p.rect_filled(fill, round, accent.gamma_multiply(0.26));
@@ -1850,7 +1853,8 @@ fn progress_fill(p: &egui::Painter, r: Rect, frac: f32, accent: Color32) {
         return;
     }
     // Glow: fading in towards the edge (additive light: alpha 0), along a smooth
-    // curve over a longer stretch so it has no visible start
+    // curve so it has no visible start, brightest right at the edge. (No line at
+    // the edge: the glow alone marks it.)
     let glow_w = (36.0_f32).min(x - r.left());
     let light = |k: f32| {
         let [r0, g0, b0, _] = accent.to_array();
@@ -1861,7 +1865,7 @@ fn progress_fill(p: &egui::Painter, r: Rect, frac: f32, accent: Color32) {
     for i in 0..=STEPS {
         let s = i as f32 / STEPS as f32;
         // (eased: barely there for most of the way, then rising to the edge)
-        let k = 0.45 * s * s * s;
+        let k = 0.6 * s * s * s;
         let gx = x - glow_w * (1.0 - s);
         m.colored_vertex(pos2(gx, r.top()), light(k));
         m.colored_vertex(pos2(gx, r.bottom()), light(k));
@@ -1872,13 +1876,6 @@ fn progress_fill(p: &egui::Painter, r: Rect, frac: f32, accent: Color32) {
         }
     }
     p.add(egui::Shape::mesh(m));
-    // The spark: a bright 1 px line, the row's full height
-    let spark = Color32::from_rgb(
-        (accent.r() as u16 * 2 / 5 + 153) as u8,
-        (accent.g() as u16 * 2 / 5 + 153) as u8,
-        (accent.b() as u16 * 2 / 5 + 153) as u8,
-    );
-    p.rect_filled(Rect::from_min_max(pos2(x - 1.0, r.top()), pos2(x, r.bottom())), 0.0, spark);
 }
 
 /// The little three-bar "playing" mark (heights 0…1)
