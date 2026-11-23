@@ -398,8 +398,8 @@ fn draw_heatmap(
     alpha: f32,
 ) {
     let (left, right) = ends;
-    // (a point every 2 px: smooth, and only a few hundred)
-    let steps = ((right - left) / 2.0).ceil().max(2.0) as usize;
+    // (a point every pixel: smooth curves, and still only a thousand or two)
+    let steps = (right - left).ceil().max(2.0) as usize;
     let pts: Vec<Pos2> = (0..=steps)
         .map(|i| {
             let x = left + (right - left) * i as f32 / steps as f32;
@@ -411,14 +411,30 @@ fn draw_heatmap(
         let f = ((base - y) / HEAT_H).clamp(0.0, 1.0);
         Color32::from_white_alpha(((0.12 + 0.28 * f) * 255.0 * alpha) as u8)
     };
+    // (a mesh has no anti-aliasing of its own, which left the hill's top edge
+    // stair-stepped: so it gets its own soft edge, a 1-pixel strip fading out
+    // across the curve, like egui gives its shapes)
+    let feather = 1.0 / p.ctx().pixels_per_point();
     let mut m = egui::Mesh::default();
     for (i, q) in pts.iter().enumerate() {
-        m.colored_vertex(*q, shade(q.y));
+        // the curve's outward (upward) direction here
+        let (a, b) = (pts[i.saturating_sub(1)], pts[(i + 1).min(pts.len() - 1)]);
+        let d = b - a;
+        let mut n = vec2(d.y, -d.x).normalized();
+        if n.y > 0.0 {
+            n = -n;
+        }
+        let half = n * (feather / 2.0);
+        m.colored_vertex(*q - half, shade(q.y)); // inside edge: full
         m.colored_vertex(pos2(q.x, base), shade(base));
+        m.colored_vertex(*q + half, Color32::TRANSPARENT); // outside edge: none
         if i > 0 {
-            let k = 2 * i as u32;
-            m.add_triangle(k - 2, k - 1, k);
-            m.add_triangle(k - 1, k, k + 1);
+            let (top0, base0, out0) = (3 * i as u32 - 3, 3 * i as u32 - 2, 3 * i as u32 - 1);
+            let (top1, base1, out1) = (3 * i as u32, 3 * i as u32 + 1, 3 * i as u32 + 2);
+            m.add_triangle(top0, base0, top1);
+            m.add_triangle(base0, top1, base1);
+            m.add_triangle(out0, top0, out1);
+            m.add_triangle(top0, out1, top1);
         }
     }
     p.add(egui::Shape::mesh(m));
