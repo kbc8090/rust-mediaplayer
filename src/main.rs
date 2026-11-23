@@ -363,6 +363,15 @@ struct FluentMediaPlayer {
     /// or the switch in its panel); and the "Up next" card (playlist panel)
     playlist_replay: bool,
     playlist_summary: bool,
+    /// The playlist is files dropped together (not an .m3u): "Selected playlist",
+    /// and it can be shuffled
+    playlist_selected: bool,
+    playlist_shuffle: bool,
+    /// The shuffled order (entry numbers); empty = the list's own order
+    play_order: Vec<usize>,
+    /// Whether the window showed a video last frame (a new video then keeps
+    /// showing the last picture until its own first one: no black flicker)
+    video_shown: bool,
     /// Accumulated mouse-wheel scroll (points) not yet converted into volume steps
     scroll_accum: f32,
     /// Windows accent colour (re-read every couple of seconds so changes follow live)
@@ -683,6 +692,10 @@ impl FluentMediaPlayer {
             playlist_gen: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             playlist_replay: st.playlist_replay,
             playlist_summary: st.playlist_summary,
+            playlist_selected: false,
+            playlist_shuffle: false,
+            play_order: Vec::new(),
+            video_shown: false,
             scroll_accum: 0.0,
             accent: system_accent(),
             border_color: border_accent(),
@@ -805,10 +818,11 @@ impl FluentMediaPlayer {
             self.open_url(path);
         } else if is_playlist_file(path) {
             let entries = read_playlist(Path::new(path));
-            self.start_playlist(PathBuf::from(path), entries);
+            self.start_playlist(PathBuf::from(path), entries, false);
         } else {
             self.playlist = None;
             self.playlist_rows.clear();
+            self.play_order.clear();
             self.adjust_ui.playlist_open = false;
             // Previous / next become available once the folder has been read (in the
             // background: a huge folder sorted by date would otherwise freeze the
@@ -821,9 +835,13 @@ impl FluentMediaPlayer {
     }
 
     /// Play a playlist (an .m3u's entries, or files dropped together) from its start
-    fn start_playlist(&mut self, name: PathBuf, entries: Vec<PlaylistEntry>) {
+    /// (`selected`: files dropped together, which can be shuffled)
+    fn start_playlist(&mut self, name: PathBuf, entries: Vec<PlaylistEntry>, selected: bool) {
         let Some(first) = entries.first().map(|e| e.path.to_string_lossy().into_owned()) else { return };
         self.playlist = Some(name);
+        self.playlist_selected = selected;
+        self.playlist_shuffle = false;
+        self.play_order.clear();
         self.start_playlist_rows(&entries);
         self.folder_files = entries.into_iter().map(|e| e.path).collect();
         self.folder_index = Some(0);
@@ -930,8 +948,10 @@ impl FluentMediaPlayer {
             self.link.set("demuxer-max-bytes", "32MiB");
             self.link.set("demuxer-max-back-bytes", "8MiB");
         }
-        // The picture kept from the last file mustn't show while this one opens
-        VIDEO_STALE.with(|s| s.set(true));
+        // A picture kept from something that wasn't a video (a song's cover) mustn't
+        // show while this file opens; after a video, its last frame stays up until
+        // the new one's first, so going from video to video doesn't flicker
+        VIDEO_STALE.with(|s| s.set(!self.video_shown));
         self.link.command("loadfile", &[path]);
         self.link.set("pause", "no");
         self.is_playing = true;
@@ -1289,16 +1309,25 @@ impl FluentMediaPlayer {
                 ctx.request_repaint_after(std::time::Duration::from_millis(40));
             }
         }
-        let (mut replay, mut summary) = (self.playlist_replay, self.playlist_summary);
+        let (mut replay, mut summary, mut shuffle) = (self.playlist_replay, self.playlist_summary, self.playlist_shuffle);
         let progress = if self.duration > 0.0 { (self.time_pos / self.duration) as f32 } else { 0.0 };
         if playing && self.adjust_ui.playlist_open {
             // (the playing row's progress fill moves on)
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
-        let mut action = adjust::draw_playlist(ctx, &mut self.adjust_ui, &self.playlist_rows, current, mark, progress, &mut replay, &mut summary, self.accent);
+        let shuffle_opt = self.playlist_selected.then_some(&mut shuffle);
+        let mut action = adjust::draw_playlist(ctx, &mut self.adjust_ui, &self.playlist_rows, current, mark, progress, &mut replay, &mut summary, shuffle_opt, self.accent);
         if summary && !self.adjust_ui.playlist_open {
             let noun = self.playlist_noun();
-            let a = adjust::draw_playlist_summary(ctx, &mut self.adjust_ui, &self.playlist_rows, current, replay, noun, self.accent);
+            // the next three in playing order
+            let mut next = Vec::new();
+            for d in 1..=3 {
+                match self.step_index(d) {
+                    Some(k) if k != current && !next.contains(&k) => next.push(k),
+                    _ => break,
+                }
+            }
+            let a = adjust::draw_playlist_summary(ctx, &mut self.adjust_ui, &self.playlist_rows, current, &next, noun, self.accent);
             if !matches!(a, adjust::PlaylistAction::None) {
                 action = a;
             }
@@ -1307,6 +1336,9 @@ impl FluentMediaPlayer {
         }
         self.playlist_replay = replay;
         self.playlist_summary = summary;
+        if shuffle != self.playlist_shuffle {
+            self.set_shuffle(shuffle);
+        }
         match action {
             adjust::PlaylistAction::Play(i) => self.play_index(i),
             adjust::PlaylistAction::Open => self.toggle_playlist_panel(),
@@ -1366,40 +1398,38 @@ impl FluentMediaPlayer {
         let dt = now.saturating_duration_since(self.bars_tick).as_secs_f32();
         self.bars_tick = now;
 
-        // The song's name: its title tag (else the file name), then "artist · album"
+        // The song's details: its title tag (else the file name), artist, album
         let title = if self.song_title.is_empty() { self.file_name() } else { self.song_title.clone() };
         let position = self.playlist_position();
-        let info = self.song_info.lock().ok().and_then(|s| s.as_ref().filter(|(p, _)| *p == self.current_file).map(|(_, i)| i.clone()));
-        let format = visualizer::format_line(&self.current_file, &self.song_codec, u32::try_from(self.song_rate).ok(), info.as_ref());
-        let name = visualizer::SongName {
-            song: &title,
-            artist: &self.song_artist,
-            album: &self.song_album,
-            playlist: position.as_deref(),
-            format: format.as_deref(),
-        };
+        let name = visualizer::SongName { song: &title, artist: &self.song_artist, album: &self.song_album, playlist: position.as_deref() };
         let p = ui.painter();
+        let playing = self.is_playing && !self.eof;
 
-        // Album art: the cover with the song's name; nothing moves, so nothing
-        // more to decode or redraw. (Songs without a cover, or a window too small
-        // for one, get the visualizer.)
-        let has_cover = self.video_kind == VideoKind::Cover && self.render_ctx_initialized;
-        if self.adjust.music == MusicShow::AlbumArt && has_cover {
-            if let Some(c) = visualizer::Bars::cover_rect(rect, self.cover_aspect, name.lines()) {
-                self.scope.stop();
+        if self.adjust.music == MusicShow::AlbumArt {
+            // Album art: the cover with the song's details under it; nothing
+            // moves, so nothing more to decode or redraw
+            self.scope.stop();
+            let has_cover = self.video_kind == VideoKind::Cover && self.render_ctx_initialized;
+            if let Some(c) = visualizer::Bars::cover_rect(rect, self.cover_aspect, name.lines()).filter(|_| has_cover) {
                 self.bars.draw_cover_back(p, rect, c, self.accent);
                 p.add(video_callback(c));
                 self.bars.draw_cover_front(p, rect, name);
-                return;
+            } else {
+                // No cover (or no room for one): the details drift round in their box
+                if self.bars.draw_floating(p, rect, name, self.accent, playing, dt) {
+                    ui.ctx().request_repaint_after(std::time::Duration::from_millis(33));
+                }
             }
+            return;
         }
 
         self.scope.follow(&self.current_file, self.time_pos);
-        let playing = self.is_playing && !self.eof;
         let moving = self.bars.update(&self.scope, &self.current_file, self.time_pos, playing, dt);
         if self.bars.state == visualizer::State::Unsupported {
-            // (a file the bars can't read: Opus, WMA, a link...)
-            self.bars.draw_still(p, rect, name, self.accent);
+            // (a file the bars can't read: WMA, a link...): the drifting box
+            if self.bars.draw_floating(p, rect, name, self.accent, playing, dt) {
+                ui.ctx().request_repaint_after(std::time::Duration::from_millis(33));
+            }
             return;
         }
         self.bars.draw_visualizer(p, rect, name, self.accent);
@@ -1408,6 +1438,16 @@ impl FluentMediaPlayer {
         if moving {
             ui.ctx().request_repaint_after(std::time::Duration::from_millis(6));
         }
+    }
+
+    /// The playing song's format for the controls row: "FLAC — 16-bit · 44.1 kHz ·
+    /// 1,012 kb/s", and shorter versions to fall back on when there's less room
+    pub(crate) fn song_format(&self) -> Vec<String> {
+        if !self.is_music() {
+            return Vec::new();
+        }
+        let info = self.song_info.lock().ok().and_then(|s| s.as_ref().filter(|(p, _)| *p == self.current_file).map(|(_, i)| i.clone()));
+        visualizer::format_lines(&self.current_file, &self.song_codec, u32::try_from(self.song_rate).ok(), info.as_ref())
     }
 
     fn quit(&mut self) -> ! {
@@ -1526,26 +1566,58 @@ impl FluentMediaPlayer {
     }
 
     fn has_prev(&self) -> bool {
-        self.wraps() || self.folder_index.is_some_and(|i| i > 0)
+        self.step_index(-1).is_some()
     }
 
     fn has_next(&self) -> bool {
-        self.wraps() || self.folder_index.is_some_and(|i| i + 1 < self.folder_files.len())
+        self.step_index(1).is_some()
+    }
+
+    /// The entry `delta` steps from the playing one: in the shuffled order when
+    /// shuffle is on, going round when the playlist replays
+    pub(crate) fn step_index(&self, delta: isize) -> Option<usize> {
+        let i = self.folder_index?;
+        let n = self.folder_files.len() as isize;
+        let shuffled = self.play_order.len() == n as usize;
+        let pos = if shuffled { self.play_order.iter().position(|&k| k == i)? as isize } else { i as isize };
+        let mut target = pos + delta;
+        if self.wraps() {
+            target = target.rem_euclid(n);
+        }
+        if target < 0 || target >= n {
+            return None;
+        }
+        Some(if shuffled { self.play_order[target as usize] } else { target as usize })
+    }
+
+    /// Shuffle on: a random order, starting from the playing entry. Off: the
+    /// list's own order.
+    fn set_shuffle(&mut self, on: bool) {
+        self.playlist_shuffle = on;
+        self.play_order.clear();
+        if !on {
+            return;
+        }
+        let n = self.folder_files.len();
+        let cur = self.folder_index.unwrap_or(0);
+        let mut rest: Vec<usize> = (0..n).filter(|&k| k != cur).collect();
+        // (xorshift seeded from the clock: no need for a random-number library)
+        let mut x = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0x9E37_79B9, |d| d.as_nanos() as u64) | 1;
+        for k in (1..rest.len()).rev() {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            rest.swap(k, (x % (k as u64 + 1)) as usize);
+        }
+        self.play_order = std::iter::once(cur).chain(rest).collect();
     }
 
     /// Open the previous (-1) or next (+1) entry: of the playlist when one is
     /// playing, else of the current file's folder
     fn play_adjacent(&mut self, delta: isize) {
-        let Some(i) = self.folder_index else { return };
-        let n = self.folder_files.len() as isize;
-        let mut target = i as isize + delta;
-        if self.wraps() {
-            target = target.rem_euclid(n);
+        if let Some(target) = self.step_index(delta) {
+            self.play_index(target);
         }
-        if target < 0 || target >= n { return; }
-        let path = self.folder_files[target as usize].to_string_lossy().into_owned();
-        self.folder_index = Some(target as usize);
-        self.load_entry(&path);
     }
 
     /// Skip with the keys / taskbar buttons, and show "+5 sec" (adding up quick repeats
@@ -2137,7 +2209,7 @@ impl eframe::App for FluentMediaPlayer {
             let mut files: Vec<PathBuf> = media.iter().map(PathBuf::from).collect();
             files.sort_by(|a, b| natural_cmp(&a.file_name().unwrap_or_default().to_string_lossy(), &b.file_name().unwrap_or_default().to_string_lossy()));
             let entries: Vec<PlaylistEntry> = files.into_iter().map(|path| PlaylistEntry { path, title: None, secs: None }).collect();
-            self.start_playlist(PathBuf::from("Dropped files"), entries);
+            self.start_playlist(PathBuf::from("Dropped files"), entries, true);
         } else {
             for s in &inp.dropped {
                 if is_media_file(s) || is_playlist_file(s) { self.open_file(s); }
@@ -2274,14 +2346,16 @@ impl eframe::App for FluentMediaPlayer {
                 if !music {
                     self.scope.stop();
                 }
+                self.video_shown = false;
                 if !self.has_file {
                     splash::draw(ui.painter(), rect, self.accent);
                 } else if music {
                     self.draw_music(ui, rect);
                 } else if self.render_ctx_initialized && self.url_load.is_none() {
-                    // (While a link is opening: just black. A new file shows black
-                    // too until its first picture, see VIDEO_STALE.)
+                    // (While a link is opening: just black. See VIDEO_STALE for a
+                    // new file.)
                     ui.painter().add(video_callback(rect));
+                    self.video_shown = self.video_kind == VideoKind::Video;
                 }
             });
 

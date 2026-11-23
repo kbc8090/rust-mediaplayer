@@ -806,6 +806,23 @@ pub(crate) fn draw_bottom_bar(app: &mut FluentMediaPlayer, ctx: &egui::Context, 
                 p.circle_filled(dot, LIVE_DOT, Color32::from_rgb(232, 17, 35).gamma_multiply(t));
                 p.galley(pos2(dot.x + LIVE_DOT + 6.0, row_y - 1.0 - g.size().y / 2.0), g, white);
             }
+            // A song's format in a small box after the time ("FLAC — 16-bit ·
+            // 44.1 kHz · 932 kb/s"; shorter, or left out, when there's less room)
+            let formats = if chapter_at(&app.chapters, app.time_pos).is_none() { app.song_format() } else { Vec::new() };
+            if !formats.is_empty() {
+                let x = lay.time_x + time_w + 14.0;
+                let room = lay.mute - BTN_BOX / 2.0 - 12.0 - x;
+                let font = FontId::proportional(12.0);
+                let col = Color32::from_rgb(205, 210, 222).gamma_multiply(t);
+                let pad = vec2(9.0, 4.0);
+                if let Some(g) = formats.iter().map(|f| p.layout_no_wrap(f.clone(), font.clone(), col)).find(|g| g.size().x + pad.x * 2.0 <= room) {
+                    let r = Rect::from_min_size(pos2(x, row_y - 1.0 - g.size().y / 2.0 - pad.y), g.size() + pad * 2.0);
+                    p.rect_filled(r, 6.0, Color32::from_white_alpha((14.0 * t) as u8));
+                    p.rect_stroke(r.shrink(0.5), 6.0, Stroke::new(1.0_f32, Color32::from_white_alpha((22.0 * t) as u8)));
+                    p.galley(r.min + pad, g, col);
+                }
+            }
+
             // The chapter playing (videos with chapters): "12:41 / 33:07 | Title",
             // cut short to the room before the buttons on the right
             if let Some(title) = chapter_at(&app.chapters, app.time_pos) {

@@ -329,6 +329,10 @@ pub(crate) struct Bars {
     pub(crate) state: State,
     /// The backdrop and vignette, built for one window size / accent / height
     cache: Option<(Rect, Color32, f32, Mesh, Mesh)>,
+    /// The floating details box (no cover, no bars): its top-left corner as a
+    /// fraction of the room it has to move in, and its direction
+    float_at: egui::Vec2,
+    float_dir: egui::Vec2,
 }
 
 impl Bars {
@@ -350,6 +354,8 @@ impl Bars {
             reference: -20.0,
             state: State::Waiting,
             cache: None,
+            float_at: vec2(0.5, 0.42),
+            float_dir: vec2(0.8, 0.6),
         }
     }
 
@@ -598,16 +604,60 @@ impl Bars {
         self.vignette(&p);
     }
 
-    /// No pictures and no bars: the backdrop with the song's name
-    pub(crate) fn draw_still(&mut self, p: &egui::Painter, rect: Rect, name: SongName, accent: Color32) {
+    /// No cover and no bars: the song's details in a frosted box that drifts
+    /// slowly round the window, bouncing off its edges (like the old DVD
+    /// screensaver), over the faint grid. It only moves while the song plays.
+    /// Returns true while it moves (redraw about 30 times a second).
+    pub(crate) fn draw_floating(&mut self, p: &egui::Painter, rect: Rect, name: SongName, accent: Color32, playing: bool, dt: f32) -> bool {
         let p = p.with_clip_rect(rect);
-        let cy = rect.top() + rect.height() * 0.46;
-        self.backdrop(&p, rect, accent, cy);
-        let s = (rect.height() / 720.0).clamp(0.9, 1.6);
-        let top = cy - name.lines() as f32 * LINE_H * s / 2.0;
-        song_name(&p, rect.center().x, top, rect.width() * 0.8, &name, s);
+        self.backdrop(&p, rect, accent, rect.center().y);
+        let s = text_scale(rect);
+        let pad = vec2(40.0, 30.0) * s;
+        let block = song_name_size(&p, &name, s, rect.width() * 0.7);
+        let size = block + pad * 2.0;
+        // The room it moves in (a little in from the edges)
+        let room = rect.shrink(10.0);
+        let free = (room.size() - size).max(vec2(0.0, 0.0));
+        // Move: about 16 px a second (at the 720 p size), bouncing at the edges
+        if playing && free.x + free.y > 0.0 {
+            let speed = 16.0 * s * dt.clamp(0.0, 0.1);
+            for (at, dir, room) in [(&mut self.float_at.x, &mut self.float_dir.x, free.x), (&mut self.float_at.y, &mut self.float_dir.y, free.y)] {
+                if room <= 1.0 {
+                    *at = 0.5;
+                    continue;
+                }
+                *at += *dir * speed / room;
+                if *at < 0.0 {
+                    *at = -*at;
+                    *dir = dir.abs();
+                } else if *at > 1.0 {
+                    *at = 2.0 - *at;
+                    *dir = -dir.abs();
+                }
+                *at = at.clamp(0.0, 1.0);
+            }
+        }
+        let min = room.min + vec2(free.x * self.float_at.x, free.y * self.float_at.y);
+        let boxr = Rect::from_min_size(pos2(min.x.round(), min.y.round()), size);
+        let radius = 22.0 * s;
+        crate::glass::shadow(&p, boxr, radius, 1.0);
+        crate::glass::fill(&p, boxr, radius, Color32::from_rgb(30, 32, 40), 1.0);
+        p.rect_stroke(boxr.shrink(0.5), radius, egui::Stroke::new(1.0_f32, crate::glass::edge(Color32::from_rgb(60, 64, 76))));
+        // a faint accent glow along its top edge
+        let mut m = Mesh::default();
+        let glow = Rect::from_min_max(pos2(boxr.left() + radius, boxr.top() + 1.0), pos2(boxr.right() - radius, boxr.top() + 2.0));
+        quad_v(&mut m, glow, splash::light(splash::rgb(accent), 0.5), splash::light(splash::rgb(accent), 0.5));
+        p.add(egui::Shape::mesh(m));
+        song_name(&p, boxr.center().x, boxr.top() + pad.y, rect.width() * 0.7, &name, s);
         self.vignette(&p);
+        playing
     }
+}
+
+/// Text size for the song's details: steps down with a smaller window, and
+/// only grows a little in a big one
+fn text_scale(rect: Rect) -> f32 {
+    (rect.height() / 720.0).clamp(0.9, 1.2)
 }
 
 /// The album-art screen, top to bottom: the cover, then the song's name (just
@@ -622,9 +672,9 @@ struct CoverLayout {
 
 impl CoverLayout {
     fn new(rect: Rect, lines: usize) -> Self {
-        // (the text stays readable in a small window)
-        let scale = (rect.height() / 720.0).clamp(0.9, 1.6);
-        let name_top = rect.bottom() - 118.0 - lines as f32 * LINE_H * scale;
+        let scale = text_scale(rect);
+        // (its bottom a little above the seek bar)
+        let name_top = rect.bottom() - 82.0 - lines as f32 * LINE_H * scale;
         Self { scale, cover_top: rect.top() + 56.0, cover_bottom: name_top - 22.0 * scale, name_top }
     }
 }
@@ -640,8 +690,6 @@ pub(crate) struct SongName<'a> {
     pub(crate) album: &'a str,
     /// "3 of 12" in a playlist
     pub(crate) playlist: Option<&'a str>,
-    /// "FLAC — 16-bit · 44.1 kHz · 1,012 kb/s"
-    pub(crate) format: Option<&'a str>,
 }
 
 impl SongName<'_> {
@@ -651,7 +699,6 @@ impl SongName<'_> {
             ("Artist", self.artist),
             ("Album", self.album),
             ("Playlist", self.playlist.unwrap_or("")),
-            ("Format", self.format.unwrap_or("")),
         ]
             .into_iter()
             .map(|(k, v)| (k, v.trim()))
@@ -662,6 +709,22 @@ impl SongName<'_> {
     pub(crate) fn lines(&self) -> usize {
         self.rows().len()
     }
+}
+
+/// The size of the song's details block (song_name)
+fn song_name_size(p: &egui::Painter, name: &SongName, s: f32, max_w: f32) -> egui::Vec2 {
+    let rows = name.rows();
+    let label_w = rows.iter().map(|(k, _)| p.layout_no_wrap(k.to_uppercase(), FontId::proportional(11.5 * s), Color32::WHITE).size().x).fold(0.0, f32::max);
+    let gap = 12.0 * s;
+    let value_w = rows
+        .iter()
+        .enumerate()
+        .map(|(i, (_, v))| {
+            let f = if i == 0 { FontId::new(15.5 * s, FontFamily::Name("semibold".into())) } else { FontId::proportional(15.0 * s) };
+            crate::controls::elide(p, v, f, Color32::WHITE, (max_w - label_w - gap).max(40.0)).size().x
+        })
+        .fold(0.0, f32::max);
+    vec2(label_w + gap + value_w, rows.len() as f32 * LINE_H * s)
 }
 
 /// The song's name as labelled lines: small labels right-aligned in a column
@@ -808,10 +871,11 @@ pub(crate) fn song_info(path: &str) -> SongInfo {
     info
 }
 
-/// The FORMAT line: "FLAC — 16-bit · 44.1 kHz · 1,012 kb/s", "MP3 — 44.1 kHz ·
-/// 320 kb/s". `codec`: mpv's name for the sound's codec; `rate`: mpv's sample
-/// rate, used when the file's own details aren't known.
-pub(crate) fn format_line(path: &str, codec: &str, rate: Option<u32>, info: Option<&SongInfo>) -> Option<String> {
+/// The song's format for the controls row, longest first, then shorter ones for
+/// less room: "FLAC — 16-bit · 44.1 kHz · 1,012 kb/s", "FLAC — 16-bit · 44.1 kHz",
+/// "FLAC". `codec`: mpv's name for the sound's codec; `rate`: mpv's sample rate,
+/// used when the file's own details aren't known.
+pub(crate) fn format_lines(path: &str, codec: &str, rate: Option<u32>, info: Option<&SongInfo>) -> Vec<String> {
     let ext = std::path::Path::new(path).extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
     let (name, lossless) = match codec {
         "flac" => ("FLAC", true),
@@ -827,8 +891,8 @@ pub(crate) fn format_line(path: &str, codec: &str, rate: Option<u32>, info: Opti
         "ac3" | "eac3" => ("Dolby Digital", false),
         "dts" => ("DTS", false),
         c if c.starts_with("pcm") => (if ext == "aif" || ext == "aiff" { "AIFF" } else { "WAV" }, true),
-        _ if !ext.is_empty() => return Some(ext.to_uppercase()),
-        _ => return None,
+        _ if !ext.is_empty() => return vec![ext.to_uppercase()],
+        _ => return Vec::new(),
     };
     let mut parts = Vec::new();
     if lossless {
@@ -840,9 +904,18 @@ pub(crate) fn format_line(path: &str, codec: &str, rate: Option<u32>, info: Opti
         let khz = r as f64 / 1000.0;
         parts.push(if (khz - khz.round()).abs() < 0.05 { format!("{} kHz", khz.round()) } else { format!("{khz:.1} kHz") });
     }
+    let short = parts.len();
     if let Some(k) = info.and_then(|i| i.kbps) {
         let k = if k >= 1000 { format!("{},{:03}", k / 1000, k % 1000) } else { k.to_string() };
         parts.push(format!("{k} kb/s"));
     }
-    Some(if parts.is_empty() { name.to_owned() } else { format!("{name} \u{2014} {}", parts.join(" \u{b7} ")) })
+    let line = |n: usize| if n == 0 { name.to_owned() } else { format!("{name} \u{2014} {}", parts[..n].join(" \u{b7} ")) };
+    let mut out = vec![line(parts.len())];
+    if short > 0 && short < parts.len() {
+        out.push(line(short));
+    }
+    if !parts.is_empty() {
+        out.push(line(0));
+    }
+    out
 }

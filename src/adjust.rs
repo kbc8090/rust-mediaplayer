@@ -1885,7 +1885,8 @@ fn playing_mark(p: &egui::Painter, right: f32, bottom: f32, levels: [f32; 3], co
 
 /// The playlist panel on the right: every entry (click one to play it), and its
 /// two options. `playing`: heights for the playing entry's three-bar mark;
-/// `progress`: how far into it (0…1), shown as a fill along its row.
+/// `progress`: how far into it (0…1), shown as a fill along its row. `shuffle`:
+/// for a playlist of files dropped together ("Selected playlist"), a Shuffle switch.
 #[allow(clippy::too_many_arguments)]
 pub fn draw_playlist(
     ctx: &egui::Context,
@@ -1896,6 +1897,7 @@ pub fn draw_playlist(
     progress: f32,
     replay: &mut bool,
     summary: &mut bool,
+    shuffle: Option<&mut bool>,
     accent: Color32,
 ) -> PlaylistAction {
     if !ui_state.playlist_open || rows.is_empty() {
@@ -1905,7 +1907,9 @@ pub fn draw_playlist(
     const ITEM_H: f32 = 28.0;
     let screen = ctx.screen_rect();
     let w = PANEL_W.min(screen.width() - 16.0);
-    let foot_h = 9.0 + ROW_H * 2.0 + 6.0;
+    let title = if shuffle.is_some() { "Selected playlist" } else { "Playlist" };
+    let switches = if shuffle.is_some() { 3.0 } else { 2.0 };
+    let foot_h = 9.0 + ROW_H * switches + 6.0;
     let max_h = (screen.height() - PANEL_TOP - BOTTOM_GAP).max(HEAD_H + foot_h + ITEM_H * 2.0);
     let list_h = (rows.len() as f32 * ITEM_H + 8.0).min(max_h - HEAD_H - foot_h);
     let h = HEAD_H + list_h + foot_h;
@@ -1918,12 +1922,12 @@ pub fn draw_playlist(
         ui.allocate_rect(rect, Sense::click_and_drag());
         let p = ui.painter().clone();
         panel_frame(&p, rect);
-        let (_, close) = header_with(ui, &p, rect, "Playlist", "playlist", false);
+        let (_, close) = header_with(ui, &p, rect, title, "playlist", false);
         if close {
             ui_state.playlist_open = false;
         }
         // "3 of 12 · 46:00" after the title (the total only once every length is known)
-        let title_w = p.layout_no_wrap("Playlist".to_owned(), semibold(14.5), TEXT).size().x;
+        let title_w = p.layout_no_wrap(title.to_owned(), semibold(14.5), TEXT).size().x;
         let total: Option<f64> = rows.iter().map(|r| r.secs).sum();
         let count = match total {
             Some(t) => format!("{} of {} \u{b7} {}", current + 1, rows.len(), clock(t)),
@@ -1985,7 +1989,12 @@ pub fn draw_playlist(
         let mut top = rect.top() + HEAD_H + list_h;
         p.line_segment([pos2(rect.left() + 10.0, top + 4.5), pos2(rect.right() - 10.0, top + 4.5)], Stroke::new(1.0_f32, LINE));
         top += 9.0;
-        for (label, key) in [("Replay when it ends", 0), ("Always show \u{201c}Up next\u{201d}", 1)] {
+        let mut shuffle = shuffle;
+        let has_shuffle = shuffle.is_some();
+        for (label, key) in [("Shuffle", 2), ("Replay when it ends", 0), ("Always show \u{201c}Up next\u{201d}", 1)] {
+            if key == 2 && !has_shuffle {
+                continue;
+            }
             let r = Rect::from_min_size(pos2(rect.left() + 6.0, top), vec2(w - 12.0, ROW_H));
             top += ROW_H;
             let resp = ui.interact(r, ui.id().with(("playlist_switch", key)), Sense::click_and_drag());
@@ -1993,13 +2002,21 @@ pub fn draw_playlist(
                 p.rect_filled(r, 4.0, c);
             }
             p.text(pos2(r.left() + 10.0, r.center().y), Align2::LEFT_CENTER, label, FontId::proportional(NAME_SIZE), TEXT);
-            let on = if key == 0 { *replay } else { *summary };
+            let on = match key {
+                0 => *replay,
+                1 => *summary,
+                _ => shuffle.as_deref().copied().unwrap_or(false),
+            };
             switch(&p, Rect::from_center_size(pos2(r.right() - 28.0, r.center().y), vec2(38.0, 19.0)), on, accent);
             if activated(&resp) {
-                if key == 0 {
-                    *replay = !*replay;
-                } else {
-                    *summary = !*summary;
+                match key {
+                    0 => *replay = !*replay,
+                    1 => *summary = !*summary,
+                    _ => {
+                        if let Some(sh) = shuffle.as_deref_mut() {
+                            *sh = !*sh;
+                        }
+                    }
                 }
             }
         }
@@ -2010,14 +2027,11 @@ pub fn draw_playlist(
 /// The "Up next" card, bottom right: the next three entries (click one to play
 /// it) and a link to the whole list
 /// `noun`: "songs", "videos" or "files", for its "All 12 songs…" link
-pub fn draw_playlist_summary(ctx: &egui::Context, ui_state: &mut AdjustUi, rows: &[PlaylistRow], current: usize, replay: bool, noun: &str, accent: Color32) -> PlaylistAction {
+/// (`next`: the next entries in playing order: shuffled, or going round to the
+/// start when it replays)
+pub fn draw_playlist_summary(ctx: &egui::Context, ui_state: &mut AdjustUi, rows: &[PlaylistRow], current: usize, next: &[usize], noun: &str, accent: Color32) -> PlaylistAction {
     const ITEM_H: f32 = 25.0;
-    // The next three, going round to the start when it replays
-    let mut next: Vec<usize> = (current + 1..rows.len()).take(3).collect();
-    if replay {
-        let more = 3 - next.len();
-        next.extend((0..rows.len()).take(more.min(current + 1)));
-    }
+    let next: Vec<usize> = next.iter().copied().filter(|&i| i < rows.len()).collect();
     let screen = ctx.screen_rect();
     let w = 240.0_f32.min(screen.width() - 16.0);
     let body = if next.is_empty() { ITEM_H } else { next.len() as f32 * ITEM_H };
