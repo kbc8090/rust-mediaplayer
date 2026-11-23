@@ -1219,7 +1219,8 @@ pub(crate) fn icon_seek(p: &egui::Painter, c: Pos2, col: Color32, forward: bool)
 // ── Dropping files: what's coming ─────────────────────────────────────────────
 /// What's being dragged over the window, worked out from the file names
 /// (Windows says which files they are while they're still being dragged)
-struct DropPreview {
+#[derive(Clone)]
+pub(crate) struct DropPreview {
     icon: DropIcon,
     /// In big letters: "FLAC", "MP4", "8 SONGS"…
     big: String,
@@ -1378,56 +1379,106 @@ fn drop_icon(p: &egui::Painter, c: Pos2, size: f32, icon: DropIcon, colour: &dyn
 /// something it can't play), with an
 /// icon for the kind of file, its format in big letters, and what dropping it
 /// will do
-pub(crate) fn draw_drop_overlay(app: &FluentMediaPlayer, ctx: &egui::Context) {
+pub(crate) fn draw_drop_overlay(app: &mut FluentMediaPlayer, ctx: &egui::Context) {
     let paths: Vec<String> = ctx.input(|i| {
         i.raw.hovered_files.iter().filter_map(|f| f.path.as_ref().map(|p| p.to_string_lossy().into_owned())).collect()
     });
-    let Some(d) = drop_preview(&paths) else { return };
+    // (a video dragged over a video that's open: no blur, so the one playing
+    // stays in view; just the frame and the details over it)
+    let video_open = app.has_file && (app.video_kind == VideoKind::Video || matches!(media_kind(&app.current_file), Some(MediaKind::Video)));
+    if let Some(d) = drop_preview(&paths) {
+        let blur = !(video_open && d.icon == DropIcon::Video);
+        paint_drop(ctx, app.accent, &d, blur, None);
+        app.drop_seen = Some((d, blur));
+        return;
+    }
+    // Let go: a short send-off (a third of a second). Taken: the frame opens out
+    // a little and everything fades. Refused: it shakes its head, then fades.
+    // (Dragged away again: it just goes.)
+    if let Some(d) = app.drop_seen.take() {
+        if ctx.input(|i| !i.raw.dropped_files.is_empty()) {
+            app.drop_anim = Some((d.0, d.1, std::time::Instant::now()));
+        }
+    }
+    if let Some((d, blur, t0)) = &app.drop_anim {
+        let k = t0.elapsed().as_secs_f32() / DROP_ANIM_SECS;
+        if k >= 1.0 {
+            app.drop_anim = None;
+        } else {
+            paint_drop(ctx, app.accent, d, *blur, Some(k));
+            ctx.request_repaint();
+        }
+    }
+}
+
+/// How long the send-off after a drop takes
+const DROP_ANIM_SECS: f32 = 0.32;
+
+/// The drop overlay itself. `after`: how far through the send-off after the
+/// drop (0…1), None while still dragging.
+fn paint_drop(ctx: &egui::Context, accent: Color32, d: &DropPreview, blur: bool, after: Option<f32>) {
     let screen = ctx.screen_rect();
     let area = Rect::from_min_max(
-        pos2(screen.left(), screen.top() + WIN_BTN_H + 6.0),
-        pos2(screen.right(), screen.bottom() - SEEK_FROM_BOTTOM - 22.0),
+        pos2(screen.left(), screen.top() + WIN_BTN_H + 1.0),
+        pos2(screen.right(), screen.bottom() - SEEK_FROM_BOTTOM - 12.0),
     );
     if area.height() < 60.0 {
         return;
     }
+    let k = after.unwrap_or(0.0).clamp(0.0, 1.0);
+    let out = 1.0 - (1.0 - k).powi(3); // (eased)
+    let alpha = 1.0 - out;
+    // Taken: opens out a little; refused: a quick shake that dies down
+    let (grow, shake) = if d.playable {
+        (14.0 * out, 0.0)
+    } else {
+        (0.0, (k * std::f32::consts::PI * 6.0).sin() * 9.0 * (1.0 - k))
+    };
     let p = ctx.layer_painter(egui::LayerId::new(egui::Order::Tooltip, egui::Id::new("drop_overlay")));
-    let acc = crate::splash::rgb(app.accent);
-    let grey = |_: f32| Color32::from_rgb(128, 128, 136);
+    let acc = crate::splash::rgb(accent);
+    let grey = move |_: f32| Color32::from_rgb(128, 128, 136).gamma_multiply(alpha);
     // (the start screen's teal → accent → violet, but mostly the accent: a
     // gentle shift across the letters rather than the full ribbon)
-    let ribbon = |f: f32| {
+    let ribbon = move |f: f32| {
         let [r, g, b] = crate::splash::mix(acc, crate::splash::ribbon_colour(acc, f), 0.4);
-        Color32::from_rgb((r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8)
+        Color32::from_rgb((r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8).gamma_multiply(alpha)
     };
     let colour: &dyn Fn(f32) -> Color32 = if d.playable { &ribbon } else { &grey };
 
     // Inside a rounded frame 10 px in from the window's edges: the video blurred
     // (the frosted glass the menus use; a dark veil without it), outlined in
     // the accent colour (grey for something it can't play)
-    let fr = area.shrink(10.0);
+    let fr = area.shrink(10.0).expand(grow).translate(vec2(shake, 0.0));
     let r = 16.0;
-    crate::glass::fill(&p, fr, r, Color32::from_black_alpha(170), 1.0);
-    let edge = if d.playable { app.accent } else { Color32::from_rgb(128, 128, 136) };
-    p.rect_stroke(fr.shrink(1.0), r - 1.0, Stroke::new(2.0_f32, edge));
+    if blur {
+        crate::glass::fill(&p, fr, r, Color32::from_black_alpha(170), alpha);
+    } else {
+        // (a light veil, so the details still read over the video)
+        p.rect_filled(fr, r, Color32::from_black_alpha((70.0 * alpha) as u8));
+    }
+    let edge = if d.playable { accent } else { Color32::from_rgb(128, 128, 136) };
+    p.rect_stroke(fr.shrink(1.0), r - 1.0, Stroke::new(2.0_f32, edge.gamma_multiply(alpha)));
 
     // The icon, the format, the details and what dropping does: centred
-    let s = (area.height() / 560.0).clamp(0.55, 1.4);
+    // (growing a touch as it's taken)
+    let s = (area.height() / 560.0).clamp(0.55, 1.4) * (1.0 + 0.06 * out);
+    let cx = area.center().x + shake;
     let big = FontId::new((96.0 * s).round(), FontFamily::Name("semibold".into()));
     let icon_size = (64.0 * s).round();
     let gap = 14.0 * s;
     let big_h = big.size;
     let block = icon_size + gap + big_h + 14.0 * s + 18.0 + 8.0 + 20.0;
     let mut y = area.center().y - block / 2.0;
-    drop_icon(&p, pos2(area.center().x, y + icon_size / 2.0), icon_size, d.icon, colour);
+    drop_icon(&p, pos2(cx, y + icon_size / 2.0), icon_size, d.icon, colour);
     y += icon_size + gap;
-    gradient_text(&p, pos2(area.center().x, y + big_h / 2.0), &d.big, big, colour);
+    gradient_text(&p, pos2(cx, y + big_h / 2.0), &d.big, big, colour);
     y += big_h + 14.0 * s;
     if !d.detail.is_empty() {
-        let g = elide(&p, &d.detail, FontId::proportional(14.0), Color32::from_rgb(214, 214, 222), area.width() * 0.8);
-        p.galley(pos2(area.center().x - g.size().x / 2.0, y), g, Color32::from_rgb(214, 214, 222));
+        let dc = Color32::from_rgb(214, 214, 222).gamma_multiply(alpha);
+        let g = elide(&p, &d.detail, FontId::proportional(14.0), dc, area.width() * 0.8);
+        p.galley(pos2(cx - g.size().x / 2.0, y), g, dc);
     }
     y += 18.0 + 8.0;
     let col = if d.playable { Color32::WHITE } else { Color32::from_rgb(200, 200, 206) };
-    p.text(pos2(area.center().x, y), Align2::CENTER_TOP, d.action, FontId::new(16.0, FontFamily::Name("semibold".into())), col);
+    p.text(pos2(cx, y), Align2::CENTER_TOP, d.action, FontId::new(16.0, FontFamily::Name("semibold".into())), col.gamma_multiply(alpha));
 }

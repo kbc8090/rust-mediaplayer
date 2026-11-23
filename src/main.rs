@@ -348,6 +348,11 @@ struct FluentMediaPlayer {
     show_controls: bool,
     /// Fraction of the seek bar while the user is dragging it
     drag_frac: Option<f32>,
+    /// Files being dragged over the window: what they are, and whether the
+    /// overlay blurs (kept for the moment they're dropped); then the short
+    /// animation after the drop (and when it started)
+    pub(crate) drop_seen: Option<(controls::DropPreview, bool)>,
+    pub(crate) drop_anim: Option<(controls::DropPreview, bool, std::time::Instant)>,
     /// The drag along the seek bar has seeked to keyframes only (an exact seek
     /// follows when it ends)
     pub(crate) drag_rough: bool,
@@ -716,6 +721,8 @@ impl FluentMediaPlayer {
             speed: 1.0,
             show_controls: true,
             drag_frac: None,
+            drop_seen: None,
+            drop_anim: None,
             drag_rough: false,
             last_mouse_move: std::time::Instant::now(),
             has_file: false,
