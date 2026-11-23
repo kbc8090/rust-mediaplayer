@@ -142,6 +142,13 @@ unsafe fn paint_video(gl: &glow::Context, rc: &mut RenderContext<'static>, x: i3
         if drew {
             let _ = rc.render::<*mut std::os::raw::c_void>(v.fbo.0.get() as i32, w, h, true);
         }
+        if new_frame {
+            VIDEO_STALE.with(|s| s.set(false));
+        }
+        if VIDEO_STALE.with(|s| s.get()) {
+            // (the previous file's picture: leave the window black)
+            return drew;
+        }
         gl.bind_framebuffer(glow::READ_FRAMEBUFFER, Some(v.fbo));
         gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, None);
         gl.blit_framebuffer(0, 0, w, h, x, y, x + w, y + h, glow::COLOR_BUFFER_BIT, glow::NEAREST);
@@ -174,6 +181,12 @@ fn video_callback(rect: Rect) -> egui::PaintCallback {
 thread_local! {
     /// The size the cached video picture was drawn at
     static VIDEO_SIZE: std::cell::Cell<(i32, i32)> = const { std::cell::Cell::new((0, 0)) };
+    /// A new file was opened and mpv hasn't drawn its first picture yet: the kept
+    /// picture is the previous file's (its last frame, or a song's cover), so
+    /// nothing is shown until mpv has a new one. (mpv is still asked to draw
+    /// every frame meanwhile: if it isn't, it waits up to 0.2 s for each one,
+    /// which made new videos start a beat late.)
+    static VIDEO_STALE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// End the process immediately, without running any DLL or runtime shutdown code.
@@ -424,10 +437,6 @@ struct FluentMediaPlayer {
     /// The link playing is a live stream (yt-dlp says so): the seek bar is full and
     /// still, and the time shows "● Live" beside it
     pub(crate) live: bool,
-    /// A link has loaded but may not have drawn its first picture yet: the video
-    /// stays black until it's playing (else mpv shows the previous video's last
-    /// frame for a moment). Since when.
-    pub(crate) video_hold: Option<std::time::Instant>,
     /// Save video as… / Save clip as…: what to save, waiting for a folder
     save_pending: Option<SavePending>,
     /// Save clip as…: the clip being set up (panel at the top, ends on the seek bar)
@@ -701,7 +710,6 @@ impl FluentMediaPlayer {
             bars: visualizer::Bars::new(),
             bars_tick: std::time::Instant::now(),
             live: false,
-            video_hold: None,
             save_pending: None,
             clip: None,
             os_title: String::new(),
@@ -845,6 +853,8 @@ impl FluentMediaPlayer {
             self.link.set("demuxer-max-bytes", "32MiB");
             self.link.set("demuxer-max-back-bytes", "8MiB");
         }
+        // The picture kept from the last file mustn't show while this one opens
+        VIDEO_STALE.with(|s| s.set(true));
         self.link.command("loadfile", &[path]);
         self.link.set("pause", "no");
         self.is_playing = true;
@@ -1148,51 +1158,45 @@ impl FluentMediaPlayer {
     }
 
     /// Remember the window geometry, then end the process at once
-    /// A song is playing: the visualizer, the album-art screen, or (Show: Off)
-    /// the cover / a still background (Picture & Sound → Sound → Show)
+    /// A song is playing: the visualizer, or the album-art screen
+    /// (Picture & Sound → Sound → Show)
     fn draw_music(&mut self, ui: &egui::Ui, rect: Rect) {
         use adjust::MusicShow;
         let now = std::time::Instant::now();
         let dt = now.saturating_duration_since(self.bars_tick).as_secs_f32();
         self.bars_tick = now;
 
-        let mode = self.adjust.music;
-        let has_cover = self.video_kind == VideoKind::Cover && self.render_ctx_initialized;
-        let cover = if has_cover && mode == MusicShow::AlbumArt { visualizer::Bars::cover_rect(rect, self.cover_aspect) } else { None };
-        // (Off, or the cover shown full size: no bars, so no second decoder either)
-        let wants_bars = match mode {
-            MusicShow::Off => false,
-            MusicShow::AlbumArt | MusicShow::Visualizer => true,
-        };
-        let moving = if wants_bars {
-            self.scope.follow(&self.current_file, self.time_pos);
-            let playing = self.is_playing && !self.eof;
-            self.bars.update(&self.scope, &self.current_file, self.time_pos, playing, dt)
-        } else {
-            self.scope.stop();
-            false
-        };
-        let readable = self.bars.state != visualizer::State::Unsupported;
-
         // The song's name: its title tag (else the file name), then "artist · album"
         let title = if self.song_title.is_empty() { self.file_name() } else { self.song_title.clone() };
         let sub = [self.song_artist.trim(), self.song_album.trim()].iter().filter(|t| !t.is_empty()).copied().collect::<Vec<_>>().join(" \u{b7} ");
-
         let p = ui.painter();
-        if mode == MusicShow::Off && has_cover {
-            p.add(video_callback(rect));
-        } else if let Some(c) = cover {
-            self.bars.draw_cover_back(p, rect, c, self.accent);
-            p.add(video_callback(c));
-            self.bars.draw_cover_front(p, rect, (&title, &sub), self.accent, readable);
-        } else if mode == MusicShow::Off || !readable {
-            self.bars.draw_still(p, rect, &title, &sub, self.accent);
-        } else {
-            self.bars.draw_visualizer(p, rect, self.accent);
+
+        // Album art: the cover with the song's name; nothing moves, so nothing
+        // more to decode or redraw. (Songs without a cover, or a window too small
+        // for one, get the visualizer.)
+        let has_cover = self.video_kind == VideoKind::Cover && self.render_ctx_initialized;
+        if self.adjust.music == MusicShow::AlbumArt && has_cover {
+            if let Some(c) = visualizer::Bars::cover_rect(rect, self.cover_aspect) {
+                self.scope.stop();
+                self.bars.draw_cover_back(p, rect, c, self.accent);
+                p.add(video_callback(c));
+                self.bars.draw_cover_front(p, rect, (&title, &sub));
+                return;
+            }
         }
+
+        self.scope.follow(&self.current_file, self.time_pos);
+        let playing = self.is_playing && !self.eof;
+        let moving = self.bars.update(&self.scope, &self.current_file, self.time_pos, playing, dt);
+        if self.bars.state == visualizer::State::Unsupported {
+            // (a file the bars can't read: Opus, WMA, a link...)
+            self.bars.draw_still(p, rect, &title, &sub, self.accent);
+            return;
+        }
+        self.bars.draw_visualizer(p, rect, self.accent);
         // Keep the bars moving (at the screen's refresh rate; the 6 ms is only a
         // limit in case vsync is off). Paused, they settle and the redrawing stops.
-        if moving && readable {
+        if moving {
             ui.ctx().request_repaint_after(std::time::Duration::from_millis(6));
         }
     }
@@ -1458,11 +1462,6 @@ impl eframe::App for FluentMediaPlayer {
         self.last_tick = now;
         if snap.valid {
             self.track_url_load(ctx, &snap);
-            if let Some(t0) = self.video_hold {
-                if (snap.path == self.current_file && snap.time_pos > 0.05) || t0.elapsed().as_secs_f32() > 1.5 {
-                    self.video_hold = None;
-                }
-            }
             // A link's thumbnails: from the small preview stream yt-dlp found
             if is_url(&self.current_file) && self.link_thumbs.as_deref() != Some(self.current_file.as_str()) {
                 if let Some(li) = snap.link_info.as_ref().filter(|li| li.url == self.current_file) {
@@ -2030,14 +2029,9 @@ impl eframe::App for FluentMediaPlayer {
                     splash::draw(ui.painter(), rect, self.accent);
                 } else if music {
                     self.draw_music(ui, rect);
-                } else if self.render_ctx_initialized
-                    && self.video_kind == VideoKind::Video
-                    && self.url_load.is_none()
-                    && self.video_hold.is_none()
-                {
-                    // (Until the new file is known to be a video, and while a link
-                    // is opening: just black, not the last picture of whatever
-                    // played before, such as the previous song's cover.)
+                } else if self.render_ctx_initialized && self.url_load.is_none() {
+                    // (While a link is opening: just black. A new file shows black
+                    // too until its first picture, see VIDEO_STALE.)
                     ui.painter().add(video_callback(rect));
                 }
             });

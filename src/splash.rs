@@ -88,7 +88,8 @@ fn rings(mesh: &mut Mesh, c: Pos2, rx: f32, ry: f32, ds: &[f32], ring: impl Fn(f
 
 /// The dark background with its faint grid and the accent glow, centred on the
 /// height `cy` (the start screen's ribbon, the music visualizer's bars)
-pub(crate) fn backdrop(m: &mut Mesh, rect: Rect, accent: Color32, cy: f32) {
+/// `grid`: how strong the grid lines are (1 = the start screen's)
+pub(crate) fn backdrop(m: &mut Mesh, rect: Rect, accent: Color32, cy: f32, grid: f32) {
     let (w, h) = (rect.width(), rect.height());
     if w < 4.0 || h < 4.0 {
         return;
@@ -118,7 +119,7 @@ pub(crate) fn backdrop(m: &mut Mesh, rect: Rect, accent: Color32, cy: f32) {
         let base = m.vertices.len() as u32;
         for i in 0..=samples {
             let y = rect.top() + h * i as f32 / samples as f32;
-            let col = light(GRID, 0.028 * fade(y));
+            let col = light(GRID, 0.028 * grid * fade(y));
             m.colored_vertex(pos2(x - 0.5, y), col);
             m.colored_vertex(pos2(x + 0.5, y), col);
         }
@@ -131,7 +132,7 @@ pub(crate) fn backdrop(m: &mut Mesh, rect: Rect, accent: Color32, cy: f32) {
     }
     let mut y = cy - (((cy - rect.top()) / step).floor()) * step - step * 0.5;
     while y < rect.bottom() {
-        let col = light(GRID, 0.022 * fade(y));
+        let col = light(GRID, 0.022 * grid * fade(y));
         let r = Rect::from_min_max(pos2(rect.left(), y - 0.5), pos2(rect.right(), y + 0.5));
         let base = m.vertices.len() as u32;
         for c in [r.left_top(), r.right_top(), r.right_bottom(), r.left_bottom()] {
@@ -161,7 +162,7 @@ pub fn draw(p: &egui::Painter, rect: Rect, accent: Color32) {
     let cy = rect.top() + h * 0.44;
 
     let mut m = Mesh::default();
-    backdrop(&mut m, rect, accent, cy);
+    backdrop(&mut m, rect, accent, cy, 1.0);
 
     // ── the ribbon: 11 interleaved waves ────────────────────────────────────
     let npts = ((w / 3.0) as usize).clamp(120, 900);

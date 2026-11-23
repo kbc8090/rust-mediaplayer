@@ -478,7 +478,9 @@ impl Bars {
         let fresh = !matches!(&self.cache, Some((r, a, y, _, _)) if *r == rect && *a == accent && *y == cy);
         if fresh {
             let mut back = Mesh::default();
-            splash::backdrop(&mut back, rect, accent, cy);
+            // (the grid a little stronger than the start screen's: behind the bars it
+            // was hard to see)
+            splash::backdrop(&mut back, rect, accent, cy, 1.6);
             let mut vig = Mesh::default();
             splash::vignette(&mut vig, rect);
             self.cache = Some((rect, accent, cy, back, vig));
@@ -545,11 +547,12 @@ impl Bars {
     /// The visualizer filling `rect`
     pub(crate) fn draw_visualizer(&mut self, p: &egui::Painter, rect: Rect, accent: Color32) {
         let p = p.with_clip_rect(rect);
-        let (w, h) = (rect.width(), rect.height());
+        let h = rect.height();
         let base = rect.top() + h * 0.58;
         self.backdrop(&p, rect, accent, base);
         let s = (h / 720.0).clamp(0.45, 2.0);
-        let area = Rect::from_min_max(pos2(rect.left() + w * 0.08, base - h * 0.34), pos2(rect.right() - w * 0.08, base));
+        // (edge to edge)
+        let area = Rect::from_min_max(pos2(rect.left(), base - h * 0.34), pos2(rect.right(), base));
         self.draw_bars(&p, area, accent, true, 14.0 * s);
         self.vignette(&p);
     }
@@ -558,7 +561,7 @@ impl Bars {
     /// for it, show the visualizer instead). `aspect` = the cover's width / height.
     pub(crate) fn cover_rect(rect: Rect, aspect: f32) -> Option<Rect> {
         let l = CoverLayout::new(rect);
-        let side = (l.cover_bottom - l.cover_top).min(rect.width() * 0.5);
+        let side = (l.cover_bottom - l.cover_top).min(rect.width() * 0.6);
         if side < 90.0 {
             return None;
         }
@@ -579,15 +582,11 @@ impl Bars {
         p.add(egui::Shape::mesh(shadow.tessellate(cover, 4.0)));
     }
 
-    /// The album-art screen, around the cover: the song's name and the strip of bars
-    pub(crate) fn draw_cover_front(&mut self, p: &egui::Painter, rect: Rect, (title, sub): (&str, &str), accent: Color32, bars: bool) {
+    /// The album-art screen, around the cover: the song's name under it
+    pub(crate) fn draw_cover_front(&mut self, p: &egui::Painter, rect: Rect, (title, sub): (&str, &str)) {
         let p = p.with_clip_rect(rect);
         let l = CoverLayout::new(rect);
         song_name(&p, pos2(rect.center().x, l.title_y), rect.width() * 0.8, title, sub, l.scale);
-        if bars {
-            let area = Rect::from_min_max(pos2(rect.left() + rect.width() * 0.03, l.strip_top), pos2(rect.right() - rect.width() * 0.03, l.strip_base));
-            self.draw_bars(&p, area, accent, false, 7.0 * l.scale);
-        }
         self.vignette(&p);
     }
 
@@ -602,24 +601,20 @@ impl Bars {
     }
 }
 
-/// The album-art screen, top to bottom: the cover, the song's name, the strip of
-/// bars (just above the controls)
+/// The album-art screen, top to bottom: the cover, then the song's name (just
+/// above the controls)
 struct CoverLayout {
     scale: f32,
     cover_top: f32,
     cover_bottom: f32,
     title_y: f32,
-    strip_top: f32,
-    strip_base: f32,
 }
 
 impl CoverLayout {
     fn new(rect: Rect) -> Self {
         let scale = (rect.height() / 720.0).clamp(0.6, 1.6);
-        let strip_base = rect.bottom() - 112.0;
-        let strip_top = strip_base - 34.0 * scale;
-        let title_y = strip_top - 22.0 * scale - SUB_GAP * scale;
-        Self { scale, cover_top: rect.top() + 52.0, cover_bottom: title_y - 30.0 * scale, title_y, strip_top, strip_base }
+        let title_y = rect.bottom() - 120.0 - SUB_GAP * scale;
+        Self { scale, cover_top: rect.top() + 56.0, cover_bottom: title_y - 34.0 * scale, title_y }
     }
 }
 

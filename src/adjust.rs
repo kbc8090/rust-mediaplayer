@@ -37,20 +37,17 @@ const NORMALIZER: &str = "lavfi=[dynaudnorm=f=150:g=15]";
 pub enum MusicShow {
     /// Glowing bars that move with the music
     Visualizer,
-    /// The song's cover with a strip of bars under it; songs without a cover get
-    /// the visualizer
+    /// The song's cover with its title, artist and album; songs without a cover
+    /// get the visualizer
     AlbumArt,
-    /// Nothing that moves: the cover if there is one, else a still background
-    Off,
 }
 
 impl MusicShow {
-    const ALL: [MusicShow; 3] = [MusicShow::Visualizer, MusicShow::AlbumArt, MusicShow::Off];
+    const ALL: [MusicShow; 2] = [MusicShow::Visualizer, MusicShow::AlbumArt];
     fn key(self) -> &'static str {
         match self {
             MusicShow::Visualizer => "visualizer",
             MusicShow::AlbumArt => "album_art",
-            MusicShow::Off => "off",
         }
     }
 }
@@ -720,8 +717,8 @@ fn rows(a: &Adjust, normalize: bool, hq: bool, tab: Tab, denoise_skipped: bool) 
                 Row::Section("While music plays"),
                 Row::Choice(
                     "Show",
-                    "Visualizer: glowing bars that move with the music. Album art: the song's cover with a strip of bars under it (songs without a cover show the visualizer). Off: just the cover, or a still background; nothing moves, so it uses no extra power.",
-                    &["Visualizer", "Album art", "Off"],
+                    "Visualizer: glowing bars that move with the music. Album art: the song's cover with its title, artist and album (songs without a cover show the visualizer).",
+                    &["Visualizer", "Album art"],
                     music,
                     ChoiceKey::Music,
                 ),

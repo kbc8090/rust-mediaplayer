@@ -583,7 +583,6 @@ impl FluentMediaPlayer {
             // still being looked up, which looked like the link had loaded)
             if snap.duration > 0.0 || snap.time_pos > 0.0 {
                 self.url_load = None;
-                self.video_hold = Some(std::time::Instant::now());
                 return;
             }
         }
