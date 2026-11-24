@@ -48,6 +48,11 @@ thread_local! {
     static GL: RefCell<Option<Gl>> = const { RefCell::new(None) };
 }
 
+/// How long a thumbnail seek gets before it's checked (and sent again if it
+/// hasn't landed), and how often to look while waiting
+const RETRY_AFTER: Duration = Duration::from_millis(1200);
+const RETRY_CHECK: Duration = Duration::from_millis(300);
+
 pub struct Thumbs {
     /// Started on first use (`load`); None until then, or if it couldn't start
     mpv: Option<(Arc<Mutex<Mpv>>, MpvLink)>,
@@ -63,6 +68,12 @@ pub struct Thumbs {
     synced: bool,
     /// The time last asked for
     requested: Option<f64>,
+    /// When that was sent, until the thumbnail player is seen to have got there
+    /// (a seek over the network can fail or get lost: it's sent again)
+    sent_at: Option<Instant>,
+    /// Times it has been sent again (twice at most: a video whose keyframes are
+    /// far apart never looks "there")
+    retries: u8,
     /// When the pending file was handed over (it's opened ahead of time once it has
     /// been playing for WARM_DELAY)
     pending_since: Option<Instant>,
@@ -82,6 +93,8 @@ impl Thumbs {
             wanted: false,
             synced: false,
             requested: None,
+            sent_at: None,
+            retries: 0,
             pending_since: None,
             user_agent: None,
             headers: Vec::new(),
@@ -243,7 +256,33 @@ impl Thumbs {
         }
         if resend || self.requested.is_none_or(|r| (r - secs).abs() > 0.2) {
             self.requested = Some(secs);
+            self.sent_at = Some(Instant::now());
+            self.retries = 0;
             link.command("seek", &[&at, "absolute+keyframes"]);
+            ctx.request_repaint_after(RETRY_CHECK);
+            return;
+        }
+        // The pointer has stopped: make sure the thumbnail player really got
+        // there. A seek in an online video's preview stream sometimes never
+        // lands (a dropped or refused request), and the picture stayed on the
+        // last one until the pointer moved again. Checked every so often while
+        // the pointer rests; sent again if it isn't near the time after a while.
+        let (Some(sent), Some(r)) = (self.sent_at, self.requested) else { return };
+        if sent.elapsed() < RETRY_AFTER {
+            ctx.request_repaint_after(RETRY_CHECK);
+            return;
+        }
+        let s = link.snapshot();
+        // (a keyframe seek lands on the keyframe before the time: up to several
+        // seconds early)
+        let there = s.duration > 0.0 && s.time_pos <= r + 1.0 && s.time_pos >= r - 12.0;
+        if there || self.retries >= 2 {
+            self.sent_at = None;
+        } else {
+            self.retries += 1;
+            self.sent_at = Some(Instant::now());
+            link.command("seek", &[&at, "absolute+keyframes"]);
+            ctx.request_repaint_after(RETRY_CHECK);
         }
     }
 
