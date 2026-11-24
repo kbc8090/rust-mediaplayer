@@ -81,6 +81,11 @@ pub struct Thumbs {
     /// wants (None / empty for files)
     user_agent: Option<String>,
     headers: Vec<String>,
+    /// A YouTube video's storyboard (its thumbnails come from that instead),
+    /// with the sheet the thumbnail player has open and the crop last set
+    board: Option<std::sync::Arc<crate::online::Storyboard>>,
+    board_sheet: Option<usize>,
+    board_crop: String,
 }
 
 impl Thumbs {
@@ -98,6 +103,9 @@ impl Thumbs {
             pending_since: None,
             user_agent: None,
             headers: Vec::new(),
+            board: None,
+            board_sheet: None,
+            board_crop: String::new(),
         }
     }
 
@@ -106,6 +114,7 @@ impl Thumbs {
     pub fn load(&mut self, path: &str) {
         self.user_agent = None;
         self.headers.clear();
+        self.drop_board();
         self.pending = Some(path.to_owned());
         self.pending_since = Some(Instant::now());
         self.requested = None;
@@ -161,9 +170,32 @@ impl Thumbs {
         self.headers = headers;
     }
 
+    /// A YouTube video is playing: its thumbnails come from its storyboard, the
+    /// pictures YouTube itself shows over its seek bar. Each sheet is one small
+    /// image holding dozens of them, so hovering along the bar mostly just moves
+    /// a crop over the sheet that's already open: no seeking in a video over the
+    /// internet, which sometimes never landed.
+    pub fn load_storyboard(&mut self, board: std::sync::Arc<crate::online::Storyboard>) {
+        self.forget();
+        self.user_agent = None;
+        self.headers.clear();
+        self.board = Some(board);
+    }
+
+    fn drop_board(&mut self) {
+        if self.board.take().is_some() {
+            if let Some((_, link)) = &self.mpv {
+                link.set("video-crop", "");
+            }
+        }
+        self.board_sheet = None;
+        self.board_crop.clear();
+    }
+
     /// A link is playing whose preview stream isn't known yet (or there isn't
     /// one): let go of the previous file and don't open anything
     pub fn forget(&mut self) {
+        self.drop_board();
         self.pending = None;
         self.pending_since = None;
         self.requested = None;
@@ -223,6 +255,9 @@ impl Thumbs {
         if !self.gl_ready {
             return None;
         }
+        if let Some(b) = &self.board {
+            return self.board_sheet.is_some().then_some(b.w as f32 / b.h as f32);
+        }
         let s = self.mpv.as_ref()?.1.snapshot();
         (s.dwidth > 0 && s.dheight > 0).then(|| s.dwidth as f32 / s.dheight as f32)
     }
@@ -236,6 +271,23 @@ impl Thumbs {
             if !self.gl_failed && !self.wanted {
                 self.wanted = true;
                 ctx.request_repaint();
+            }
+            return;
+        }
+        // A storyboard: the right sheet open, cropped to the right picture
+        if let Some(b) = self.board.clone() {
+            let Some((_, link)) = &self.mpv else { return };
+            let (sheet, crop) = b.tile(secs);
+            if crop != self.board_crop || self.board_sheet != Some(sheet) {
+                link.set("video-crop", crop.as_str());
+                self.board_crop = crop;
+            }
+            if self.board_sheet != Some(sheet) {
+                link.command("change-list", &["http-header-fields", "clr", ""]);
+                link.set("user-agent", "libmpv");
+                link.set("start", "none");
+                link.command("loadfile", &[&b.sheets[sheet]]);
+                self.board_sheet = Some(sheet);
             }
             return;
         }

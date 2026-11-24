@@ -1944,7 +1944,11 @@ impl eframe::App for FluentMediaPlayer {
                 // (not from a failed answer: opening the same link again after it
                 // failed, the old answer can still be around for a frame or two)
                 if let Some(li) = snap.link_info.as_ref().filter(|li| li.url == self.current_file && li.error.is_none()) {
-                    if let Some(pv) = &li.preview {
+                    // (YouTube's storyboard when there is one: quicker and surer
+                    // than seeking in a video stream over the internet)
+                    if let Some(sb) = &li.storyboard {
+                        self.thumbs.load_storyboard(sb.clone());
+                    } else if let Some(pv) = &li.preview {
                         self.thumbs.load_stream(&pv.url, pv.user_agent.clone(), pv.headers.clone());
                     }
                     self.link_thumbs = Some(self.current_file.clone());

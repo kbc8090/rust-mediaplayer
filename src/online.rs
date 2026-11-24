@@ -309,6 +309,9 @@ pub(crate) struct LinkInfo {
     pub(crate) rows: Vec<(&'static str, String)>,
     /// A small video-only stream of it, for the seek-bar thumbnails
     pub(crate) preview: Option<PreviewStream>,
+    /// YouTube's own seek-bar preview pictures (sheets of small frames, the
+    /// way YouTube does it): used for thumbnails instead of the preview stream
+    pub(crate) storyboard: Option<std::sync::Arc<Storyboard>>,
     /// A live stream (Twitch, a YouTube live...): no end, so no seeking along a bar
     pub(crate) live: bool,
     /// YouTube's "most replayed" graph, when it has one
@@ -351,6 +354,53 @@ fn parse_heatmap(j: &serde_json::Value) -> Option<std::sync::Arc<Heatmap>> {
         return None;
     }
     Some(std::sync::Arc::new(Heatmap { values, end }))
+}
+
+/// A video's storyboard: pictures every few seconds, laid out in a grid on
+/// each of a series of sheets (JPEG images)
+#[derive(Debug, PartialEq)]
+pub(crate) struct Storyboard {
+    /// Each sheet's address, in order
+    pub(crate) sheets: Vec<String>,
+    pub(crate) cols: u32,
+    pub(crate) rows: u32,
+    /// One picture's size, in pixels
+    pub(crate) w: u32,
+    pub(crate) h: u32,
+    /// Seconds between pictures
+    pub(crate) every: f64,
+}
+
+impl Storyboard {
+    /// The picture for `secs`: which sheet, and where on it (mpv's crop:
+    /// "WxH+X+Y")
+    pub(crate) fn tile(&self, secs: f64) -> (usize, String) {
+        let per = (self.cols * self.rows).max(1) as usize;
+        let last = (self.sheets.len() * per).saturating_sub(1);
+        let i = ((secs.max(0.0) / self.every) as usize).min(last);
+        let (sheet, at) = (i / per, (i % per) as u32);
+        let (x, y) = ((at % self.cols) * self.w, (at / self.cols) * self.h);
+        (sheet, format!("{}x{}+{}+{}", self.w, self.h, x, y))
+    }
+}
+
+/// yt-dlp's storyboard formats (YouTube's "sb0", "sb1"…): the sharpest one
+fn parse_storyboard(j: &serde_json::Value) -> Option<std::sync::Arc<Storyboard>> {
+    let best = j["formats"]
+        .as_array()?
+        .iter()
+        .filter(|f| f["format_note"].as_str() == Some("storyboard"))
+        .filter_map(|f| {
+            let n = |k: &str| f[k].as_u64().and_then(|v| u32::try_from(v).ok()).filter(|v| *v > 0);
+            let fps = f["fps"].as_f64().filter(|v| *v > 0.0)?;
+            let sheets: Vec<String> = f["fragments"].as_array()?.iter().filter_map(|g| g["url"].as_str().map(str::to_owned)).collect();
+            if sheets.is_empty() {
+                return None;
+            }
+            Some(Storyboard { sheets, cols: n("columns")?, rows: n("rows")?, w: n("width")?, h: n("height")?, every: 1.0 / fps })
+        })
+        .max_by_key(|s| s.w * s.h)?;
+    Some(std::sync::Arc::new(best))
 }
 
 /// A low-resolution video stream the thumbnail player can open directly
@@ -485,7 +535,8 @@ pub(crate) fn parse_link_result(text: &str) -> Option<LinkInfo> {
     };
     let live = j["is_live"].as_bool() == Some(true) || text(&j["live_status"]).as_deref() == Some("is_live");
     let heatmap = if live { None } else { parse_heatmap(&j) };
-    Some(LinkInfo { url: String::new(), error: None, rows, preview, live, heatmap })
+    let storyboard = if live { None } else { parse_storyboard(&j) };
+    Some(LinkInfo { url: String::new(), error: None, rows, preview, live, heatmap, storyboard })
 }
 
 /// "20240312" → "12 Mar 2024"
