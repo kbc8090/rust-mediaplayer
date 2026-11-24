@@ -348,6 +348,8 @@ struct FluentMediaPlayer {
     show_controls: bool,
     /// Fraction of the seek bar while the user is dragging it
     drag_frac: Option<f32>,
+    /// The next file loaded starts this far through (0…1)
+    start_at: Option<f32>,
     /// Files being dragged over the window: what they are (kept for the moment
     /// they're dropped); then the short animation after the drop (and when it
     /// started)
@@ -721,6 +723,7 @@ impl FluentMediaPlayer {
             speed: 1.0,
             show_controls: true,
             drag_frac: None,
+            start_at: None,
             drop_seen: None,
             drop_anim: None,
             drag_rough: false,
@@ -1016,7 +1019,14 @@ impl FluentMediaPlayer {
         // show while this file opens; after a video, its last frame stays up until
         // the new one's first, so going from video to video doesn't flicker
         VIDEO_STALE.with(|s| s.set(!self.video_shown));
-        self.link.command("loadfile", &[path]);
+        // (started part way through: right-clicked along its row in the playlist)
+        match self.start_at.take() {
+            Some(f) => {
+                let start = format!("start={:.2}%", f * 100.0);
+                self.link.command("loadfile", &[path, "replace", "-1", &start]);
+            }
+            None => self.link.command("loadfile", &[path]),
+        }
         self.link.set("pause", "no");
         self.is_playing = true;
         self.time_pos = 0.0;
@@ -1468,6 +1478,14 @@ impl FluentMediaPlayer {
         }
         match action {
             adjust::PlaylistAction::Play(i) => self.play_index(i),
+            adjust::PlaylistAction::PlayFrom(i, f) => {
+                if Some(i) == self.folder_index && self.duration > 0.0 {
+                    self.seek_to(self.duration * f as f64);
+                } else {
+                    self.start_at = Some(f);
+                    self.play_index(i);
+                }
+            }
             adjust::PlaylistAction::Open => self.toggle_playlist_panel(),
             adjust::PlaylistAction::None => {}
         }

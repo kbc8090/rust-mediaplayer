@@ -29,6 +29,7 @@ pub(crate) const SHORTCUTS: &[(&[&str], &str)] = &[
     (&["Ctrl+V"], "Play a copied link"),
     (&["E"], "Picture & Sound"),
     (&["L"], "Playlist (while one plays)"),
+    (&["Right-click"], "A song in the playlist: play from that point"),
     (&["Tab"], "Video info"),
     (&["H"], "Next decoding method"),
     (&["Media keys"], "Play / pause, next, previous"),

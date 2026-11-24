@@ -1911,6 +1911,9 @@ pub enum PlaylistAction {
     None,
     /// Play this entry (also the one playing: from the start)
     Play(usize),
+    /// Right-clicked along an entry's row: play it from that far through
+    /// (0…1; the one playing just jumps there)
+    PlayFrom(usize, f32),
     /// Open the playlist panel (from the "Up next" card)
     Open,
 }
@@ -2175,6 +2178,13 @@ pub fn draw_playlist(
                     p.galley(pos2(num_r + 10.0, r.center().y - g.size().y / 2.0), g, col);
                     if activated(&resp) {
                         action = PlaylistAction::Play(i);
+                    }
+                    // (right-click: that far through the song, as if the row were
+                    // its seek bar)
+                    if resp.secondary_clicked() {
+                        if let Some(pos) = resp.interact_pointer_pos() {
+                            action = PlaylistAction::PlayFrom(i, ((pos.x - hl.left()) / hl.width()).clamp(0.0, 0.99));
+                        }
                     }
                     if cur && scroll_to_current {
                         ui.scroll_to_rect(r, Some(egui::Align::Center));
