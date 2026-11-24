@@ -70,7 +70,7 @@ No clutter, no history, no telemetry.
 
 <!-- A short clip (MP4 or GIF) of opening several songs from Explorer, the
      playlist sliding out from its tab, and clicking a song. -->
-<img src="docs/playlist.gif" width="860" alt="Opening several songs, and the playlist sliding out">
+<img src="docs/playlist.png" width="860" alt="Opening several songs, and the playlist sliding out">
 
 - Select several files in Explorer and press **Open**, or drag them in: they play as a playlist,
   in Explorer's order
@@ -81,7 +81,7 @@ No clutter, no history, no telemetry.
 
 <!-- A GIF of dragging a song (or a few) over the window: the blur, the frame
      and "FLAC" / "8 SONGS" in big letters. -->
-<img src="docs/drop.gif" width="860" alt="Dragging songs over the player">
+<img src="docs/drop.png" width="860" alt="Dragging songs over the player">
 
 Drag something over the window and it tells you what it is (**FLAC**, **MP4**, **8 SONGS**)
 before you let go, and greys out anything it can't play.
