@@ -2128,8 +2128,16 @@ impl eframe::App for FluentMediaPlayer {
         if let Some(folder) = taskbar::take_picked_folder() {
             self.start_save(ctx, &folder);
         }
-        // A file from the open dialog, or from a second launch of the player
-        if let Some(path) = taskbar::take_picked_file() {
+        // The open dialog: one file opens; several become a selected playlist (in
+        // name order), like dropping them in together
+        let picked = taskbar::take_picked_files();
+        let media: Vec<&String> = picked.iter().filter(|s| is_media_file(s)).collect();
+        if media.len() > 1 {
+            let mut files: Vec<PathBuf> = media.iter().map(PathBuf::from).collect();
+            files.sort_by(|a, b| natural_cmp(&a.file_name().unwrap_or_default().to_string_lossy(), &b.file_name().unwrap_or_default().to_string_lossy()));
+            let entries: Vec<PlaylistEntry> = files.into_iter().map(|path| PlaylistEntry { path, title: None, secs: None }).collect();
+            self.start_playlist(PathBuf::from("Selected files"), entries, true);
+        } else if let Some(path) = media.first().map(|s| (*s).clone()).or_else(|| picked.into_iter().next()) {
             self.open_external(path);
         }
         for path in taskbar::take_forwarded() {

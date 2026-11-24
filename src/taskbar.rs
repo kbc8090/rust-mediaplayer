@@ -808,17 +808,17 @@ pub fn take_media_key() -> Option<MediaKey> {
 
 // ── Open file dialog ──────────────────────────────────────────────────────────
 static DIALOG_OPEN: AtomicBool = AtomicBool::new(false);
-static PICKED: Mutex<Option<String>> = Mutex::new(None);
+static PICKED: Mutex<Vec<String>> = Mutex::new(Vec::new());
 static DIALOG_OWNER: AtomicIsize = AtomicIsize::new(0);
 
-/// The file picked in the open dialog, once it has closed
-pub fn take_picked_file() -> Option<String> {
-    PICKED.lock().ok().and_then(|mut p| p.take())
+/// The files picked in the open dialog (one or several), once it has closed
+pub fn take_picked_files() -> Vec<String> {
+    PICKED.lock().map(|mut p| std::mem::take(&mut *p)).unwrap_or_default()
 }
 
 /// Show Windows' "Open" dialog without blocking the player: it runs on its own
 /// thread (the video keeps playing and drawing), and the choice is collected
-/// with `take_picked_file`.
+/// with `take_picked_files`.
 pub fn open_file_dialog(owner: isize, initial_dir: Option<String>) {
     if DIALOG_OPEN.swap(true, Ordering::Relaxed) {
         return; // already showing
@@ -826,9 +826,9 @@ pub fn open_file_dialog(owner: isize, initial_dir: Option<String>) {
     DIALOG_OWNER.store(owner, Ordering::Relaxed);
     std::thread::spawn(move || {
         let picked = unsafe { run_open_dialog(owner, initial_dir) };
-        if let Some(p) = picked {
+        if !picked.is_empty() {
             if let Ok(mut slot) = PICKED.lock() {
-                *slot = Some(p);
+                *slot = picked;
             }
         }
         DIALOG_OPEN.store(false, Ordering::Relaxed);
@@ -836,7 +836,7 @@ pub fn open_file_dialog(owner: isize, initial_dir: Option<String>) {
     });
 }
 
-unsafe fn run_open_dialog(owner: isize, initial_dir: Option<String>) -> Option<String> {
+unsafe fn run_open_dialog(owner: isize, initial_dir: Option<String>) -> Vec<String> {
     CoInitializeEx(std::ptr::null_mut(), 0x2 /* COINIT_APARTMENTTHREADED */);
     let filter: Vec<u16> = concat!(
         "Media files\0",
@@ -851,7 +851,8 @@ unsafe fn run_open_dialog(owner: isize, initial_dir: Option<String>) -> Option<S
     )
         .encode_utf16()
         .collect();
-    let mut file = vec![0u16; 4096];
+    // (room for a few hundred picked files' names)
+    let mut file = vec![0u16; 65_536];
     let dir = initial_dir.map(|d| wide(&d));
     let title = wide("Open");
     let mut ofn: OpenFileNameW = std::mem::zeroed();
@@ -863,13 +864,20 @@ unsafe fn run_open_dialog(owner: isize, initial_dir: Option<String>) -> Option<S
     ofn.max_file = file.len() as u32;
     ofn.initial_dir = dir.as_ref().map_or(std::ptr::null(), |d| d.as_ptr());
     ofn.title = title.as_ptr();
-    // OFN_EXPLORER | OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_HIDEREADONLY | OFN_ENABLESIZING
-    ofn.flags = 0x0008_0000 | 0x0000_1000 | 0x0000_0800 | 0x0000_0004 | 0x0080_0000;
+    // OFN_EXPLORER | OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_HIDEREADONLY |
+    // OFN_ENABLESIZING | OFN_ALLOWMULTISELECT
+    ofn.flags = 0x0008_0000 | 0x0000_1000 | 0x0000_0800 | 0x0000_0004 | 0x0080_0000 | 0x0000_0200;
     if GetOpenFileNameW(&mut ofn) == 0 {
-        return None; // cancelled
+        return Vec::new(); // cancelled
     }
-    let len = file.iter().position(|&c| c == 0).unwrap_or(file.len());
-    Some(String::from_utf16_lossy(&file[..len]))
+    // One file: its full path. Several: the folder, then each file's name, each
+    // ending in a 0 (and a second 0 after the last)
+    let parts: Vec<String> = file.split(|&c| c == 0).take_while(|p| !p.is_empty()).map(String::from_utf16_lossy).collect();
+    match parts.as_slice() {
+        [] => Vec::new(),
+        [one] => vec![one.clone()],
+        [dir, names @ ..] => names.iter().map(|n| std::path::Path::new(dir).join(n).to_string_lossy().into_owned()).collect(),
+    }
 }
 
 // ── Folder picker (Save As…) ──────────────────────────────────────────────────

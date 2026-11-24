@@ -20,7 +20,7 @@ pub(crate) const SHORTCUTS: &[(&[&str], &str)] = &[
     (&["Right-click"], "Main menu"),
     (&["Esc"], "Leave full screen / close menu"),
     (&["R"], "Rotate 90\u{b0}"),
-    (&["Ctrl+O"], "Open file"),
+    (&["Ctrl+O"], "Open file(s)"),
     (&["Ctrl+U"], "Open URL"),
     (&["Ctrl+S"], "Save video as (online videos)"),
     (&["Ctrl+Shift+S"], "Save clip as"),
@@ -374,7 +374,7 @@ pub(crate) fn draw_main_menu(app: &mut FluentMediaPlayer, ctx: &egui::Context) {
 
     let sort_label = SORT_CHOICES.iter().find(|(by, _)| *by == app.sort_by).map_or("Name", |(_, l)| *l);
     let mut rows = vec![
-        MenuRow::Item { key: "open", label: "Open file\u{2026}", hint: Some("Ctrl+O"), mark: Mark::None },
+        MenuRow::Item { key: "open", label: "Open file(s)\u{2026}", hint: Some("Ctrl+O"), mark: Mark::None },
         MenuRow::Item { key: "open_url", label: "Open URL\u{2026}", hint: Some("Ctrl+U"), mark: Mark::None },
     ];
     // Save As… while an online video is playing (Cancel saving while one saves)
