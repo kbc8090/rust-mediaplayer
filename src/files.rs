@@ -9,48 +9,55 @@ use super::*;
 pub(crate) fn scan_folder(path: &Path, by: SortBy, desc: bool) -> Vec<PathBuf> {
     let Some(dir) = path.parent() else { return vec![path.to_owned()] };
     let kind = media_kind(&path.to_string_lossy());
-    let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
+    // Windows hands over each file's type, size and dates with the folder listing
+    // itself, so no file is opened one by one here (that took a while for a big
+    // folder on an old hard drive). Other files are skipped by name first.
+    let files: Vec<(PathBuf, std::fs::Metadata)> = std::fs::read_dir(dir)
         .map(|rd| {
             rd.filter_map(|e| e.ok())
-                .map(|e| e.path())
-                .filter(|p| {
+                .filter_map(|e| {
+                    let p = e.path();
                     let k = media_kind(&p.to_string_lossy());
-                    p.is_file() && k.is_some() && (kind.is_none() || k == kind)
+                    if k.is_none() || (kind.is_some() && k != kind) {
+                        return None;
+                    }
+                    let md = match e.metadata() {
+                        Ok(m) if !m.file_type().is_symlink() => Some(m),
+                        // (a link: what it points to)
+                        _ => std::fs::metadata(&p).ok(),
+                    };
+                    md.filter(|m| m.is_file()).map(|m| (p, m))
                 })
                 .collect()
         })
         .unwrap_or_default();
-    sort_files(&mut files, by, desc);
-    files
+    sort_files(files, by, desc)
 }
 
 /// Sort like Explorer: by name (natural order), date or size; ties go by name
-pub(crate) fn sort_files(files: &mut Vec<PathBuf>, by: SortBy, desc: bool) {
-    let name = |p: &PathBuf| p.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-    if by == SortBy::Name {
-        files.sort_by(|a, b| natural_cmp(&name(a), &name(b)));
-    } else {
-        // Read each file's date / size once
-        let key = |p: &PathBuf| -> u128 {
-            let Ok(md) = std::fs::metadata(p) else { return 0 };
-            let since = |t: std::io::Result<std::time::SystemTime>| {
-                t.ok()
-                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                    .map_or(0, |d| d.as_nanos())
-            };
-            match by {
-                SortBy::Modified => since(md.modified()),
-                SortBy::Created => since(md.created()),
-                _ => md.len() as u128,
-            }
-        };
-        let mut keyed: Vec<(u128, String, PathBuf)> = files.drain(..).map(|p| (key(&p), name(&p), p)).collect();
-        keyed.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| natural_cmp(&a.1, &b.1)));
-        files.extend(keyed.into_iter().map(|(_, _, p)| p));
-    }
+fn sort_files(files: Vec<(PathBuf, std::fs::Metadata)>, by: SortBy, desc: bool) -> Vec<PathBuf> {
+    let name = |p: &Path| p.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    let since = |t: std::io::Result<std::time::SystemTime>| {
+        t.ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map_or(0, |d| d.as_nanos())
+    };
+    let key = |md: &std::fs::Metadata| -> u128 {
+        match by {
+            SortBy::Name => 0,
+            SortBy::Modified => since(md.modified()),
+            SortBy::Created => since(md.created()),
+            SortBy::Size => md.len() as u128,
+        }
+    };
+    // (each name worked out once, not again on every comparison)
+    let mut keyed: Vec<(u128, String, PathBuf)> = files.into_iter().map(|(p, md)| (key(&md), name(&p), p)).collect();
+    keyed.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| natural_cmp(&a.1, &b.1)));
+    let mut out: Vec<PathBuf> = keyed.into_iter().map(|(_, _, p)| p).collect();
     if desc {
-        files.reverse();
+        out.reverse();
     }
+    out
 }
 
 /// Case-insensitive compare where digit runs compare by value ("2" < "10"),
