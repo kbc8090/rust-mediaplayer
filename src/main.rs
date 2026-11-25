@@ -672,6 +672,21 @@ impl FluentMediaPlayer {
             let _ = init.set_property("cache", "no");
             let _ = init.set_property("demuxer-max-bytes", "32MiB");
             let _ = init.set_property("demuxer-max-back-bytes", "8MiB");
+            // Startup: mpv starts each of its built-in Lua scripts (stats page,
+            // console, menus, …) on its own thread while initializing. The player
+            // uses none of them, only the yt-dlp hook for links, which stays on.
+            // (Options an older mpv doesn't know are just refused, harmlessly.)
+            for k in [
+                "load-stats-overlay",
+                "load-osd-console",
+                "load-auto-profiles",
+                "load-select",
+                "load-positioning",
+                "load-commands",
+                "load-context-menu",
+            ] {
+                let _ = init.set_property(k, "no");
+            }
             Ok(())
         })
         .expect("Failed to initialize libmpv!");
