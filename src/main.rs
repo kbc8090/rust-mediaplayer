@@ -56,7 +56,6 @@ unsafe extern "system" {
     fn GetProcessTimes(process: isize, created: *mut u64, exited: *mut u64, kernel: *mut u64, user: *mut u64) -> i32;
     fn MultiByteToWideChar(code_page: u32, flags: u32, src: *const u8, src_len: i32, dst: *mut u16, dst_len: i32) -> i32;
     fn LoadLibraryW(name: *const u16) -> isize;
-    fn GetSystemTimePreciseAsFileTime(time: *mut u64); // (startup timing)
 }
 
 #[link(name = "user32")]
@@ -196,55 +195,6 @@ thread_local! {
 fn terminate_now() -> ! {
     unsafe { TerminateProcess(GetCurrentProcess(), 0); }
     std::process::exit(0)
-}
-
-// ── Startup timing (Tab overlay) ── to remove: delete this block, the
-// startup_mark(…) calls and the startup_rows() line in refresh_info ─────────────
-/// Milliseconds from the process being created to each step of startup
-static STARTUP: Mutex<Vec<(&'static str, f64)>> = Mutex::new(Vec::new());
-static STARTUP_T0: std::sync::OnceLock<(std::time::Instant, f64)> = std::sync::OnceLock::new();
-static STARTUP_FRAMES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-
-/// Note that the step `name` has just finished
-fn startup_mark(name: &'static str) {
-    let &(t0, before) = STARTUP_T0.get_or_init(|| {
-        // (the time Windows took before any of the player's code ran: from the
-        // process being created to now, by the system clock)
-        let (mut created, mut exited, mut kernel, mut user, mut now) = (0u64, 0u64, 0u64, 0u64, 0u64);
-        let ok = unsafe { GetProcessTimes(GetCurrentProcess(), &mut created, &mut exited, &mut kernel, &mut user) } != 0;
-        unsafe { GetSystemTimePreciseAsFileTime(&mut now) };
-        let ms = if ok && now > created { (now - created) as f64 / 10_000.0 } else { 0.0 };
-        (std::time::Instant::now(), ms)
-    });
-    let ms = before + t0.elapsed().as_secs_f64() * 1000.0;
-    if let Ok(mut v) = STARTUP.lock() {
-        v.push((name, ms));
-    }
-}
-
-/// The first frame is on screen once the second one starts (which is asked for
-/// straight away, so nothing else delays it)
-fn startup_frame(ctx: &egui::Context) {
-    use std::sync::atomic::Ordering::Relaxed;
-    match STARTUP_FRAMES.load(Relaxed) {
-        0 => ctx.request_repaint(),
-        1 => startup_mark("First frame"),
-        _ => return,
-    }
-    STARTUP_FRAMES.fetch_add(1, Relaxed);
-}
-
-/// Each step's own time, and the total
-fn startup_rows(rows: &mut Vec<InfoRow>) {
-    let Ok(v) = STARTUP.lock() else { return };
-    let Some(&(_, total)) = v.last() else { return };
-    rows.push(InfoRow::Section("Startup"));
-    let mut prev = 0.0;
-    for &(name, ms) in v.iter() {
-        rows.push(InfoRow::Item(name, format!("{:.0} ms", ms - prev)));
-        prev = ms;
-    }
-    rows.push(InfoRow::Item("Total", format!("{total:.0} ms")));
 }
 
 // ── Memory readout for the info overlay ──────────────────────────────────────
@@ -676,9 +626,7 @@ fn gl_proc_address(_ctx: &*mut std::ffi::c_void, name: &str) -> *mut std::ffi::c
 
 impl FluentMediaPlayer {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        startup_mark("Window + GL");
         let caption_font = install_fonts(&cc.egui_ctx);
-        startup_mark("Fonts");
         taskbar::set_snap(load_settings().snap);
         let saved = load_window_state().unwrap_or(WinState::DEFAULT);
         let st = load_settings();
@@ -756,7 +704,6 @@ impl FluentMediaPlayer {
         // display when Smooth motion is on for a film (see `update_smooth`).
         // Repaints: mpv signals us through a channel when a new frame is ready.
 
-        startup_mark("mpv setup");
         let mpv = Arc::new(Mutex::new(mpv));
         let link = MpvLink::start(mpv.clone());
 
@@ -934,7 +881,6 @@ impl FluentMediaPlayer {
             app.link.command("change-list", &["script-opts", "append", &format!("ytdl_hook-ytdl_path={}", p.display())]);
         }
         app.apply_online();
-        startup_mark("Other setup");
         app
     }
 
@@ -1773,7 +1719,6 @@ impl FluentMediaPlayer {
         if let Some((ws, private)) = process_memory_mb() {
             rows.push(InfoRow::Item("Memory", format!("{ws:.0} MB  \u{b7}  {private:.0} MB private")));
         }
-        startup_rows(&mut rows);
         self.info_rows = rows;
     }
 
@@ -1972,7 +1917,6 @@ impl FluentMediaPlayer {
 
 impl eframe::App for FluentMediaPlayer {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
-        startup_frame(ctx);
         self.blank_hover_prev = std::mem::take(&mut self.blank_hover);
         // No button ever keeps keyboard focus. egui moves focus between buttons with
         // Tab (our info key), and a focused button also "clicks" on Space / Enter,
@@ -3336,7 +3280,6 @@ fn libmpv_loads() -> bool {
 }
 
 fn main() -> eframe::Result<()> {
-    startup_mark("Exe start");
     // If anything ever panics, say so (and keep a log) instead of vanishing silently
     std::panic::set_hook(Box::new(|info| {
         let msg = format!("{info}");
@@ -3356,7 +3299,6 @@ fn main() -> eframe::Result<()> {
     if !libmpv_loads() {
         return Ok(());
     }
-    startup_mark("libmpv DLL");
     // Anything the player starts (yt-dlp and the Deno it runs, ffmpeg; also
     // mpv's own yt-dlp runs) ends when the player does, however it closes
     taskbar::end_children_with_player();
@@ -3402,7 +3344,6 @@ fn main() -> eframe::Result<()> {
         renderer: eframe::Renderer::Glow,
         ..Default::default()
     };
-    startup_mark("Pre-window");
     eframe::run_native(
         "Rust Media Player",
         options,
