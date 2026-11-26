@@ -514,6 +514,32 @@ pub fn set_border_color(hwnd: isize, color: u32) {
     unsafe { DwmSetWindowAttribute(hwnd, 34, &color as *const u32 as *const c_void, 4) };
 }
 
+/// The colour behind the video, for the parts of the window not drawn yet (see
+/// WM_ERASEBKGND): 0x00BBGGRR
+static ERASE_COLOR: AtomicU32 = AtomicU32::new(0);
+
+/// The backdrop: black, or a picture's grey (r, g, b)
+pub fn set_backdrop(rgb: (u8, u8, u8)) {
+    ERASE_COLOR.store(rgb.0 as u32 | (rgb.1 as u32) << 8 | (rgb.2 as u32) << 16, Ordering::Relaxed);
+}
+
+#[link(name = "user32")]
+unsafe extern "system" {
+    fn FillRect(hdc: isize, rect: *const RectI, brush: isize) -> i32;
+    fn GetClientRect(hwnd: isize, rect: *mut RectI) -> i32;
+}
+#[link(name = "gdi32")]
+unsafe extern "system" {
+    fn CreateSolidBrush(color: u32) -> isize;
+}
+
+/// After the window has grown: fill the part that just became visible right
+/// away (see WM_ERASEBKGND), before the next frame is drawn. Only what Windows
+/// marked as new is touched (no RDW_INVALIDATE), never the video already there.
+unsafe fn erase_new_part(hwnd: isize) {
+    RedrawWindow(hwnd, std::ptr::null(), 0, 0x0200 /* RDW_ERASENOW */);
+}
+
 unsafe fn enter_fullscreen_now(hwnd: isize) {
     if ROUNDED.load(Ordering::Relaxed) {
         set_corners(hwnd, false); // rounded corners on a full screen look wrong
@@ -563,6 +589,7 @@ unsafe fn enter_fullscreen_now(hwnd: isize) {
         // "exclusive fullscreen" present mode, and that switch is a visible blink.
         // The extra row is off-screen; the taskbar still hides as usual.
         SetWindowPos(hwnd, 0, m.left, m.top, m.right - m.left, m.bottom - m.top + 1, 0x0200); // SWP_NOOWNERZORDER
+        erase_new_part(hwnd);
     } else {
         if was_max {
             ShowWindow(hwnd, 3); // SW_MAXIMIZE — couldn't go fullscreen, put it back
@@ -1511,7 +1538,20 @@ unsafe extern "system" fn subclass_proc(
         }
     }
     if msg == WM_ERASEBKGND {
-        // The whole client area is painted by OpenGL; erasing it first only flashes.
+        // The client area is painted by OpenGL. But where the window has just
+        // grown (going full screen, or being resized larger), nothing is drawn
+        // there until the next frame, and Windows showed what was behind the
+        // window meanwhile: there it's filled with the backdrop's colour (black,
+        // a picture's grey). Nothing else is erased: Windows clips this to the
+        // part it marked as new.
+        let mut r = RectI::default();
+        if wparam != 0 && GetClientRect(hwnd, &mut r) != 0 {
+            let brush = CreateSolidBrush(ERASE_COLOR.load(Ordering::Relaxed));
+            if brush != 0 {
+                FillRect(wparam as isize, &r, brush);
+                DeleteObject(brush);
+            }
+        }
         return 1;
     } else if msg == WM_APP_FULLSCREEN {
         if wparam == 1 {

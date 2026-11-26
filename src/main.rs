@@ -3589,6 +3589,8 @@ impl eframe::App for FluentMediaPlayer {
         // (a picture: grey from the start, before mpv has drawn it)
         let (r, g, b) = PICTURE_GREY;
         let backdrop = if self.is_picture() { Color32::from_rgb(r, g, b) } else { Color32::BLACK };
+        // (and the same colour where the window grows, before it's drawn)
+        taskbar::set_backdrop(if self.is_picture() { PICTURE_GREY } else { (0, 0, 0) });
         egui::CentralPanel::default()
             .frame(egui::Frame::none().fill(backdrop))
             .show(ctx, |ui| {
