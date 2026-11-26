@@ -93,6 +93,8 @@ struct VideoTarget {
 /// controls fading) copies the last picture, which costs the GPU next to nothing.
 /// Before, every one of those repaints ran mpv's whole scaling pipeline again,
 /// which with a fast mouse meant hundreds of full redraws a second.
+///
+/// Pictures are drawn differently, see PIC_FRAME.
 unsafe fn paint_video(gl: &glow::Context, rc: &mut RenderContext<'static>, x: i32, y: i32, w: i32, h: i32) -> bool {
     if w <= 0 || h <= 0 {
         return false;
@@ -100,6 +102,16 @@ unsafe fn paint_video(gl: &glow::Context, rc: &mut RenderContext<'static>, x: i3
     // Acknowledge mpv's update (its docs ask for this after every update callback);
     // it says whether mpv has a new picture for us
     let new_frame = rc.update().map_or(true, |f| f & mpv_render_update::Frame != 0);
+    if new_frame {
+        PIC_NEW.with(|p| p.set(true));
+    }
+    let frame = PIC_FRAME.with(|p| p.get());
+    if let PicFrame::View(v) = frame {
+        if let Some(drew) = paint_picture(gl, rc, (x, y, w, h), v) {
+            return drew;
+        }
+        // (no texture for it on this PC: drawn by mpv like a video frame)
+    }
     VIDEO_TARGET.with(|t| {
         let mut t = t.borrow_mut();
         let mut fresh = false;
@@ -109,24 +121,9 @@ unsafe fn paint_video(gl: &glow::Context, rc: &mut RenderContext<'static>, x: i3
                 gl.delete_framebuffer(old.fbo);
                 gl.delete_texture(old.tex);
             }
-            let (tw, th) = ((w + 255) / 256 * 256, (h + 255) / 256 * 256);
-            if let (Ok(tex), Ok(fbo)) = (gl.create_texture(), gl.create_framebuffer()) {
-                gl.bind_texture(glow::TEXTURE_2D, Some(tex));
-                gl.tex_image_2d(glow::TEXTURE_2D, 0, glow::RGBA8 as i32, tw, th, 0, glow::RGBA, glow::UNSIGNED_BYTE, None);
-                gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::NEAREST as i32);
-                gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, glow::NEAREST as i32);
-                gl.bind_texture(glow::TEXTURE_2D, None);
-                gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
-                gl.framebuffer_texture_2d(glow::FRAMEBUFFER, glow::COLOR_ATTACHMENT0, glow::TEXTURE_2D, Some(tex), 0);
-                let ok = gl.check_framebuffer_status(glow::FRAMEBUFFER) == glow::FRAMEBUFFER_COMPLETE;
-                gl.bind_framebuffer(glow::FRAMEBUFFER, None);
-                if ok {
-                    *t = Some(VideoTarget { fbo, tex, w: tw, h: th });
-                    fresh = true;
-                } else {
-                    gl.delete_framebuffer(fbo);
-                    gl.delete_texture(tex);
-                }
+            if let Some(v) = make_target(gl, (w + 255) / 256 * 256, (h + 255) / 256 * 256) {
+                *t = Some(v);
+                fresh = true;
             }
         }
         // egui clips with the scissor test; it mustn't cut into mpv's drawing
@@ -140,55 +137,146 @@ unsafe fn paint_video(gl: &glow::Context, rc: &mut RenderContext<'static>, x: i3
         // The size is part of the picture too: a resize always redraws
         let size_changed = VIDEO_SIZE.with(|s| s.replace((w, h)) != (w, h));
         let drew = fresh || new_frame || size_changed;
-        // Keeping what's on screen (see HOLD): copy it before mpv draws over it
-        let mut hold = HOLD.with(|s| s.get());
-        if hold.0 == 1 {
-            hold = (0, 0);
-            if !fresh && !size_changed {
-                HOLD_TARGET.with(|ht| {
-                    let mut ht = ht.borrow_mut();
-                    if ht.as_ref().is_some_and(|k| k.w != v.w || k.h != v.h) {
-                        if let Some(old) = ht.take() {
-                            gl.delete_framebuffer(old.fbo);
-                            gl.delete_texture(old.tex);
-                        }
-                    }
-                    if ht.is_none() {
-                        *ht = make_target(gl, v.w, v.h);
-                    }
-                    if let Some(k) = ht.as_ref() {
-                        gl.bind_framebuffer(glow::READ_FRAMEBUFFER, Some(v.fbo));
-                        gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, Some(k.fbo));
-                        gl.blit_framebuffer(0, 0, w, h, 0, 0, w, h, glow::COLOR_BUFFER_BIT, glow::NEAREST);
-                        gl.bind_framebuffer(glow::FRAMEBUFFER, None);
-                        hold = (2, 0);
-                    }
-                });
-            }
-        } else if hold.0 == 2 && (fresh || size_changed) {
-            hold = (0, 0); // (the window changed size: show what mpv draws)
-        }
         if drew {
             let _ = rc.render::<*mut std::os::raw::c_void>(v.fbo.0.get() as i32, w, h, true);
-            if hold.0 == 2 && new_frame {
-                hold.1 += 1;
+            if new_frame {
+                WIN_FRAMES.with(|f| f.set(f.get().wrapping_add(1)));
             }
+            WIN_STALE.with(|s| s.set(false));
         }
-        HOLD.with(|s| s.set(hold));
         if new_frame {
             VIDEO_STALE.with(|s| s.set(false));
         }
+        // The picture just left stays as it was until the next file shows
+        // (see PicFrame::Keep), and so does a picture whose texture is newer
+        // than what's here
+        if (matches!(frame, PicFrame::Keep) || WIN_STALE.with(|s| s.get())) && draw_last_picture(gl, (x, y, w, h)) {
+            return drew;
+        }
+        // (the picture's texture is done with: its memory back)
+        PIC_TARGET.with(|p| {
+            if let Some(old) = p.borrow_mut().take() {
+                gl.delete_framebuffer(old.t.fbo);
+                gl.delete_texture(old.t.tex);
+            }
+        });
         if VIDEO_STALE.with(|s| s.get()) {
             // (the previous file's picture: leave the window black)
             return drew;
         }
-        let from = if hold.0 == 2 { HOLD_TARGET.with(|ht| ht.borrow().as_ref().map(|k| k.fbo)) } else { None };
-        gl.bind_framebuffer(glow::READ_FRAMEBUFFER, Some(from.unwrap_or(v.fbo)));
+        gl.bind_framebuffer(glow::READ_FRAMEBUFFER, Some(v.fbo));
         gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, None);
         gl.blit_framebuffer(0, 0, w, h, x, y, x + w, y + h, glow::COLOR_BUFFER_BIT, glow::NEAREST);
         gl.bind_framebuffer(glow::FRAMEBUFFER, None);
         drew
     })
+}
+
+/// A picture in picture mode (see PIC_FRAME): mpv draws the whole picture into
+/// a texture of its own, at the zoom's size (at most its own size, or for a
+/// small picture about the window's area), and only again when that size or the
+/// picture changes. Zooming in further and moving it about just copy that texture
+/// to the window, stretched. (mpv's own zoom cuts the picture to the window in
+/// whole pixels of the picture: zoomed far in, it moved in visible jumps, and
+/// every step drew everything again.) None: no texture could be made.
+unsafe fn paint_picture(gl: &glow::Context, rc: &mut RenderContext<'static>, area: (i32, i32, i32, i32), v: PicView) -> Option<bool> {
+    let (_, _, w, h) = area;
+    let (pw, ph) = (v.size.0.max(1.0), v.size.1.max(1.0));
+    let max = MAX_TEX.with(|m| {
+        if m.get() == 0 {
+            m.set(gl.get_parameter_i32(glow::MAX_TEXTURE_SIZE).clamp(2048, 16384));
+        }
+        m.get()
+    }) as f32;
+    // Drawn by mpv: up to its own size, or a small picture up to the window's area;
+    // never more than the graphics card takes, nor 50 million pixels
+    let most = ((w as f32 * h as f32) / (pw * ph)).sqrt().max(1.0).min(max / pw).min(max / ph).min((50.0e6 / (pw * ph)).sqrt());
+    let s = v.scale.min(most);
+    let size = |s: f32| (((pw * s).round() as i32).max(1), ((ph * s).round() as i32).max(1));
+    let (tw, th) = size(s);
+    PIC_TARGET.with(|pt| {
+        let mut pt = pt.borrow_mut();
+        let pending = PIC_NEW.with(|p| p.get());
+        let changed = pt.as_ref().is_none_or(|p| p.size != v.size);
+        // A new size without a new picture from mpv (turned with R, say): mpv
+        // hasn't got there yet, so what it has would be drawn wrongly sized. The
+        // last one stays as it was meanwhile (but not for long).
+        if changed && !pending && pt.as_ref().is_some_and(|p| p.shown.is_some()) {
+            let since = PIC_WAIT.with(|t| {
+                let since = t.get().unwrap_or_else(std::time::Instant::now);
+                t.set(Some(since));
+                since
+            });
+            if since.elapsed().as_secs_f32() < 0.15 {
+                drop(pt);
+                draw_last_picture(gl, area);
+                return Some(false);
+            }
+        }
+        let (cw, ch) = size(most);
+        let fits = pt.as_ref().is_some_and(|p| {
+            p.t.w >= tw && p.t.h >= th && (p.t.w as i64 * p.t.h as i64) <= 4 * (cw as i64 * ch as i64).max(1 << 20)
+        });
+        if !fits {
+            if let Some(old) = pt.take() {
+                gl.delete_framebuffer(old.t.fbo);
+                gl.delete_texture(old.t.tex);
+            }
+            *pt = Some(PicTarget { t: make_target(gl, cw.max(tw), ch.max(th))?, drawn: (0, 0), size: (0.0, 0.0), shown: None });
+        }
+        let p = pt.as_mut()?;
+        let drew = pending || changed || p.drawn != (tw, th);
+        if drew {
+            gl.disable(glow::SCISSOR_TEST);
+            let _ = rc.render::<*mut std::os::raw::c_void>(p.t.fbo.0.get() as i32, tw, th, true);
+            p.drawn = (tw, th);
+            p.size = v.size;
+            PIC_NEW.with(|n| n.set(false));
+            PIC_WAIT.with(|t| t.set(None));
+        }
+        // (drawn at the zoom's own size: copied pixel for pixel)
+        let exact = (v.scale - s).abs() < 1e-4;
+        blit_picture(gl, p, area, v.rect, exact);
+        WIN_STALE.with(|s| s.set(true));
+        Some(drew)
+    })
+}
+
+/// The picture's texture shown where it was last, if it's what's on screen
+unsafe fn draw_last_picture(gl: &glow::Context, area: (i32, i32, i32, i32)) -> bool {
+    PIC_TARGET.with(|pt| match pt.borrow_mut().as_mut() {
+        Some(p) => match p.shown {
+            Some((rect, exact)) => {
+                blit_picture(gl, p, area, rect, exact);
+                true
+            }
+            None => false,
+        },
+        None => false,
+    })
+}
+
+/// Grey all round, and the picture's texture into `rect` (pixels from the top
+/// left of `area`): copied as it is when `exact`, else stretched to fit
+unsafe fn blit_picture(gl: &glow::Context, p: &mut PicTarget, area: (i32, i32, i32, i32), rect: [f32; 4], exact: bool) {
+    let (x, y, w, h) = area;
+    let (dw, dh) = p.drawn;
+    let x0 = x + rect[0].round() as i32;
+    let top = rect[1].round() as i32;
+    let (x1, bottom) = if exact { (x0 + dw, top + dh) } else { (x + rect[2].round() as i32, rect[3].round() as i32) };
+    let (y0, y1) = (y + h - bottom, y + h - top);
+    gl.enable(glow::SCISSOR_TEST);
+    gl.scissor(x, y, w, h);
+    let (r, g, b) = PICTURE_GREY;
+    gl.clear_color(r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0, 1.0);
+    gl.clear(glow::COLOR_BUFFER_BIT);
+    gl.bind_framebuffer(glow::READ_FRAMEBUFFER, Some(p.t.fbo));
+    gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, None);
+    let filter = if x1 - x0 == dw && y1 - y0 == dh { glow::NEAREST } else { glow::LINEAR };
+    gl.blit_framebuffer(0, 0, dw, dh, x0, y0, x1, y1, glow::COLOR_BUFFER_BIT, filter);
+    gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+    gl.disable(glow::SCISSOR_TEST);
+    p.shown = Some((rect, exact));
 }
 
 /// An off-screen texture to draw into, `tw` × `th`
@@ -233,6 +321,35 @@ fn video_callback(rect: Rect) -> egui::PaintCallback {
     }
 }
 
+/// How a picture is shown this frame (see PIC_FRAME)
+#[derive(Clone, Copy)]
+enum PicFrame {
+    /// As mpv draws it, like a video frame (videos; a picture whose size isn't known yet)
+    Off,
+    /// The picture just left, as it was, while the next file opens
+    Keep,
+    /// The picture, from its own texture
+    View(PicView),
+}
+
+/// A picture to show: its size (as turned), where it goes (pixels from the
+/// window's top left: left, top, right, bottom), and window pixels per picture pixel
+#[derive(Clone, Copy)]
+struct PicView {
+    size: (f32, f32),
+    rect: [f32; 4],
+    scale: f32,
+}
+
+/// A picture's own texture: the size mpv drew it at, the picture size it was
+/// drawn for, and where it's showing (and whether pixel for pixel), if it is
+struct PicTarget {
+    t: VideoTarget,
+    drawn: (i32, i32),
+    size: (f32, f32),
+    shown: Option<([f32; 4], bool)>,
+}
+
 thread_local! {
     /// The size the cached video picture was drawn at
     static VIDEO_SIZE: std::cell::Cell<(i32, i32)> = const { std::cell::Cell::new((0, 0)) };
@@ -242,14 +359,22 @@ thread_local! {
     /// every frame meanwhile: if it isn't, it waits up to 0.2 s for each one,
     /// which made new videos start a beat late.)
     static VIDEO_STALE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    /// Keep showing what's on screen while the next picture opens. A file's own
-    /// settings (the zoom reset, the grey around a picture) are undone as it
-    /// ends, before the next file's take over, and mpv redraws the old picture
-    /// meanwhile: fitted again and on black, for a frame or more. A copy of
-    /// what was showing stays up instead, until mpv has drawn the new picture.
-    /// (0 off, 1 asked for, 2 showing the copy; and the frames mpv has drawn since)
-    static HOLD: std::cell::Cell<(u8, u32)> = const { std::cell::Cell::new((0, 0)) };
-    static HOLD_TARGET: std::cell::RefCell<Option<VideoTarget>> = const { std::cell::RefCell::new(None) };
+    /// How a picture is shown this frame, set by `update`. Pictures aren't
+    /// zoomed by mpv (see paint_picture), so mpv draws each one the same until
+    /// the next: the picture just left stays as it was (Keep) until the next
+    /// file shows, instead of mpv's redraw of it, fitted again.
+    static PIC_FRAME: std::cell::Cell<PicFrame> = const { std::cell::Cell::new(PicFrame::Off) };
+    static PIC_TARGET: std::cell::RefCell<Option<PicTarget>> = const { std::cell::RefCell::new(None) };
+    /// mpv has something new the picture's texture hasn't got yet
+    static PIC_NEW: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Since when a new picture size is waiting on mpv (see paint_picture)
+    static PIC_WAIT: std::cell::Cell<Option<std::time::Instant>> = const { std::cell::Cell::new(None) };
+    /// The video texture is older than the picture shown since
+    static WIN_STALE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// How many new frames from mpv the video texture has had
+    static WIN_FRAMES: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    /// The graphics card's largest texture (0: not asked yet)
+    static MAX_TEX: std::cell::Cell<i32> = const { std::cell::Cell::new(0) };
 }
 
 /// End the process immediately, without running any DLL or runtime shutdown code.
@@ -383,12 +508,13 @@ type ScanResult = Arc<Mutex<Option<(u64, Vec<PathBuf>)>>>;
 /// A photo's details, read on another thread: the picture, and its details
 type PhotoSlot = Arc<Mutex<Option<(String, Option<PhotoDetails>)>>>;
 
-/// The dark grey around a picture (mpv's background-color)
+/// The dark grey around a picture (mpv's background-color, and the window's)
 const PICTURE_BACKDROP: &str = "#2B2C30";
+const PICTURE_GREY: (u8, u8, u8) = (0x2B, 0x2C, 0x30);
 
-/// Showing a copy of the picture just left (see HOLD): since when, how many
-/// times playback had (re)started by then (see PLAYBACK_RESTARTS), and since
-/// when the next picture has been ready (and how many frames mpv had drawn then)
+/// Keeping the picture just left on screen (see PicFrame::Keep): since when, how
+/// many times playback had (re)started by then (see PLAYBACK_RESTARTS), and since
+/// when the next file has been showing (and how many frames mpv had drawn then)
 #[derive(Clone, Copy)]
 struct Holding {
     since: std::time::Instant,
@@ -677,11 +803,13 @@ struct FluentMediaPlayer {
     /// The picture's size in pixels, and the turn the file itself asks for
     pic_size: (f64, f64),
     pic_turn: i64,
+    /// When this file was opened
+    pic_since: std::time::Instant,
     /// Being dragged around (zoomed in past the window)
     pic_drag: bool,
     /// Gliding to a new zoom
     pic_glide: Option<ZoomGlide>,
-    /// Showing a copy of the picture just left (see HOLD)
+    /// Keeping the picture just left on screen (see PicFrame::Keep)
     hold: Option<Holding>,
     /// A photo's details for the Tab overlay (read on another thread): the
     /// picture they're for, and them (None: none in it); and which was asked for
@@ -1012,6 +1140,7 @@ impl FluentMediaPlayer {
             pic_pan: (0.0, 0.0),
             pic_size: (0.0, 0.0),
             pic_turn: 0,
+            pic_since: std::time::Instant::now(),
             pic_drag: false,
             pic_glide: None,
             hold: None,
@@ -1266,10 +1395,10 @@ impl FluentMediaPlayer {
     fn load_entry(&mut self, path: &str) {
         self.archive_gen += 1; // (an archive still being read for another file: not wanted now)
         self.archive_choice = None;
-        // Leaving a picture for another: keep it on screen as it is until the
-        // next one is drawn (see HOLD)
-        if self.is_picture() && media_kind(path) == Some(MediaKind::Image) {
-            HOLD.with(|s| s.set((1, 0)));
+        // Leaving a picture: it stays on screen as it is until the next file
+        // shows (see PicFrame::Keep). (Already leaving one, quickly: the first
+        // file to show after it will do, so going through quickly shows them.)
+        if self.is_picture() && self.hold.is_none() {
             let restarts = mpv_link::PLAYBACK_RESTARTS.load(std::sync::atomic::Ordering::Relaxed);
             self.hold = Some(Holding { since: std::time::Instant::now(), restarts, ready: None });
         }
@@ -1284,6 +1413,7 @@ impl FluentMediaPlayer {
         // the one showing until then stays as it is; its size comes from mpv)
         self.pic_size = (0.0, 0.0);
         self.pic_turn = 0;
+        self.pic_since = std::time::Instant::now();
         self.pic_drag = false;
         self.pic_glide = None;
         self.pic_zoom = 0.0;
@@ -1321,14 +1451,14 @@ impl FluentMediaPlayer {
         // show while this file opens; after a video, its last frame stays up until
         // the new one's first, so going from video to video doesn't flicker
         VIDEO_STALE.with(|s| s.set(!self.video_shown));
-        // Settings for this file only, taking effect as it opens (and undone as
-        // it ends): not zoomed or moved; around a picture a dark grey (black
-        // around pictures looks harsh; videos keep black bars); started part
-        // way through if right-clicked along its row in the playlist
-        let mut options = vec!["video-zoom=0".to_owned(), "video-pan-x=0".to_owned(), "video-pan-y=0".to_owned()];
-        if media_kind(path) == Some(MediaKind::Image) {
-            options.push(format!("background-color={PICTURE_BACKDROP}"));
-        }
+        // Around a picture a dark grey (black around pictures looks harsh;
+        // videos keep black bars). (Set for good rather than for the file
+        // only: mpv undoes a file's own settings as it ends, and redrew the
+        // picture on black for a moment then.)
+        let picture = media_kind(path) == Some(MediaKind::Image);
+        self.link.set("background-color", if picture { PICTURE_BACKDROP } else { "#000000" });
+        // Started part way through if right-clicked along its row in the playlist
+        let mut options = Vec::new();
         if let Some(f) = self.start_at.take() {
             options.push(format!("start={:.2}%", f * 100.0));
         }
@@ -1679,6 +1809,32 @@ impl FluentMediaPlayer {
         Some(Rect::from_center_size(c, vec2(sw as f32, sh as f32)))
     }
 
+    /// How the picture shows this frame (see PicFrame): the one just left while
+    /// the next file opens; this one from its own texture once mpv has it showing
+    /// and its size is known; until then as mpv draws it
+    /// (`area`: where the video goes)
+    fn pic_frame(&self, area: Rect) -> PicFrame {
+        if self.hold.is_some() {
+            return PicFrame::Keep;
+        }
+        // (mpv says when it's showing a file; and in case it never says, after a moment)
+        let showing = *mpv_link::RESTART_PATH.lock().unwrap_or_else(|e| e.into_inner()) == self.current_file
+            || self.pic_since.elapsed().as_secs_f32() > 0.5;
+        if !self.is_picture() || !showing {
+            return PicFrame::Off;
+        }
+        let (Some((w, h)), Some(r), Some(fit)) = (self.picture_size(), self.picture_rect(), self.fit_scale()) else {
+            return PicFrame::Off;
+        };
+        let ppp = self.egui_ctx.pixels_per_point();
+        let o = area.min;
+        PicFrame::View(PicView {
+            size: (w as f32, h as f32),
+            rect: [(r.min.x - o.x) * ppp, (r.min.y - o.y) * ppp, (r.max.x - o.x) * ppp, (r.max.y - o.y) * ppp],
+            scale: (fit * self.pic_zoom.exp2()) as f32,
+        })
+    }
+
     /// Set the zoom and where the picture sits. It can be moved anywhere, as
     /// long as a little of it (64 px, or all of a smaller one) stays in the window.
     fn set_picture_view(&mut self, zoom: f64, pan: (f64, f64)) {
@@ -1694,14 +1850,9 @@ impl FluentMediaPlayer {
             };
             pan = (keep(pan.0, w * s, ww), keep(pan.1, h * s, wh));
         }
-        if zoom != self.pic_zoom {
-            self.link.set("video-zoom", zoom);
-        }
-        if pan.0 != self.pic_pan.0 {
-            self.link.set("video-pan-x", pan.0);
-        }
-        if pan.1 != self.pic_pan.1 {
-            self.link.set("video-pan-y", pan.1);
+        // (drawn by the player, from the picture's texture: see paint_picture)
+        if zoom != self.pic_zoom || pan != self.pic_pan {
+            self.egui_ctx.request_repaint();
         }
         self.pic_zoom = zoom;
         self.pic_pan = pan;
@@ -2493,19 +2644,17 @@ impl eframe::App for FluentMediaPlayer {
         });
         // ── Pictures: zoom glides, the ones either side read ahead, wallpaper ──
         self.glide_picture();
-        // The copy of the picture just left (see HOLD) gives way once mpv has the
-        // next one ready (it says so: playback started) and has drawn a frame
+        // The picture just left (see PicFrame::Keep) gives way once mpv has the
+        // next file showing (it says so: playback started) and has drawn a frame
         // since, or a moment after (the frame drawn already). In any case after 1.5 s.
         if let Some(mut h) = self.hold {
-            let (state, frames) = HOLD.with(|s| s.get());
+            let frames = WIN_FRAMES.with(|f| f.get());
             if h.ready.is_none() && mpv_link::PLAYBACK_RESTARTS.load(std::sync::atomic::Ordering::Relaxed) > h.restarts {
                 h.ready = Some((std::time::Instant::now(), frames));
             }
-            let done = state == 0
-                || h.ready.is_some_and(|(r, at)| frames > at || r.elapsed().as_secs_f32() > 0.06)
+            let done = h.ready.is_some_and(|(r, at)| frames > at || r.elapsed().as_secs_f32() > 0.06)
                 || h.since.elapsed().as_secs_f32() > 1.5;
             if done {
-                HOLD.with(|s| s.set((0, 0)));
                 self.hold = None;
             } else {
                 self.hold = Some(h);
@@ -3286,8 +3435,11 @@ impl eframe::App for FluentMediaPlayer {
         }
 
         // ── Video panel: full-bleed, the controls float on top of it ──────────
+        // (a picture: grey from the start, before mpv has drawn it)
+        let (r, g, b) = PICTURE_GREY;
+        let backdrop = if self.is_picture() { Color32::from_rgb(r, g, b) } else { Color32::BLACK };
         egui::CentralPanel::default()
-            .frame(egui::Frame::none().fill(Color32::BLACK))
+            .frame(egui::Frame::none().fill(backdrop))
             .show(ctx, |ui| {
                 let rect = ui.max_rect();
                 let resp = ui.allocate_rect(rect, Sense::click_and_drag());
@@ -3343,6 +3495,8 @@ impl eframe::App for FluentMediaPlayer {
                 } else if self.render_ctx_initialized && self.url_load.is_none() {
                     // (While a link is opening: just black. See VIDEO_STALE for a
                     // new file.)
+                    let frame = self.pic_frame(rect);
+                    PIC_FRAME.with(|p| p.set(frame));
                     ui.painter().add(video_callback(rect));
                     self.video_shown = self.video_kind == VideoKind::Video;
                 }

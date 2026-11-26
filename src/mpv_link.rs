@@ -103,6 +103,8 @@ enum Job {
 /// How many times mpv has said playback (re)started: a file's first picture is
 /// ready (also after a seek). Counted by mpv's event thread.
 pub static PLAYBACK_RESTARTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// The file playback last (re)started for, as given to mpv
+pub static RESTART_PATH: Mutex<String> = Mutex::new(String::new());
 
 pub struct MpvLink {
     tx: mpsc::Sender<Job>,
@@ -118,7 +120,8 @@ pub fn yn(b: bool) -> &'static str {
 impl MpvLink {
     pub fn start(mpv: Arc<Mutex<Mpv>>) -> Self {
         // mpv's events, on a thread of their own (only one thing is listened
-        // for: a file's first picture being ready, see PLAYBACK_RESTARTS). mpv
+        // for: a file's first picture being ready, see PLAYBACK_RESTARTS and
+        // RESTART_PATH). mpv
         // takes calls from any thread, so this waits without holding the lock.
         if let Ok(guard) = mpv.lock() {
             // (mpv lives as long as the player: it's never dropped, the process
@@ -127,6 +130,8 @@ impl MpvLink {
             let _ = std::thread::Builder::new().name("mpv-events".into()).spawn(move || loop {
                 match events.wait_event(1.0) {
                     Some(Ok(libmpv2::events::Event::PlaybackRestart)) => {
+                        let path = events.get_property::<String>("path").unwrap_or_default();
+                        *RESTART_PATH.lock().unwrap_or_else(|e| e.into_inner()) = path;
                         PLAYBACK_RESTARTS.fetch_add(1, Ordering::Relaxed);
                     }
                     Some(Ok(libmpv2::events::Event::Shutdown)) => break,
