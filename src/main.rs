@@ -3159,6 +3159,12 @@ impl eframe::App for FluentMediaPlayer {
         };
         if let Some(tb) = self.taskbar.as_mut() {
             tb.sync(status, self.time_pos, self.duration);
+            // (a badge on the taskbar button for pictures and music: see set_badge)
+            tb.set_badge(match self.window_icon {
+                2 => 1,
+                3 => 2,
+                _ => 0,
+            });
         }
 
         // Follow the Windows accent colour (changes with wallpaper / Settings)

@@ -351,6 +351,7 @@ const VT_SET_PROGRESS_VALUE: usize = 9;
 const VT_SET_PROGRESS_STATE: usize = 10;
 const VT_THUMB_ADD_BUTTONS: usize = 15;
 const VT_THUMB_UPDATE_BUTTONS: usize = 16;
+const VT_SET_OVERLAY_ICON: usize = 18;
 
 /// Raw pointer to function number `slot` of a COM object's vtable
 unsafe fn method(this: *mut c_void, slot: usize) -> *const c_void {
@@ -1211,6 +1212,10 @@ pub struct Taskbar {
     last_try: Instant,
     last_status: Option<Status>,
     last_progress: (i32, u64),
+    /// The badge on the taskbar button: 0 none, 1 picture, 2 music (see set_badge),
+    /// and its icons once made
+    badge: Option<u8>,
+    badge_icons: [isize; 2],
 }
 
 impl Taskbar {
@@ -1253,7 +1258,41 @@ impl Taskbar {
                 last_try: Instant::now() - Duration::from_secs(5),
                 last_status: None,
                 last_progress: (-1, 0),
+                badge: None,
+                badge_icons: [0; 2],
             })
+        }
+    }
+
+    /// The badge in the taskbar button's corner, over the player's icon: 1 a
+    /// picture, 2 music, 0 none (videos). (With the taskbar's buttons combined,
+    /// Windows shows the program's own icon there whatever the window's is.)
+    /// Only talks to Windows when it changes; kept trying until the button exists.
+    pub fn set_badge(&mut self, which: u8) {
+        if self.badge == Some(which) || !self.buttons_added {
+            return;
+        }
+        let icon = match which {
+            1 | 2 => {
+                let i = which as usize - 1;
+                if self.badge_icons[i] == 0 {
+                    self.badge_icons[i] = badge::icon(which).unwrap_or(0);
+                }
+                self.badge_icons[i]
+            }
+            _ => 0,
+        };
+        let text = wide(match which {
+            1 => "Picture",
+            2 => "Music",
+            _ => "",
+        });
+        unsafe {
+            let set: extern "system" fn(*mut c_void, isize, isize, *const u16) -> i32 =
+                std::mem::transmute(method(self.list, VT_SET_OVERLAY_ICON));
+            if set(self.list, self.hwnd, icon, text.as_ptr()) >= 0 {
+                self.badge = Some(which);
+            }
         }
     }
 
@@ -1263,6 +1302,8 @@ impl Taskbar {
         if BUTTONS_LOST.swap(false, Ordering::Relaxed) {
             self.buttons_added = false;
             self.last_status = None;
+            // (a new taskbar button: the badge too, again)
+            self.badge = None;
         }
 
         // Thumbnail buttons. They can only be added once the taskbar button exists,
@@ -2146,4 +2187,158 @@ pub fn register_file_types(video: &[&str], music: &[&str], pictures: &[&str]) {
     set("Software\\RustMediaPlayer", Some("Registered"), &stamp);
     // Explorer: file types changed, redraw their icons
     unsafe { SHChangeNotify(0x0800_0000 /* SHCNE_ASSOCCHANGED */, 0, std::ptr::null(), std::ptr::null()) };
+}
+
+// ── Taskbar badges (see Taskbar::set_badge) ───────────────────────────────────
+// A white picture or music note on a dark grey rounded square, at the sizes
+// Windows asks for (its small icon size: 16 px, more on larger display scaling),
+// as PNGs written out as text
+mod badge {
+    const PICTURE_16: &str = concat!(
+        "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAABmJLR0QA/wD/AP+gvaeTAAACA0lEQVQ4jYWSzW8SURTFz33APGRw",
+        "wQgLkUSgiV2py0YoNgZSJFX/BJPWNJialKQmJNLEj42uG5P2D1E+VJZOSNOKUXd12w6LCoNJyzAQ5rloxVDscHfvJL9zz733EQA0",
+        "Go3A0ZHxZmBZSS65LsGmzF6/6WCsKsvuZ8Fg8BedwtvFUuVKrVaTWi3djoei+BCPxXqZTHpflt0zjmx25W258nG2WCxJhtG1hQHA",
+        "MLrY2/vpIMbk8NVwgFmWSKqqKtlBRIS5uQRu3rg+1FS1JllikHRyzhVdb9t2vZ2IY72QhxACi0tZaFoDut6C5HL7mRCCJsVut39D",
+        "CAHDMGAYxlAXQpBz4tAAvn3/gaVHj9HpdHA2LTsPmpqKjrwPDrQx+FyDVPIOtjY3kJ5PDbVoNAKi8WnHDCKRMHK5JwCA1dUVTE9f",
+        "QyIRx9bmBu4tZMYMRnbg9cp48bwAzjkAwOVy4dXLdciyF0SE5eVFfKl/haY1/iUgIoHTWz9dyyEYvDzSQVEUcH7yTdxuN/L5NTB2",
+        "EpyIhNPsmU1F8V0ECDu7dezs1v+3ljOmPliWhX7fPHQ6GKvGY7GH794XpVKpMhH+Ww/uL5gAq5Kmaf7j4+52ufwh9FmtSbresgV9",
+        "PgWJ2Vtm+u78vucCnyEA0DTN3+l0Xw8GgxTnPGBnYJrmIZHjk8cjFUKhUPMPMNrBMhz2oPAAAAAASUVORK5CYII=",
+    );
+    const PICTURE_20: &str = concat!(
+        "iVBORw0KGgoAAAANSUhEUgAAABQAAAAUCAYAAACNiR0NAAAABmJLR0QA/wD/AP+gvaeTAAACYElEQVQ4jaWUy2sTURTGv3vnTpp0",
+        "kpoE+w5Y24Dd2EmVYifpRioqQqBVd4KCtNGmQrIQbBFfILUWxbpQ60L/C5eKi8w0dJVJheIfkEiyLBPSSXInLmoKfTKp3+6c79zf",
+        "uYf7IPinfL44Vq1WEvV6XSEEbthQvQ6DEKIxJi739nZqAEAAIJf7M2ua5oKqrkp6dl3Y2tqyw4PT6URIHuKRiGKIomM+EOj+RPL5",
+        "4phplr99+Pi5TdeztkB7FZJlxOOxzdZW51VarVYSqZQmHRcGABldh6qtSqZZTVLLspRs9pdgd3Eg0Is7t2/h3HBoV17X14VazVKY",
+        "IFDJKJVswQgheL34Eu3tJ8E5x9R0HLlcHgBgGCUwRj20mdEopfB4ti+AIAhoa/Psq2HNADnnWFp6h8nJKDKZLDY2fv8fEABSqoaU",
+        "qh3qHzmy3+9HMDjQVMNDgS0tLVhYeIG3bxbR13dqlydJUvPAZGIW/af74HI58fzZY7jd24cRn4nh65cV+Hxe+8Bo9BrGxy/uxD09",
+        "3Zife4ibNyYxMRGFz+dFIvHAHnBw8Azu35vaVzgych6x2N2dOKxcwJXLl44Ger0n8PTJHERRPLD7Xs3MTKOzo2NXjnFuldyS5G3s",
+        "7vuPn7ZgDQ0E+1EoFuF2S6jVLINRSjVZPns9o+tCOr2GdHqtKWBDsjzEGaMqZUx8H4kopZAsHwsEAMPDMiLhUcPhYMuNDzZeqVRe",
+        "qdqqpOvrQrlctgVyuVyQ5SEeCY+WRFF8FAj0rJCGWSgUFNOsJms1KywIZP+rP0Cc1zcZo5rDwZa7urrSAPAXJxnHkLVpuroAAAAA",
+        "SUVORK5CYII=",
+    );
+    const PICTURE_24: &str = concat!(
+        "iVBORw0KGgoAAAANSUhEUgAAABgAAAAYCAYAAADgdz34AAAABmJLR0QA/wD/AP+gvaeTAAADC0lEQVRIia2QX0hTYRjGn/fz6+xs",
+        "6mpGguA2ZxebXeSftlkaNvsDXVQWxjTSLCn7g0Fa6EURVNRFN3VbBGUFxSC6DCkq8dZW0s3WlQ3DUYZr/tnx7HS+bnRojfJov6uP",
+        "932/53l4CHOEQqGcQCBwUNdFk6pqlUSwwgBCIClJ/L0Q9HRw8O2zYDD4EwAIABKJhC2VUvpmZ9X6kZGYHI1GuaqmjehDklbB43Fr",
+        "TqdDkSTTK7NZOmaz2RI8FArlTE8rfZOTk7v6Hj6Sh4bChoQXQkTc692Ud6T18G7Ael8I0UjxeLxJUdR7d+7ey1uJ+EJ8Pi86TrRP",
+        "mUxyO9N1ah4Zia0o+e8MDb3D51hMBkQz0zStIhqNcqMijDEcOLAPF86fQ1VVxaKdEAKRyCeeTmuVnDHKn5lJGU7Z0LAHp0+dAABs",
+        "374NHSc7MTr6JbOfmZ4BY2RlhpXnWF9amnlzzuF0OrLeLdvg9Zu30DQNAPD16zcMD3/Meme4+3nC4Q/oONmJEqcTH4aHMTU1/X8N",
+        "AGB09Mui3rOxpIp27qhHYeG6ZYX4p0F9fR16erpx4/oVWCyW/2vgcpWg69xZAIDDYUd311kQEQDAZDLh9q2bOHOmY3kGZrMZly72",
+        "QpblzKyubiuago0gIvT2dmPDhjLsb9iLar/PmAERobenG3Z78R+7o0dbce3qZWytrcnMuro6YbXmL92gKdiImprN2T8wBr/fu2hW",
+        "UFCQqfKfBuXlG9HW1pL1+G/U1m5BIFD3x5zrupi0WMxrMVdNZcVG9Pe/NGwAAKWlLgwMDEIIAUuuBbouklyS+HuPx11MRFwIgQd9",
+        "j5clvhAiQpnHrXHOwkwIeup0OhSvd9OKhefx+70odtgVgD3Jqa72RVyu9V6Px10yPv6dj42NrSh5td+HlpZDSl5u7ouiosJrBAAT",
+        "ExNrUin1vqrO7vwci8mRyCeeTCYhhL5EYQZrvhVlZW6t2GFXzCZTvyxLx202W4Lmj4QQLB7/1giI5nRaqyTCaiPphcAPzlkYYE+K",
+        "igqfE5EOAL8Ax0oKLvDeyxYAAAAASUVORK5CYII=",
+    );
+    const PICTURE_32: &str = concat!(
+        "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAABmJLR0QA/wD/AP+gvaeTAAAEN0lEQVRYhb2XX0xTVxzHv79zT3tp",
+        "bwLY2PLPAm6EMlNYMqBloouRscQHI9tgEBqHqXFTB0HUZMpQ3GJ8NE63PW1ZooHscXNZyBh70bggsCXqi8BeBqyArZM/llLae88e",
+        "sAh0KtB236d7fud3z/eTc87N/f0Iq+Tz+bJCIdVFRBVCIJsIKatz1iMhME2EESLqYQwdZrPZs3yeniYKGh9/0CKEaA6FFlJDoXCS",
+        "pmlcCI3FAkDENMZYWKfj83q9/hFj0qW0tM2fE5FYAhBCsImJB1+oqvqe3+9P7esfkHp7+zA29jfm5uZi8YfRaITVmoUyZxlKS19T",
+        "FUWZkiT+XXq6uYmIBAGAxzN5XNPUVq/XZ/r6m29paGg4JtNnyWbLx0H3AWE2b/6Hc/5ZerrlMvl8vqxgMPzb48ezWZevfCUlyjyi",
+        "ggIbGj86rCYnJ49yzrazUEh1hUILqX39Awk3B4D79wfR3/+HFAwGTZoGFyOiilAonNTb25dw84h6b9/G4iUXFVwI5GiaxkdHx2Je",
+        "mHMOV30tystfx+zsLK5e7cSdu/ei8sbGxqBpGgeQw4iQLITGAoFAzACu+lq4XHXIzc1BYaEd58+fQ2ZGRlTe3FwAQmiMCCkxfeOr",
+        "tWPH9hVjWdbD4SyJyhNCRB4prgDT0zNRsZn/iC1XXAGuXetEMLiwNB4cHMKNm7ee+w6PJ8Cdu/fw4eFGOEpLMDMzgxs3byEcDv9/",
+        "AADg8Yzj+x9+XHN+XI9gI1o3QNW+vajatzduAOs6gl273sDRox8AAAKBAH7u7okZYM07kJOTjZZjTUvjxsYjyMt7OSrP6SzFoUNu",
+        "MLa2pdeUZTAk4UzbKRgMSUsxWdbjXPsnSEl5WjDZ7dtwpu0UaqrfRl1tdXwAiAgnTxxDdrY1as5iMaP9bCs458jMyED72Vbo9XoA",
+        "wP799cjPz4sdoPrdKuzcWf7Mebt9G5oaj+DChU9X7IYkSThxvBk6nW7jAK8WFcLtbngRI/bseQuZmdE/na1bc9HwvmtjAKZNm3D6",
+        "9ElIkvRCgOeppuYdFBXZ1wfAOUdb28cwmUwxmWPZHTIYDCtiTyT4Yt3O0oxGI4tUwJWVuyHLMoaH/4wZIKLKyt24fv0n4EmlTMQ0",
+        "IcQUB/AXY+wlqzVLPzi4WBN2dXWjq6s7buarZbVuAWMsDNAIY4x+1en4vNPhTJjhapWVOaDT8XnGqIcxhg69Xv/I4ShWbbb8hJu/",
+        "UlCAkuJiVZblh0Sig5nNZg9j0iVFUaYOug+IggJbQs3d7gahKMYpgC5aLJaJSGtGExPeK6oarvP7/an9A78vtWZ+vz8mU0VRYLVu",
+        "QVmZAyXFxaqiGKc4551paebmpdYsAjE56W0SQrQEg0FTIppTWZYfAnQxPd385YrmdLm8Xm+GpsGlaeJNANlESI0FQAhMARhhjH4h",
+        "Eh0Wi2Vi+fy/pn2IcLWZvjsAAAAASUVORK5CYII=",
+    );
+    const MUSIC_16: &str = concat!(
+        "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAABmJLR0QA/wD/AP+gvaeTAAACFElEQVQ4jY2Rv08TYRjHPy8td/2B",
+        "CT1gaS8R5cpqmIiIU4ktMfonuKj8cMEQHWAEgw46GCfjQNwgYdNSUEebpv4JXqsLPRDKHZUCd9e056LBBlv8bs/75PN9v8/zCIDt",
+        "7e2+avXkab3RSMhSZw9t5Li1fV9Hx6dwODAXjUbL4jecT69vxHK5nGSaVjseRYlwbWTEHR9PboXDgWHf5OSDV5mND6Pp9Lp0cmK3",
+        "hQFs26FQLPpAhPsv9vf5Gw0vkc1mpVZAT49CPK4Rj2sMxjWGhq6w+OQZ2WxOSqXGEn5ZlhXLOjgDLi+/JhwK0d3dfaYXDAaxLBOp",
+        "M9Dr9zxP/OvnWDQKgGma6HqRr3oBXS8wPXWfUskAwPM84W8V3XVdZh4+olj83vQ+OXG3qe5oZVCvNzg4qLRqn2/wv2o5wt8aHNSY",
+        "nZ1BjUWx7eZTNxlo2gDTU/dQFAWf7zTc9NQEly/1A1Cp/KRSOR3NL4Tw/hTzc49R1RgA5XIZ160BkM9/QdMGKJVKPH/xkt3dPQCE",
+        "EJ7fcZ19RYlcME0LXS+iqjF2dn6wsLjE4eEhACura6ysrjVFV5QItZqzJ3T925tMZvPOu/dpCaCrq4tqtXruXm7fuukkk8m3wjCM",
+        "3qMjO5/JbKqfsznJssy2YCSicH30qpNM3dgKBeVhAWAYRu/xsb1Ur9fHZFnua2fgOM6eEL6PoZA0r6rq/i9xodLKeIj6ogAAAABJ",
+        "RU5ErkJggg==",
+    );
+    const MUSIC_20: &str = concat!(
+        "iVBORw0KGgoAAAANSUhEUgAAABQAAAAUCAYAAACNiR0NAAAABmJLR0QA/wD/AP+gvaeTAAACo0lEQVQ4jcWUy08TURTGvzszxQ7T",
+        "8iqJKKUk2hIpkSkPE9uia0wqJpro0oQFQjWBnbIwIVHR6IaQWB//hyZA2NEpG7BTHrG0uMC0UBblkU7ambYzLtAmbZo6rvyW53zn",
+        "l3PPufcS/FYyeTiUzyuTmqa5CYEJOqRpyBBCBIYxzLW3nxcAgABAIrH/WJbl2WAwxImRDTqXy+nhwWg0wsX3Fr1ed8ZgqJu2Wi98",
+        "IMnk4ZAsZ7+8D3xqEMWILlClXDwPv3/stL7eOEzl88rkyorA/SuMEIJOWwdstg6ERRFBIcTJcn6KUVXVHYls0n8DWCwtcDjscDjs",
+        "6HLY4XRegdlshhBaxczMK4jiBu1xe9wMTVNcRpKqQny+W7gz4oO5wYyW5uaqHhN3tr9MRgLDUGamVleDA/3o7LSVxbLZHOLxOL5H",
+        "Y7h5w4voTqwsXxOoqiryhQIWFpYQjcYQje5gb+8nVFUFAAz0u1B5I2oCNze34eiyY34+UMtWJkq3838Bax65mnp6ujFy2weWNYJl",
+        "WX1Am60D9suX0NjUWBZ3Orvx7u0sGOasTNO0s7dbCzg6+hAP7t8DIQSqquL4+KSUuzbYX4IBQCp1iMWl5bL6shm2tlpKMACgKAqx",
+        "WLyUX1xaxu7uDyiKgvX1MJ5NP8fBQaq8w2JRlUwc1wQAkiQhnT6CxdICAFhb+4YXL9+UzPv7B5jwT1abEkwmDoWCmmEoihJ4/urd",
+        "sCjS2WwOj8afwOXikU4fYWtrG5qmVQVUiud7iwxDBUkikfIqSu5rIPC5ISyKuoor1dfHY2J87IRlzw3/+WD9iqK8DgohThQ36Gw2",
+        "qwvEsix4vrfo9VyXDAbDU6v14sfS1lOplFuW81OFguqhaWLWAywWtVOGoYS6Omaura1tFQB+ASH1AWn+jnRIAAAAAElFTkSuQmCC",
+    );
+    const MUSIC_24: &str = concat!(
+        "iVBORw0KGgoAAAANSUhEUgAAABgAAAAYCAYAAADgdz34AAAABmJLR0QA/wD/AP+gvaeTAAADTklEQVRIibWT309TZxzGn/ecl9NS",
+        "aOFIBJm0lYyuxYspoaUXm4Zl0+zWgFgzXaYy/wCXjLiZ3Rgv3BL1dtOEsJphmhkvFxKNbu7OWrxR+wNjOWzSZEi7HmhPD6fn64Wz",
+        "AYuzxfhcve/3fd/P87y/GP5TJBIRBwcHh02TDui60ccYHKhDRMhLEp8mYldu3751dWRkpAwADAByuZxcLGoTpZL+UTqtWBOJBNf1",
+        "lXr4kKQG+Hxew+12aZJkud7YKB2RZTnHI5GIuLysTaiqumfi57A1Go3VBV4txhj3+/ubPz/82aeAY5yIhlgmkzmgafqlH3+61Pwm",
+        "8NUKBPw4/uXRJYvFelQwTRZKp5UNJ2eMwe1yYu/ejzE8tA8AEI3exayiWAEKccMwdiYSCV4rsK1tEzyeHng8PXjP04Pt232w2+0A",
+        "gEKhgF+vXgMRIR5P8u5t3X1cEJi9UCj+L/Tbb77G5vbN2LKlA5tk+ZXzRFGstAvLBQgCc9SUfPfuD8EYW3eMiKDM/YWWFgdKmlY1",
+        "XvPRvNDi4iJSqUdIpmaQSs3g/v2HUFUVFy78AKmhYWMGuq4jmZzBmTNnsZjN1hVIqNVgYeFp3fCaDd5Eb92g7kteLaezC4FAP8yy",
+        "CS6uj9qwwf7hfTh27AsIwvNDMAwDijJXm0FrawtCof3YueN9qKoK8aV0HR3tGB09suZvcM5RKumvN7DZbDh/7nts3fpOpUZEEERh",
+        "zZyXP96sMocTX41VGVRdcjDoXwMHANM0EY3erfQfP04jHP4F+byKpaVl3LhxE2Njp1Aul6t3YJqk2myNbS8KT/6eBxFVEhIRLl4c",
+        "x9TU9TULw5cnEb48WQWs7LLJBtOkPJckPu3zebsYY5yIkEimcPLkd9i16wOU9BL++P1PPHgYfyVoPTHG0OvzGpwLMU7Errjdrj1+",
+        "f3/znTtRAEBs+h5i0/fqgq7WwIAfXS6nBgiTYjAYiHd3v+v3+bzbFhae8vn5+Q2DGWMIDgRw6NBBrbmp6bfOzvbTDACy2WxrsaiP",
+        "63rpk1lFscbjSZ7P50Fk1ggW4LA70NvrNbpcTq3RYpmyWqVRWZZzlbdGREIm888QQKGVFaOPMbTUk54I/3IuxABhsrOz/RpjzASA",
+        "ZwaaTAONMeX0AAAAAElFTkSuQmCC",
+    );
+    const MUSIC_32: &str = concat!(
+        "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAABmJLR0QA/wD/AP+gvaeTAAAEYklEQVRYhe2XXUxbZRjH/8/b03Ow",
+        "hzA+dkoJdCOhUNjixDE+nboEs7nN6J0xwcyF3Rh14ky88UbFzMtlDhUTp8tMMMhExezKbcm82ML4cDFhCnReDNqu0A6KUuDs9Lyv",
+        "F9KuHZStfMQb/1fveZ7nze9/PvKe5yHcp1AoVGgYZhMRNQqBLUTYdH9NOhICM0QYI6KLjKFD0zR/Yp7uFQq6fXvymBCixTDuZhtG",
+        "NINzLgnB2VoMEDHOGItardKCLMvTjFlO5udv/piIRNyAEIIFApOfmKb5YiQSye7rH7D09vbB6/Vhbm5uLXzYbDY4nYWoq61DdfVO",
+        "U1XVsMUidToc2lEiEgQAfv/E25yb7waDodzTX56h0VHPmqCp5HaX4UjzYaFpm6ckSWp1OOynKBQKFep69Ors7N+Fp9o+s2wUPKby",
+        "cjfeeP1VMysra1ySWAMzDLPJMO5m9/UPbBhclmVkZqoAgOHhEfT3/2rRdT2XczRJRNRoGNGM3t6+dYExxuB0FqGs1IXSUhe2b69A",
+        "cXExvjpzFt3dPwIAeq9dQ21tdYaiiEZJCGzlnEvj495VAfPyclG6CCtbBGZmZi6pc5WUxNderxeccwnAVokIWUJwNj8//1DA/fv3",
+        "oazUBbtdg8tVgpyc7LRNz83NQwjOiLBJSndzy5uvgbH0j4YFXY+vhRCxJaVt4EHinGPc64PHcxMez008/dRubNtWAY/n5rL1azYw",
+        "NTUFj+dPjC4Ch4Z+x+zsbDy/8/HKFfenbcAwDCiKgvbPT+Py5V8wPR1enfNFpf0yI5EIAGBo6Maa4asysN7638B/bmBdzwGr1YoX",
+        "nn8Oe/c2oqioEFNT09ATDqANNSDLMo4ffx+P7Xg0HrPbtQfuW9EAEWHPnifR0FAPu6bB5/fDYll+y4ED+5LgD6uUBhRFxoet76Gy",
+        "ckc8VlHhTjzHk7QSvKurG1euXF02l/IjPHTo5SR4TES0bP2NG38sG79+/Tec/boDMzN/LZtP+QR2P1GfKoWen85jcnIyKfb9Dz2Q",
+        "rBIOHnwWuTk58Hp9+PnCJfT0nEc0Gk11E0L6t29n+TabjSV2wLcDARQUOJbABwevo739C3DOk+Kcc3R2nkNn57mUxmOy2WwgYlwI",
+        "EWYAbjHGok5nYVJRW1s7hodH4te6ruPbru/wQetHS+DpyuksAmMsCtCYxBhdslql+tqaWnlk5F5T6vP50fLWO8jLy4NqewRenx+m",
+        "aa4JHFNdXQ2sVmmBMbrIGEOHLMvTNTVVpttdllQohEAoFMKtsfF1g1eUl2NXVZWpKModItHBNE3zM2Y5qapq+EjzYVFe7l4XUCp4",
+        "c/MrQlVtYYBO2O32QGw0o0Ag2Gaa0ZcikUh2/8BgfDSL/f9XK1VV4XQWoa6uBruqqkxVtYUlSfomP19riY9mMRMTE8GjQohjuq7n",
+        "bsRwqijKHYBOOBzap0nDaaKCwWAB52jiXDwDYAsR0u+7EyQEwgDGGKMLRKLDbrcHEvP/ADbLyWEhiL2jAAAAAElFTkSuQmCC",
+    );
+
+    /// The badge for 1 a picture, 2 music, at Windows' small icon size
+    pub(super) fn icon(which: u8) -> Option<isize> {
+        let size = unsafe { super::GetSystemMetrics(49 /* SM_CXSMICON */) };
+        let pick = |set: [&'static str; 4]| match size {
+            ..=17 => set[0],
+            18..=21 => set[1],
+            22..=27 => set[2],
+            _ => set[3],
+        };
+        let png = match which {
+            1 => pick([PICTURE_16, PICTURE_20, PICTURE_24, PICTURE_32]),
+            _ => pick([MUSIC_16, MUSIC_20, MUSIC_24, MUSIC_32]),
+        };
+        super::make_icon_png(png)
+    }
+}
+
+/// An icon from a PNG written out as text
+fn make_icon_png(png_base64: &str) -> Option<isize> {
+    let png = base64_decode(png_base64)?;
+    let img = eframe::icon_data::from_png_bytes(&png).ok()?;
+    let (w, h) = (img.width as usize, img.height as usize);
+    let mut bgra = vec![0_u8; w * h * 4];
+    for (i, px) in img.rgba.chunks_exact(4).enumerate() {
+        bgra[i * 4..i * 4 + 4].copy_from_slice(&[px[2], px[1], px[0], px[3]]);
+    }
+    unsafe {
+        let color = CreateBitmap(w as i32, h as i32, 1, 32, bgra.as_ptr() as *const c_void);
+        let mask_bits = vec![0_u8; w.div_ceil(16) * 2 * h];
+        let mask = CreateBitmap(w as i32, h as i32, 1, 1, mask_bits.as_ptr() as *const c_void);
+        let info = IconInfo { is_icon: 1, x_hotspot: 0, y_hotspot: 0, mask, color };
+        let icon = CreateIconIndirect(&info);
+        DeleteObject(color);
+        DeleteObject(mask);
+        (icon != 0).then_some(icon)
+    }
 }
