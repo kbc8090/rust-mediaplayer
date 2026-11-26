@@ -1671,8 +1671,16 @@ pub(crate) fn draw_picture_bar(app: &mut FluentMediaPlayer, ctx: &egui::Context,
     let white = Color32::WHITE.gamma_multiply(t);
     let accent = app.accent.gamma_multiply(t);
     let tint = |on: bool| if on { accent } else { white };
+    // (between pictures, until the next one's size is known, the last zoom stays
+    // shown rather than a dash for a moment: going through quickly, it flickered)
     let percent = app.picture_percent();
-    let zoom_txt = percent.map_or_else(|| "\u{2013}".to_owned(), |z| format!("{z:.0}%"));
+    let shown_id = egui::Id::new("picture_zoom_shown");
+    if let Some(z) = percent {
+        ctx.data_mut(|d| d.insert_temp(shown_id, z));
+    }
+    let zoom_txt = percent
+        .or_else(|| ctx.data(|d| d.get_temp::<f64>(shown_id)))
+        .map_or_else(|| "\u{2013}".to_owned(), |z| format!("{z:.0}%"));
 
     // Laid out left to right: ‹ › | − 62% + | fit 1:1 | rotate mirror wallpaper | full screen
     const PAD: f32 = 8.0;
