@@ -318,6 +318,12 @@ const VOL_MAX: f64 = 130.0;
 /// A background folder scan's result, shared with its thread: (scan number, files)
 type ScanResult = Arc<Mutex<Option<(u64, Vec<PathBuf>)>>>;
 
+/// A photo's details, read on another thread: the picture, and its details
+type PhotoSlot = Arc<Mutex<Option<(String, Option<PhotoDetails>)>>>;
+
+/// The dark grey around a picture (mpv's background-color)
+const PICTURE_BACKDROP: &str = "#2B2C30";
+
 /// A picture gliding to a new zoom over a moment (the wheel, the zoom buttons,
 /// fit / 1:1): from where it was to where it's going, about the spot under
 /// the pointer (that spot stays put all the way), or straight across (None)
@@ -601,6 +607,10 @@ struct FluentMediaPlayer {
     pic_drag: bool,
     /// Gliding to a new zoom
     pic_glide: Option<ZoomGlide>,
+    /// A photo's details for the Tab overlay (read on another thread): the
+    /// picture they're for, and them (None: none in it); and which was asked for
+    photo: PhotoSlot,
+    photo_asked: String,
     /// Maximized last time: the window was sized to the screen while still
     /// hidden; once shown it's maximized for real, keeping this normal place
     /// to restore to
@@ -927,6 +937,8 @@ impl FluentMediaPlayer {
             pic_turn: 0,
             pic_drag: false,
             pic_glide: None,
+            photo: Arc::new(Mutex::new(None)),
+            photo_asked: String::new(),
             start_place,
             pic_prefetch: (String::new(), 0),
             wallpaper_result: Arc::new(Mutex::new(None)),
@@ -1182,18 +1194,14 @@ impl FluentMediaPlayer {
             self.url_load = None;
             self.link_error = None;
         }
-        // (each picture starts fitted to the window; its size comes from mpv)
+        // (each picture starts fitted to the window, set with the file below so
+        // the one showing until then stays as it is; its size comes from mpv)
         self.pic_size = (0.0, 0.0);
         self.pic_turn = 0;
         self.pic_drag = false;
         self.pic_glide = None;
-        if self.pic_zoom != 0.0 || self.pic_pan != (0.0, 0.0) {
-            self.pic_zoom = 0.0;
-            self.pic_pan = (0.0, 0.0);
-            self.link.set("video-zoom", 0.0);
-            self.link.set("video-pan-x", 0.0);
-            self.link.set("video-pan-y", 0.0);
-        }
+        self.pic_zoom = 0.0;
+        self.pic_pan = (0.0, 0.0);
         if self.rotation != 0 || self.mirror {
             self.rotation = 0;
             self.mirror = false;
@@ -1227,14 +1235,18 @@ impl FluentMediaPlayer {
         // show while this file opens; after a video, its last frame stays up until
         // the new one's first, so going from video to video doesn't flicker
         VIDEO_STALE.with(|s| s.set(!self.video_shown));
-        // (started part way through: right-clicked along its row in the playlist)
-        match self.start_at.take() {
-            Some(f) => {
-                let start = format!("start={:.2}%", f * 100.0);
-                self.link.command("loadfile", &[path, "replace", "-1", &start]);
-            }
-            None => self.link.command("loadfile", &[path]),
+        // Settings for this file only, taking effect as it opens (and undone as
+        // it ends): not zoomed or moved; around a picture a dark grey (black
+        // around pictures looks harsh; videos keep black bars); started part
+        // way through if right-clicked along its row in the playlist
+        let mut options = vec!["video-zoom=0".to_owned(), "video-pan-x=0".to_owned(), "video-pan-y=0".to_owned()];
+        if media_kind(path) == Some(MediaKind::Image) {
+            options.push(format!("background-color={PICTURE_BACKDROP}"));
         }
+        if let Some(f) = self.start_at.take() {
+            options.push(format!("start={:.2}%", f * 100.0));
+        }
+        self.link.command("loadfile", &[path, "replace", "-1", &options.join(",")]);
         self.link.set("pause", "no");
         self.is_playing = true;
         self.time_pos = 0.0;
@@ -2072,6 +2084,11 @@ impl FluentMediaPlayer {
 
     /// Gather the details for the info overlay (Tab)
     fn refresh_info(&mut self) {
+        // A picture: about the picture, and how the photo was taken
+        if self.is_picture() {
+            self.info_rows = self.picture_info();
+            return;
+        }
         let mut rows = Vec::new();
         for row in self.mpv_info.iter().cloned() {
             let after_decoder = matches!(row, InfoRow::Item("Decoder", _));
@@ -2109,6 +2126,66 @@ impl FluentMediaPlayer {
             rows.push(InfoRow::Item("Memory", format!("{ws:.0} MB  \u{b7}  {private:.0} MB private")));
         }
         self.info_rows = rows;
+    }
+
+    /// The Tab overlay for a picture: its name, format, size, file size, and
+    /// (from its EXIF) the camera, lens, when it was taken, the exposure, the
+    /// focal length, and whether where it was taken is saved in it
+    fn picture_info(&mut self) -> Vec<InfoRow> {
+        let path = self.current_file.clone();
+        let local = !is_url(&path) && !is_archive_entry(&path);
+        // (the photo's details: read once per picture, on another thread)
+        if self.photo_asked != path {
+            self.photo_asked = path.clone();
+            if local {
+                let (slot, ctx, p) = (self.photo.clone(), self.egui_ctx.clone(), path.clone());
+                let _ = std::thread::Builder::new().name("photo details".into()).spawn(move || {
+                    let details = photo_details(&p).filter(|d| !d.is_empty());
+                    if let Ok(mut s) = slot.lock() {
+                        *s = Some((p, details));
+                    }
+                    ctx.request_repaint();
+                });
+            }
+        }
+        let mut rows = vec![InfoRow::Section("Picture")];
+        let name = Path::new(&path).file_name().map_or_else(|| path.clone(), |n| n.to_string_lossy().into_owned());
+        rows.push(InfoRow::Item("Name", name));
+        let ext = Path::new(&path).extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
+        let format = match ext.as_str() {
+            "jpg" | "jpeg" | "jfif" => "JPEG".to_owned(),
+            "webp" => "WebP".to_owned(),
+            "jxl" => "JPEG XL".to_owned(),
+            "tif" | "tiff" => "TIFF".to_owned(),
+            other => other.to_uppercase(),
+        };
+        rows.push(InfoRow::Item("Format", format));
+        if let Some((w, h)) = self.picture_size() {
+            rows.push(InfoRow::Item("Size", format!("{w:.0} \u{d7} {h:.0}  \u{b7}  {:.1} MP", w * h / 1e6)));
+        }
+        if let Some(len) = local.then(|| std::fs::metadata(&path).ok()).flatten().map(|m| m.len()) {
+            let mb = len as f64 / (1024.0 * 1024.0);
+            rows.push(InfoRow::Item("File size", if mb >= 1.0 { format!("{mb:.1} MB") } else { format!("{:.0} KB", len as f64 / 1024.0) }));
+        }
+        let details = self.photo.lock().ok().and_then(|s| s.as_ref().filter(|(p, _)| *p == path).and_then(|(_, d)| d.clone()));
+        if let Some(d) = details {
+            rows.push(InfoRow::Section("Photo"));
+            for (label, value) in [("Camera", d.camera), ("Lens", d.lens), ("Taken", d.taken), ("Exposure", d.exposure), ("Focal length", d.focal)] {
+                if let Some(v) = value {
+                    rows.push(InfoRow::Item(label, v));
+                }
+            }
+            if d.gps {
+                rows.push(InfoRow::Item("Location", "Saved in the photo (GPS)".to_owned()));
+            }
+        }
+        rows
+    }
+
+    /// The picture can be made the wallpaper: a file here (not a link, or a
+    /// file inside an archive)
+    pub(crate) fn can_set_wallpaper(&self) -> bool {
+        self.is_picture() && !is_url(&self.current_file) && !is_archive_entry(&self.current_file)
     }
 
     fn set_mute(&mut self, mute: bool) {
@@ -3131,7 +3208,8 @@ impl eframe::App for FluentMediaPlayer {
                         self.pic_drag = false;
                     }
                 }
-                let hand = if self.pic_drag {
+                // (closed as soon as the button goes down on the picture)
+                let hand = if self.pic_drag || (pressed_on_picture && resp.is_pointer_button_down_on()) {
                     2
                 } else if resp.hovered() && edge.is_none() && on_picture(resp.hover_pos()) {
                     1

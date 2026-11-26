@@ -394,7 +394,7 @@ pub(crate) fn draw_main_menu(app: &mut FluentMediaPlayer, ctx: &egui::Context) {
         rows.push(MenuRow::Item { key: "clip", label: "Save clip as\u{2026}", hint: Some("Ctrl+Shift+S"), mark: Mark::None });
     }
     // Set as wallpaper, for a picture that's a file here (not one inside an archive)
-    if app.is_picture() && !is_url(&app.current_file) && !is_archive_entry(&app.current_file) {
+    if app.can_set_wallpaper() {
         rows.push(MenuRow::Item { key: "wallpaper", label: "Set as wallpaper", hint: None, mark: Mark::None });
     }
     rows.extend([

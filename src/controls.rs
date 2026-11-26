@@ -1637,6 +1637,17 @@ fn icon_zoom(p: &egui::Painter, c: Pos2, col: Color32, plus: bool) {
     }
 }
 
+/// Set as wallpaper: a monitor showing a little landscape
+fn icon_wallpaper(p: &egui::Painter, c: Pos2, col: Color32) {
+    // (drawn on a 24-unit grid around the middle, like the other icons)
+    let at = |x: f32, y: f32| pos2(c.x + (x - 12.0) * K, c.y + (y - 12.0) * K);
+    p.rect_stroke(Rect::from_min_max(at(3.0, 4.0), at(21.0, 16.5)), 1.8, Stroke::new(SW, col));
+    p.line_segment([at(12.0, 16.5), at(12.0, 20.5)], Stroke::new(SW, col));
+    p.line_segment([at(8.5, 20.5), at(15.5, 20.5)], Stroke::new(SW, col));
+    kpoly(p, c, &[(-6.5, 2.0), (-3.0, -1.5), (-0.2, 1.3), (1.8, -0.7), (5.0, 2.5)], col, SW);
+    p.circle_stroke(at(15.6, 8.0), 1.2 * K, Stroke::new(SW, col));
+}
+
 /// Fit to window: a small frame inside four corners
 fn icon_fit(p: &egui::Painter, c: Pos2, col: Color32) {
     for (sx, sy) in [(-1.0_f32, -1.0_f32), (1.0, -1.0), (-1.0, 1.0), (1.0, 1.0)] {
@@ -1647,7 +1658,7 @@ fn icon_fit(p: &egui::Painter, c: Pos2, col: Color32) {
 
 /// A picture's tools, in a frosted pill floating at the bottom in place of the
 /// controls: zoom out / the zoom / zoom in, fit to the window, its own size,
-/// rotate, mirror, full screen
+/// rotate, mirror, set as wallpaper (a file here), full screen
 pub(crate) fn draw_picture_bar(app: &mut FluentMediaPlayer, ctx: &egui::Context, t: f32) {
     let screen = ctx.screen_rect();
     let white = Color32::WHITE.gamma_multiply(t);
@@ -1656,11 +1667,12 @@ pub(crate) fn draw_picture_bar(app: &mut FluentMediaPlayer, ctx: &egui::Context,
     let percent = app.picture_percent();
     let zoom_txt = percent.map_or_else(|| "\u{2013}".to_owned(), |z| format!("{z:.0}%"));
 
-    // Laid out left to right: − 62% + | fit 1:1 | rotate mirror | full screen
+    // Laid out left to right: − 62% + | fit 1:1 | rotate mirror wallpaper | full screen
     const PAD: f32 = 8.0;
     const SEP: f32 = 17.0;
     const ZOOM_W: f32 = 50.0;
-    let w = PAD * 2.0 + BTN_STEP * 2.0 + ZOOM_W + SEP + BTN_STEP * 2.0 + SEP + BTN_STEP * 2.0 + SEP + BTN_STEP;
+    let wallpaper = app.can_set_wallpaper();
+    let w = PAD * 2.0 + BTN_STEP * 2.0 + ZOOM_W + SEP + BTN_STEP * 2.0 + SEP + BTN_STEP * if wallpaper { 3.0 } else { 2.0 } + SEP + BTN_STEP;
     let h = 42.0;
     let rect = Rect::from_min_size(pos2((screen.center().x - w / 2.0).round(), screen.bottom() - 12.0 - h), vec2(w, h));
 
@@ -1739,6 +1751,13 @@ pub(crate) fn draw_picture_bar(app: &mut FluentMediaPlayer, ctx: &egui::Context,
         if go {
             app.toggle_mirror();
         }
+        if wallpaper {
+            let (go, c) = button(ui, &mut x, "wallpaper", "Set as wallpaper");
+            icon_wallpaper(&p, c, white);
+            if go {
+                app.set_wallpaper();
+            }
+        }
 
         sep(&p, x + SEP / 2.0);
         x += SEP;
@@ -1786,8 +1805,9 @@ pub(crate) fn draw_picture_arrows(app: &mut FluentMediaPlayer, ctx: &egui::Conte
                     egui::Rounding { nw: 10.0, sw: 10.0, ne: 0.0, se: 0.0 }
                 };
                 p.rect_filled(r, rounding, Color32::from_black_alpha((140.0 * a) as u8));
-                // A thin chevron, 44 px tall
-                let c = r.center();
+                // A thin chevron, 44 px tall (a little toward the window's edge, so it
+                // looks centred: a chevron's weight is in its open side)
+                let c = r.center() + vec2(if left { -3.0 } else { 3.0 }, 0.0);
                 let dx = if left { 10.0 } else { -10.0 };
                 let stroke = Stroke::new(1.7_f32, Color32::WHITE.gamma_multiply(a));
                 p.line_segment([pos2(c.x + dx, c.y - 22.0), pos2(c.x - dx, c.y)], stroke);

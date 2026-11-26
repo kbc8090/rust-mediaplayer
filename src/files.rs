@@ -466,3 +466,170 @@ pub(crate) fn explorer_zip_playlist(copy: &str) -> Result<(String, Vec<String>, 
         ))
     }
 }
+
+// ── Photo details (EXIF) ──────────────────────────────────────────────────────
+/// What a photo's EXIF says about how it was taken (the Tab overlay)
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct PhotoDetails {
+    pub(crate) camera: Option<String>,
+    pub(crate) lens: Option<String>,
+    /// "1 May 2024, 14:03"
+    pub(crate) taken: Option<String>,
+    /// "1/120 s · f/1.8 · ISO 64"
+    pub(crate) exposure: Option<String>,
+    /// "6.9 mm (26 mm equiv.)"
+    pub(crate) focal: Option<String>,
+    /// Where it was taken is saved in it (GPS)
+    pub(crate) gps: bool,
+}
+
+impl PhotoDetails {
+    pub(crate) fn is_empty(&self) -> bool {
+        *self == PhotoDetails::default()
+    }
+}
+
+/// A photo's EXIF details: JPEG, HEIC / AVIF, WebP, PNG, TIFF (whichever keep
+/// it). Reads only as far as it's found (a JPEG's are at the start).
+pub(crate) fn photo_details(path: &str) -> Option<PhotoDetails> {
+    use std::io::Read;
+    let mut f = std::fs::File::open(path).ok()?;
+    let mut data = Vec::new();
+    let mut chunk = vec![0_u8; 1 << 20];
+    // (in 1 MB steps, up to 32 MB: a phone's HEIC can keep it after the picture)
+    while data.len() < 32 << 20 {
+        let n = f.read(&mut chunk).ok()?;
+        if n == 0 {
+            break;
+        }
+        data.extend_from_slice(&chunk[..n]);
+        if let Some(at) = find_tiff(&data) {
+            // (a little more read, if the details run past what's read so far)
+            let mut more = vec![0_u8; 256 << 10];
+            if let Ok(m) = f.read(&mut more) {
+                data.extend_from_slice(&more[..m]);
+            }
+            return Some(parse_exif(&data[at..]));
+        }
+    }
+    None
+}
+
+/// Where the EXIF (a little TIFF file) starts: at the start of a TIFF; after
+/// "Exif\0\0" (JPEG, HEIC, AVIF); in a PNG's eXIf or a WebP's EXIF chunk
+fn find_tiff(d: &[u8]) -> Option<usize> {
+    let tiff = |at: usize| d.get(at..at + 4).is_some_and(|h| h == b"II*\0" || h == b"MM\0*");
+    if tiff(0) {
+        return Some(0);
+    }
+    // (WebP's "EXIF" chunk: its 4-byte size, then the TIFF, sometimes after "Exif\0\0")
+    for (marker, skip) in [(&b"Exif\0\0"[..], 0), (&b"eXIf"[..], 0), (&b"EXIF"[..], 4)] {
+        let mut from = 0;
+        while let Some(i) = d[from..].windows(marker.len()).position(|w| w == marker) {
+            let at = from + i + marker.len() + skip;
+            if tiff(at) {
+                return Some(at);
+            }
+            from = from + i + 1;
+        }
+    }
+    None
+}
+
+/// The details out of EXIF (a TIFF structure: directories of tagged values)
+fn parse_exif(t: &[u8]) -> PhotoDetails {
+    let le = t.starts_with(b"II");
+    let u16_at = |o: usize| t.get(o..o + 2).map(|b| if le { u16::from_le_bytes([b[0], b[1]]) } else { u16::from_be_bytes([b[0], b[1]]) });
+    let u32_at = |o: usize| {
+        t.get(o..o + 4).map(|b| {
+            let b = [b[0], b[1], b[2], b[3]];
+            if le { u32::from_le_bytes(b) } else { u32::from_be_bytes(b) }
+        })
+    };
+    // A directory's entries: tag → (type, count, where its value is)
+    let dir = |at: usize| -> Vec<(u16, u16, u32, usize)> {
+        let Some(n) = u16_at(at) else { return Vec::new() };
+        (0..n.min(512) as usize)
+            .filter_map(|i| {
+                let e = at + 2 + i * 12;
+                let (tag, kind, count) = (u16_at(e)?, u16_at(e + 2)?, u32_at(e + 4)?);
+                let size = match kind {
+                    3 | 8 => 2,
+                    4 | 9 | 11 => 4,
+                    5 | 10 | 12 => 8,
+                    _ => 1,
+                } * count as usize;
+                // (4 bytes or less: right there; more: where the entry points)
+                let value = if size <= 4 { e + 8 } else { u32_at(e + 8)? as usize };
+                Some((tag, kind, count, value))
+            })
+            .collect()
+    };
+    let find = |d: &[(u16, u16, u32, usize)], tag: u16| d.iter().find(|e| e.0 == tag).copied();
+    let text = |e: Option<(u16, u16, u32, usize)>| {
+        let (_, _, count, at) = e?;
+        let raw = t.get(at..at + count as usize)?;
+        let s = String::from_utf8_lossy(raw).trim_matches(|c: char| c == '\0' || c.is_whitespace()).to_owned();
+        (!s.is_empty()).then_some(s)
+    };
+    let number = |e: Option<(u16, u16, u32, usize)>| -> Option<f64> {
+        let (_, kind, _, at) = e?;
+        match kind {
+            3 => u16_at(at).map(f64::from),
+            4 => u32_at(at).map(f64::from),
+            5 | 10 => {
+                let (n, d) = (u32_at(at)?, u32_at(at + 4)?);
+                let (n, d) = if kind == 10 { (n as i32 as f64, d as i32 as f64) } else { (n as f64, d as f64) };
+                (d != 0.0).then(|| n / d)
+            }
+            _ => None,
+        }
+    };
+    let Some(first) = u32_at(4) else { return PhotoDetails::default() };
+    let ifd0 = dir(first as usize);
+    let exif = find(&ifd0, 0x8769).and_then(|e| u32_at(e.3)).map_or_else(Vec::new, |o| dir(o as usize));
+    let gps = find(&ifd0, 0x8825).and_then(|e| u32_at(e.3)).is_some_and(|o| !dir(o as usize).is_empty());
+
+    // Camera: make and model ("Apple iPhone 15 Pro"; the make once, if the model has it)
+    // ("NIKON CORPORATION" + "NIKON D850" → "NIKON D850")
+    let camera = match (text(find(&ifd0, 0x010F)), text(find(&ifd0, 0x0110))) {
+        (Some(make), Some(model)) => {
+            let brand = make.split_whitespace().next().unwrap_or("").to_lowercase();
+            Some(if !brand.is_empty() && model.to_lowercase().starts_with(&brand) { model } else { format!("{make} {model}") })
+        }
+        (make, model) => make.or(model),
+    };
+    // Taken: "2024:05:01 14:03:22" → "1 May 2024, 14:03"
+    let taken = text(find(&exif, 0x9003)).or_else(|| text(find(&ifd0, 0x0132))).map(|s| {
+        const MONTHS: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+        let n: Vec<u32> = s.split([':', ' ']).filter_map(|p| p.parse().ok()).collect();
+        match n.as_slice() {
+            [y, mo, d, h, mi, ..] if (1..=12).contains(mo) => format!("{d} {} {y}, {h:02}:{mi:02}", MONTHS[*mo as usize - 1]),
+            _ => s,
+        }
+    });
+    // Exposure: "1/120 s · f/1.8 · ISO 64"
+    let trim = |x: f64, places: usize| {
+        let s = format!("{x:.places$}");
+        if s.contains('.') { s.trim_end_matches('0').trim_end_matches('.').to_owned() } else { s }
+    };
+    let mut parts = Vec::new();
+    if let Some(t) = number(find(&exif, 0x829A)).filter(|t| *t > 0.0) {
+        parts.push(if t < 0.5 { format!("1/{:.0} s", 1.0 / t) } else { format!("{} s", trim(t, 1)) });
+    }
+    if let Some(f) = number(find(&exif, 0x829D)).filter(|f| *f > 0.0) {
+        parts.push(format!("f/{}", trim(f, 1)));
+    }
+    if let Some(iso) = number(find(&exif, 0x8827)).filter(|i| *i > 0.0) {
+        parts.push(format!("ISO {iso:.0}"));
+    }
+    let exposure = (!parts.is_empty()).then(|| parts.join("  \u{b7}  "));
+    // Focal length: "6.9 mm (26 mm equiv.)"
+    let focal = number(find(&exif, 0x920A)).filter(|f| *f > 0.0).map(|f| {
+        match number(find(&exif, 0xA405)).filter(|e| *e > 0.0 && (*e - f).abs() > 0.5) {
+            Some(e) => format!("{} mm ({e:.0} mm equiv.)", trim(f, 1)),
+            None => format!("{} mm", trim(f, 1)),
+        }
+    });
+    PhotoDetails { camera, lens: text(find(&exif, 0xA434)), taken, exposure, focal, gps }
+}
