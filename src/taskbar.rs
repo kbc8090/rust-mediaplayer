@@ -352,6 +352,21 @@ const VT_SET_PROGRESS_STATE: usize = 10;
 const VT_THUMB_ADD_BUTTONS: usize = 15;
 const VT_THUMB_UPDATE_BUTTONS: usize = 16;
 const VT_SET_OVERLAY_ICON: usize = 18;
+const VT_MARK_FULLSCREEN: usize = 8;
+
+/// The taskbar's ITaskbarList3, once made (see Taskbar::new), for full screen (see mark_fullscreen)
+static TASKBAR_LIST: AtomicIsize = AtomicIsize::new(0);
+
+/// Tell the taskbar the window is (or no longer is) full screen, so it steps
+/// behind it at once. (Left to notice by itself, it stayed in front for a
+/// frame after the window had covered the screen.)
+unsafe fn mark_fullscreen(hwnd: isize, on: bool) {
+    let list = TASKBAR_LIST.load(Ordering::Relaxed) as *mut c_void;
+    if !list.is_null() {
+        let mark: extern "system" fn(*mut c_void, isize, i32) -> i32 = std::mem::transmute(method(list, VT_MARK_FULLSCREEN));
+        mark(list, hwnd, on as i32);
+    }
+}
 
 /// Raw pointer to function number `slot` of a COM object's vtable
 unsafe fn method(this: *mut c_void, slot: usize) -> *const c_void {
@@ -374,6 +389,8 @@ static BUTTONS_LOST: AtomicBool = AtomicBool::new(false);
 static FS_RESTORE: Mutex<Option<[i32; 4]>> = Mutex::new(None);
 /// The window was maximized when fullscreen was entered
 static FS_WAS_MAX: AtomicBool = AtomicBool::new(false);
+/// Its placement then (maximized, and the size it restores to), to go back to
+static FS_PLACEMENT: Mutex<Option<WindowPlacement>> = Mutex::new(None);
 /// Entering fullscreen could not be done natively (caller falls back to egui's way)
 static FS_FAILED: AtomicBool = AtomicBool::new(false);
 
@@ -501,11 +518,7 @@ unsafe fn enter_fullscreen_now(hwnd: isize) {
     if ROUNDED.load(Ordering::Relaxed) {
         set_corners(hwnd, false); // rounded corners on a full screen look wrong
     }
-    // A maximized window can't be sized past its maximized size: un-maximize first.
     let was_max = IsZoomed(hwnd) != 0;
-    if was_max {
-        ShowWindow(hwnd, 9); // SW_RESTORE
-    }
     let mut window = RectI::default();
     let mut info = MonitorInfo {
         size: std::mem::size_of::<MonitorInfo>() as u32,
@@ -514,12 +527,37 @@ unsafe fn enter_fullscreen_now(hwnd: isize) {
         flags: 0,
     };
     let monitor = MonitorFromWindow(hwnd, 2); // MONITOR_DEFAULTTONEAREST
-    if monitor != 0 && GetWindowRect(hwnd, &mut window) != 0 && GetMonitorInfoW(monitor, &mut info) != 0 {
+    if monitor != 0 && GetMonitorInfoW(monitor, &mut info) != 0 {
+        // A maximized window can't be sized past its maximized size: un-maximize
+        // it first, but straight to covering the screen. (Restoring it showed it
+        // at its normal size for a frame, the desktop around it, then full screen.)
+        if was_max {
+            let mut wp: WindowPlacement = std::mem::zeroed();
+            wp.length = std::mem::size_of::<WindowPlacement>() as u32;
+            if GetWindowPlacement(hwnd, &mut wp) != 0 {
+                if let Ok(mut p) = FS_PLACEMENT.lock() {
+                    *p = Some(wp);
+                }
+                let (m, w) = (info.monitor, info.work);
+                let mut full = wp;
+                full.flags = 0;
+                full.show_cmd = 1; // SW_SHOWNORMAL
+                // (its normal size is counted from the work area's corner)
+                let (dx, dy) = (w.left - m.left, w.top - m.top);
+                full.normal = RectI { left: m.left - dx, top: m.top - dy, right: m.right - dx, bottom: m.bottom + 1 - dy };
+                SetWindowPlacement(hwnd, &full);
+            } else {
+                ShowWindow(hwnd, 9); // SW_RESTORE
+            }
+        }
+    }
+    if monitor != 0 && GetWindowRect(hwnd, &mut window) != 0 && info.size != 0 && info.monitor.right > info.monitor.left {
         if let Ok(mut r) = FS_RESTORE.lock() {
             *r = Some([window.left, window.top, window.right, window.bottom]);
         }
         FS_WAS_MAX.store(was_max, Ordering::Relaxed);
         let m = info.monitor;
+        mark_fullscreen(hwnd, true);
         // One pixel taller than the monitor: a borderless OpenGL window that exactly
         // covers the screen gets switched by Windows / the GPU driver into an
         // "exclusive fullscreen" present mode, and that switch is a visible blink.
@@ -564,8 +602,12 @@ pub fn still_fullscreen(hwnd: isize) -> bool {
 /// is already wherever Windows put it, so just forget the size to go back to and
 /// put the rounded corners back
 pub fn forget_fullscreen(hwnd: isize) {
+    unsafe { mark_fullscreen(hwnd, false) };
     if let Ok(mut r) = FS_RESTORE.lock() {
         *r = None;
+    }
+    if let Ok(mut p) = FS_PLACEMENT.lock() {
+        *p = None;
     }
     FS_WAS_MAX.store(false, Ordering::Relaxed);
     if ROUNDED.load(Ordering::Relaxed) {
@@ -574,15 +616,25 @@ pub fn forget_fullscreen(hwnd: isize) {
 }
 
 unsafe fn exit_fullscreen_now(hwnd: isize) {
+    mark_fullscreen(hwnd, false);
     if ROUNDED.load(Ordering::Relaxed) {
         set_corners(hwnd, true);
     }
     let saved = FS_RESTORE.lock().ok().and_then(|mut r| r.take());
-    if let Some([l, t, r, b]) = saved {
-        SetWindowPos(hwnd, 0, l, t, r - l, b - t, 0x0200);
-        if FS_WAS_MAX.swap(false, Ordering::Relaxed) {
+    let placement = FS_PLACEMENT.lock().ok().and_then(|mut p| p.take());
+    if FS_WAS_MAX.swap(false, Ordering::Relaxed) {
+        // Back to maximized straight from full screen, keeping the size it
+        // restores to. (Putting it at that size first, then maximizing it,
+        // showed it small for a frame, the desktop around it.)
+        if let Some(mut wp) = placement {
+            wp.flags = 0;
+            wp.show_cmd = 3; // SW_SHOWMAXIMIZED
+            SetWindowPlacement(hwnd, &wp);
+        } else {
             ShowWindow(hwnd, 3); // SW_MAXIMIZE
         }
+    } else if let Some([l, t, r, b]) = saved {
+        SetWindowPos(hwnd, 0, l, t, r - l, b - t, 0x0200);
     }
 }
 
@@ -1250,6 +1302,7 @@ impl Taskbar {
                 make_icon(Glyph::Forward)?,
                 make_icon(Glyph::Next)?,
             ];
+            TASKBAR_LIST.store(list as isize, Ordering::Relaxed);
             Some(Self {
                 list,
                 hwnd,
