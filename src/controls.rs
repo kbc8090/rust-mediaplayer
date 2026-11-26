@@ -1717,7 +1717,7 @@ pub(crate) fn draw_picture_bar(app: &mut FluentMediaPlayer, ctx: &egui::Context,
         sep(&p, x + SEP / 2.0);
         x += SEP;
         let (go, c) = button(ui, &mut x, "fit", "Fit to window");
-        icon_fit(&p, c, tint(app.pic_zoom == 0.0));
+        icon_fit(&p, c, tint(app.pic_zoom == 0.0 && app.pic_pan == (0.0, 0.0)));
         if go {
             app.picture_fit();
         }

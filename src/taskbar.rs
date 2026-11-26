@@ -20,7 +20,7 @@
 //! in main.rs) so no extra dependency is needed.
 
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, AtomicU8, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -317,6 +317,7 @@ unsafe extern "system" {
 }
 
 const WM_ERASEBKGND: u32 = 0x0014;
+const WM_SETCURSOR: u32 = 0x0020;
 /// Private message: switch fullscreen on (wparam 1) or off (wparam 2)
 const WM_APP_FULLSCREEN: u32 = 0x8001;
 const WM_COMMAND: u32 = 0x0111;
@@ -1403,6 +1404,16 @@ unsafe extern "system" fn subclass_proc(
             return 1;
         }
     }
+    if msg == WM_SETCURSOR && (lparam & 0xFFFF) == 1 /* HTCLIENT */ {
+        // A hand over a picture (see set_hand), in place of the cursor egui asks for
+        let which = HAND.load(Ordering::Relaxed);
+        if which != 0 {
+            if let Some(c) = hand_cursor(which) {
+                SetCursor(c);
+                return 1;
+            }
+        }
+    }
     if msg == WM_ERASEBKGND {
         // The whole client area is painted by OpenGL; erasing it first only flashes.
         return 1;
@@ -1832,4 +1843,180 @@ pub fn set_wallpaper(path: &str) -> bool {
         // SPI_SETDESKWALLPAPER; SPIF_UPDATEINIFILE | SPIF_SENDCHANGE (kept after a restart)
         SystemParametersInfoW(0x0014, 0, file.as_mut_ptr() as *mut c_void, 0x01 | 0x02) != 0
     }
+}
+
+// ── Hand cursors (a picture: open hand over it, closed while dragging it) ─────
+// Windows has no grabbing hand of its own, so these are drawn here: an open
+// and a closed hand, white with a dark outline, at 32 px (normal) and 48 px
+// (larger cursors / scaling), as PNGs written out as text
+mod hand {
+    pub(super) const OPEN_32: &str = concat!(
+        "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAADeUlEQVR4AexXb0hTURS/W2mp8w8mOhGUpkGQaDE1pUBcyEgo",
+        "98EJhtIHwX3SwCiFKKEYwnQJEpQIip+iBkJ+0BQKkbUgZBFiQcwVKpNVDGMTNzTX78y3R8re2+bUCHqc37nn3HvOPb/d9+57",
+        "d1L2l69/joAGC/YecAMvgJNATBLNChRkZGSYpqamzjocDllra+tVVH4GPFcoFJ7k5OTPsG8BUUk4AnGYTQmcAGoaGxuPVldX",
+        "s+zsbKbX61lcXFyJwWDQLiwsJK2srJwqLi42IO4KELGIEVCnp6d/b2lpma2oqPiBGZvlcjmabcEvZjKZTFJfXx/oSEpKYg0N",
+        "DWSXQKUCRPwoWlERI/BofHw8dWBggFksFlZeXl4Uaqa8vDy+Oy0tjezL8fHxrvz8/Fk4y8AFQFCECEixzAVlZWV8okaj4W0x",
+        "A4VLcTukNpuN9ff3ZyHWCAiKEIEjPp+PSSQSPtHv9/O2mKHVahluXSCEuz0FAUdACREQCI+uOyuLFoAdE8s6UAJihYNj/wkE",
+        "V+AcluQV8BN4AhyaEIGLiYmJFpPJpHI6nSlVVVU6VL8BHIoQgbtGo/F4XV0dy8zMZKOjo/Sq1e9j9QSxuYjAt83NTT6G3mbD",
+        "w8PxfAdndHZ2so6ODs7bblwu17bBaZ1Ox7q7uzmPb6gG7+w2aLC3p6dna21tjR9Tq9WsqamJ92M0tsTyicCHxcXF3ra2th1x",
+        "9LXb0bF3xyuWSgRovGtoaMg+OTlJdgD0dQsYsSvRd3iQALG8joutrq7GXpKbgft+/OLckE2QAA2asQ0f4/tP9r4AJyeax0FK",
+        "CH8SoJjbeB8sDw4Oks08Hk+g3auy2+2UGlBkhMJuAlSxBqswV1hYyGg3hEqKtA9HNQq1kRLCbgIUNwdVND8/r8BJ6NPExATc",
+        "vcnIyAglmkgJIRSBYOwXGM20PTc2NmBGJ2NjY2x6evolst4AgiJGgJLe4mjVpVKpGI5Z5EcEKo4TNMXeISWGcAQo977ZbL6H",
+        "sx7Ds8FmZmYYPd3cFqNx5vV62dLSErNaray9vZ3V1tZ+dbvdlzBoBUQlEgI0wYP19fUz2B0PKysrZ3NycpxSqdQvkUgC58aE",
+        "hAR3bm7uO6VS+bSvr4/+nJxG0msgrERKgCb6CHUTKAXkAOVK0BJS0J4HrgG9gA+ISGiSiAIPKujACYQj/hsAAP//85t+dQAA",
+        "AAZJREFUAwA+JPFBla6rOgAAAABJRU5ErkJggg==",
+    );
+    pub(super) const CLOSED_32: &str = concat!(
+        "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAADaElEQVR4AeyWW0iTYRjHn5k1DU+QGl5qEkKC85SBXoiGUFR4",
+        "oTRBUbrxkBAdbtScG3MjiCKQse1iOIRJwSxbF15IwWA5hAY5hbQLD7TQ6cUkIoVI+z9bG9/k28GRROB4fu/3Pu/7PM/738v7",
+        "HZLoH/+OBRzvwPEO/Hc7kIzHRg+wAQOoAidBI3gALoJDWawduIBqOvAG3AW68vJy3djY2PWhoaHOtLQ0J8Y+FRcXv+rq6nqc",
+        "nZ09C18LToAykAuiWjQB51NSUlz9/f094+Pj16qrq5+iUqvJZKK2tjZSKpXU2toqkclk5+bn50mv15PT6SSJRHIfcV/y8/Nd",
+        "qampXvSfg4jrRJxAUr1cLpdqNBpqaWkhs9nMxU+XlJRgKmBYnDo6OgIO2sLCQqqqqjqlVqvzlpeXaX19nRB/E1M3gKhFE3Cm",
+        "qKgolMTFs7KyQn6ws7GxEez6r5ubm/4dYiczM9MvHv1CIGpiAqoReQ+cBQlZRkZGKG9/f5/7Um7EOCigMy8vz9Hb2/skNzf3",
+        "tlhCgmM5kfKEAsqlUqne4XDQyMgILSwsSGpra8PybDYbbW9vh8ZwMKm5uTnk7+7uEh/S9PT00JhMJuN+ATdiCAVcaWpqkhQU",
+        "BGJzcnKosrIyLKempoaE5wC3H5WV8d0WCMNdQyw6OZkfF4GxpaUl7nzlRgyhAM/KykpYTFKScDpsKm5nZ2eHYz3ciCFcwTIz",
+        "M2PHA4X29vbEYo9kTCjgJ1a4ajQarXV1deTz+eAevQkF8Go/0DTb7XZFaWkpra2twf0r9itSlYMCgnFqLD46OTkZ9BO+og7n",
+        "xnUGOFCI0Ww2C/2E+ouLi5z3mRsxIu0Ax85+xG9ubo77CbO6usq5fhXcOUg0ARyr6+vr42tCTExMEAS8RPI3IGqxBJimpqbe",
+        "KxQK0eRog16vl7q7u/khcCdaXCwB/CaR4/XqbmhoIJfLFa1WaM5isVBFRQVtbW2pMRjxAGKOYgngGC5waXp6+hmK+vj2bG9v",
+        "p4GBAVKpVH4GBwf53/rfC3j/84fKW4/H04jkRyCqxSOAC/BW8ifZWZzLenyS3dJqtQ/xVaRihoeH+wwGg9xqtVa63W5+E11G",
+        "0mvAO4hLZItXQLACPy3fwRkFGqD8A//TF+h/AN9B3HZYAXEXjjfwyAXEEvIbAAD///q+WZQAAAAGSURBVAMAe3r0QSIx9MoA",
+        "AAAASUVORK5CYII=",
+    );
+    pub(super) const OPEN_48: &str = concat!(
+        "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",
+        "REFUAwBu7Idw6aS9KgAAAABJRU5ErkJggg==",
+    );
+    pub(super) const CLOSED_48: &str = concat!(
+        "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",
+    );
+}
+
+#[link(name = "user32")]
+unsafe extern "system" {
+    fn SetCursor(cursor: isize) -> isize;
+    fn GetSystemMetrics(index: i32) -> i32;
+    fn LoadCursorW(instance: isize, name: *const u16) -> isize;
+}
+
+/// Which hand to show over the window's client area: 0 none (whatever egui
+/// asks for), 1 open, 2 closed
+static HAND: AtomicU8 = AtomicU8::new(0);
+static HAND_CURSORS: std::sync::OnceLock<[isize; 2]> = std::sync::OnceLock::new();
+
+/// Show the open hand (1), the closed hand (2), or the usual cursor again (0)
+pub fn set_hand(which: u8) {
+    if HAND.swap(which, Ordering::Relaxed) == which {
+        return;
+    }
+    unsafe {
+        match hand_cursor(which) {
+            Some(c) => {
+                SetCursor(c);
+            }
+            // (back to the arrow straight away, not at the next mouse move;
+            // anything else egui wants follows at that move)
+            None => {
+                SetCursor(LoadCursorW(0, 32512 as *const u16 /* IDC_ARROW */));
+            }
+        }
+    }
+}
+
+/// The cursor for hand 1 or 2 (made the first time it's needed)
+fn hand_cursor(which: u8) -> Option<isize> {
+    if which == 0 {
+        return None;
+    }
+    let cursors = HAND_CURSORS.get_or_init(|| {
+        // (the 48 px ones once Windows' cursors are bigger than 40 px)
+        let big = unsafe { GetSystemMetrics(13 /* SM_CXCURSOR */) } > 40;
+        let (open, closed) = if big { (hand::OPEN_48, hand::CLOSED_48) } else { (hand::OPEN_32, hand::CLOSED_32) };
+        [make_cursor(open).unwrap_or(0), make_cursor(closed).unwrap_or(0)]
+    });
+    let c = cursors[(which as usize - 1).min(1)];
+    (c != 0).then_some(c)
+}
+
+/// A cursor from a PNG (as base64 text), its point in the middle of the palm
+fn make_cursor(png_base64: &str) -> Option<isize> {
+    let png = base64_decode(png_base64)?;
+    let img = eframe::icon_data::from_png_bytes(&png).ok()?;
+    let (w, h) = (img.width as usize, img.height as usize);
+    let mut bgra = vec![0_u8; w * h * 4];
+    for (i, px) in img.rgba.chunks_exact(4).enumerate() {
+        bgra[i * 4..i * 4 + 4].copy_from_slice(&[px[2], px[1], px[0], px[3]]);
+    }
+    unsafe {
+        let color = CreateBitmap(w as i32, h as i32, 1, 32, bgra.as_ptr() as *const c_void);
+        let mask_bits = vec![0_u8; w.div_ceil(16) * 2 * h];
+        let mask = CreateBitmap(w as i32, h as i32, 1, 1, mask_bits.as_ptr() as *const c_void);
+        // (the palm's middle, on the 24-unit grid the hands are drawn on)
+        let spot = |u: f32, size: usize| (u / 24.0 * size as f32).round() as u32;
+        let info = IconInfo { is_icon: 0, x_hotspot: spot(12.0, w), y_hotspot: spot(13.0, h), mask, color };
+        let cursor = CreateIconIndirect(&info);
+        DeleteObject(color);
+        DeleteObject(mask);
+        (cursor != 0).then_some(cursor)
+    }
+}
+
+fn base64_decode(text: &str) -> Option<Vec<u8>> {
+    let value = |c: u8| -> Option<u32> {
+        Some(match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            _ => return None,
+        } as u32)
+    };
+    let bytes: Vec<u8> = text.bytes().filter(|&c| c != b'=').collect();
+    let mut out = Vec::with_capacity(bytes.len() * 3 / 4);
+    for chunk in bytes.chunks(4) {
+        let mut n = 0_u32;
+        for (i, &c) in chunk.iter().enumerate() {
+            n |= value(c)? << (18 - 6 * i);
+        }
+        out.extend_from_slice(&n.to_be_bytes()[1..chunk.len()]);
+    }
+    Some(out)
 }

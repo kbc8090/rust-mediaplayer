@@ -1570,28 +1570,29 @@ impl FluentMediaPlayer {
         self.picture_percent().is_some_and(|p| (p - 100.0).abs() < 0.5)
     }
 
-    /// Bigger than the window, so dragging moves it about (rather than the window)
-    pub(crate) fn picture_overflows(&self) -> bool {
-        let (Some((w, h)), Some(fit)) = (self.picture_size(), self.fit_scale()) else { return false };
-        let s = fit * self.pic_zoom.exp2();
-        let (ww, wh) = self.window_px();
-        w * s > ww + 1.0 || h * s > wh + 1.0
+    /// Where the picture is in the window, in points
+    pub(crate) fn picture_rect(&self) -> Option<Rect> {
+        let (w, h) = self.picture_size()?;
+        let s = self.fit_scale()? * self.pic_zoom.exp2();
+        let ppp = self.egui_ctx.pixels_per_point() as f64;
+        let (sw, sh) = (w * s / ppp, h * s / ppp);
+        let mid = self.egui_ctx.screen_rect().center();
+        let c = pos2(mid.x + (self.pic_pan.0 * sw) as f32, mid.y + (self.pic_pan.1 * sh) as f32);
+        Some(Rect::from_center_size(c, vec2(sw as f32, sh as f32)))
     }
 
-    /// Set the zoom and where the picture sits, kept so it never leaves a gap at
-    /// an edge it's bigger than (smaller than the window: centred that way)
+    /// Set the zoom and where the picture sits. It can be moved anywhere, as
+    /// long as a little of it (64 px, or all of a smaller one) stays in the window.
     fn set_picture_view(&mut self, zoom: f64, pan: (f64, f64)) {
         let mut pan = pan;
         if let (Some((w, h)), Some(fit)) = (self.picture_size(), self.fit_scale()) {
             let s = fit * zoom.exp2();
             let (ww, wh) = self.window_px();
+            let ppp = self.egui_ctx.pixels_per_point() as f64;
             let keep = |p: f64, shown: f64, room: f64| {
-                if shown <= room {
-                    0.0
-                } else {
-                    let most = (shown - room) / 2.0 / shown;
-                    p.clamp(-most, most)
-                }
+                let stay = shown.min(64.0 * ppp);
+                let most = (((room + shown) / 2.0 - stay) / shown).max(0.0);
+                p.clamp(-most, most)
             };
             pan = (keep(pan.0, w * s, ww), keep(pan.1, h * s, wh));
         }
@@ -3114,25 +3115,33 @@ impl eframe::App for FluentMediaPlayer {
                     self.toggle_fullscreen(ctx);
                 }
 
-                // A picture bigger than the window: dragging moves it about
-                let pan = self.is_picture() && self.picture_overflows();
-                if pan && resp.drag_started_by(egui::PointerButton::Primary) {
+                // A picture: dragging it moves it about (an open hand over it, a
+                // closed one while dragging); dragging beside it moves the window
+                let pic_rect = if self.is_picture() { self.picture_rect() } else { None };
+                let on_picture = |p: Option<Pos2>| p.is_some_and(|p| pic_rect.is_some_and(|r| r.contains(p)));
+                let pressed_on_picture = on_picture(ctx.input(|i| i.pointer.press_origin()));
+                if resp.drag_started_by(egui::PointerButton::Primary) && pressed_on_picture {
                     self.pic_drag = true;
                 }
                 if self.pic_drag {
                     if resp.dragged_by(egui::PointerButton::Primary) {
                         let d = resp.drag_delta();
                         self.picture_pan_by(d.x, d.y);
-                        ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
                     } else {
                         self.pic_drag = false;
                     }
-                } else if pan && resp.hovered() {
-                    ctx.set_cursor_icon(egui::CursorIcon::Grab);
                 }
+                let hand = if self.pic_drag {
+                    2
+                } else if resp.hovered() && edge.is_none() && on_picture(resp.hover_pos()) {
+                    1
+                } else {
+                    0
+                };
+                taskbar::set_hand(hand);
 
-                // Drag anywhere on the video (left button) → move the window
-                if !pan && resp.drag_started_by(egui::PointerButton::Primary) && !self.is_fullscreen && edge.is_none() {
+                // Drag anywhere else on the video (left button) → move the window
+                if !self.pic_drag && resp.drag_started_by(egui::PointerButton::Primary) && !self.is_fullscreen && edge.is_none() {
                     ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
                 }
 
