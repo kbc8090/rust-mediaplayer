@@ -3455,17 +3455,10 @@ fn main() -> eframe::Result<()> {
         unsafe { MessageBoxW(0, text.as_ptr(), title.as_ptr(), 0x10 /* MB_ICONERROR */); }
     }));
 
-    // libmpv is delay-loaded (see build.rs): load it now, before anything uses it,
-    // so a missing DLL gets a clear message rather than a crash
-    if !libmpv_loads() {
-        return Ok(());
-    }
-    // Anything the player starts (yt-dlp and the Deno it runs, ffmpeg; also
-    // mpv's own yt-dlp runs) ends when the player does, however it closes
-    taskbar::end_children_with_player();
-
     // Single window: if the player is already running, hand it the file (it plays
-    // it in place of the current one) and leave
+    // it in place of the current one) and leave. (First: a file double-clicked
+    // in Explorer while the player is open gets to it sooner, without this copy
+    // loading libmpv for nothing.)
     let arg_files: Vec<String> = std::env::args_os()
         .skip(1)
         .map(PathBuf::from)
@@ -3476,6 +3469,15 @@ fn main() -> eframe::Result<()> {
     if taskbar::forward_to_running_instance(&arg_files, !load_settings().multi) {
         return Ok(());
     }
+
+    // libmpv is delay-loaded (see build.rs): load it now, before anything uses it,
+    // so a missing DLL gets a clear message rather than a crash
+    if !libmpv_loads() {
+        return Ok(());
+    }
+    // Anything the player starts (yt-dlp and the Deno it runs, ffmpeg; also
+    // mpv's own yt-dlp runs) ends when the player does, however it closes
+    taskbar::end_children_with_player();
 
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("RustMediaPlayer")
