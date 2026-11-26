@@ -386,6 +386,16 @@ type PhotoSlot = Arc<Mutex<Option<(String, Option<PhotoDetails>)>>>;
 /// The dark grey around a picture (mpv's background-color)
 const PICTURE_BACKDROP: &str = "#2B2C30";
 
+/// Showing a copy of the picture just left (see HOLD): since when, how many
+/// times playback had (re)started by then (see PLAYBACK_RESTARTS), and since
+/// when the next picture has been ready (and how many frames mpv had drawn then)
+#[derive(Clone, Copy)]
+struct Holding {
+    since: std::time::Instant,
+    restarts: u64,
+    ready: Option<(std::time::Instant, u32)>,
+}
+
 /// A picture gliding to a new zoom over a moment (the wheel, the zoom buttons,
 /// fit / 1:1): from where it was to where it's going, about the spot under
 /// the pointer (that spot stays put all the way), or straight across (None)
@@ -403,7 +413,6 @@ struct ZoomGlide {
 struct ZipFound {
     gen: u64,
     copy: String,
-    zip: String,
     files: Vec<String>,
     at: usize,
 }
@@ -646,6 +655,9 @@ struct FluentMediaPlayer {
     archive_result: Arc<Mutex<Option<(u64, String, Inside)>>>,
     pub(crate) archive_peek: Arc<Mutex<Option<(String, Inside)>>>,
     zip_found: Arc<Mutex<Option<ZipFound>>>,
+    /// Previous / next go through a folder of a zip (a file double-clicked in
+    /// it in Explorer), not the folder the file is in: don't scan that again
+    zip_folder: bool,
     /// An archive with several kinds in it, asking which to play (its path,
     /// each kind's files)
     archive_choice: Option<(String, KindFiles)>,
@@ -669,10 +681,8 @@ struct FluentMediaPlayer {
     pic_drag: bool,
     /// Gliding to a new zoom
     pic_glide: Option<ZoomGlide>,
-    /// Showing a copy of the picture just left (see HOLD): since when,
-    /// and since when the next one has been open (and how many frames mpv
-    /// had drawn by then)
-    hold: Option<(std::time::Instant, Option<(std::time::Instant, u32)>)>,
+    /// Showing a copy of the picture just left (see HOLD)
+    hold: Option<Holding>,
     /// A photo's details for the Tab overlay (read on another thread): the
     /// picture they're for, and them (None: none in it); and which was asked for
     photo: PhotoSlot,
@@ -991,6 +1001,7 @@ impl FluentMediaPlayer {
             archive_result: Arc::new(Mutex::new(None)),
             archive_peek: Arc::new(Mutex::new(None)),
             zip_found: Arc::new(Mutex::new(None)),
+            zip_folder: false,
             archive_choice: None,
             egui_ctx: cc.egui_ctx.clone(),
             sort_by: st.sort_by,
@@ -1047,6 +1058,7 @@ impl FluentMediaPlayer {
     /// previous / next go through its entries; otherwise through the files of the
     /// same kind (videos / music / pictures) in the file's folder.
     fn open_file(&mut self, path: &str) {
+        self.zip_folder = false;
         if is_url(path) {
             self.open_url(path);
         } else if is_playlist_file(path) {
@@ -1072,9 +1084,9 @@ impl FluentMediaPlayer {
             if temp_copy_name(path).is_some() {
                 let (gen, slot, ctx, copy) = (self.archive_gen, self.zip_found.clone(), self.egui_ctx.clone(), path.to_owned());
                 let _ = std::thread::Builder::new().name("zip".into()).spawn(move || {
-                    if let Ok((zip, files, at)) = explorer_zip_playlist(&copy) {
+                    if let Ok((_, files, at)) = explorer_zip_playlist(&copy) {
                         if let Ok(mut s) = slot.lock() {
-                            *s = Some(ZipFound { gen, copy, zip, files, at });
+                            *s = Some(ZipFound { gen, copy, files, at });
                         }
                         ctx.request_repaint();
                     }
@@ -1258,7 +1270,8 @@ impl FluentMediaPlayer {
         // next one is drawn (see HOLD)
         if self.is_picture() && media_kind(path) == Some(MediaKind::Image) {
             HOLD.with(|s| s.set((1, 0)));
-            self.hold = Some((std::time::Instant::now(), None));
+            let restarts = mpv_link::PLAYBACK_RESTARTS.load(std::sync::atomic::Ordering::Relaxed);
+            self.hold = Some(Holding { since: std::time::Instant::now(), restarts, ready: None });
         }
         self.current_file = path.to_owned();
         self.has_file = true;
@@ -1424,7 +1437,7 @@ impl FluentMediaPlayer {
     fn set_sort(&mut self, by: SortBy, desc: bool) {
         self.sort_by = by;
         self.sort_desc = desc;
-        if self.playlist.is_none() && self.has_file && !is_url(&self.current_file) && !is_archive_entry(&self.current_file) {
+        if self.playlist.is_none() && self.has_file && !self.zip_folder && !is_url(&self.current_file) && !is_archive_entry(&self.current_file) {
             let current = self.current_file.clone();
             self.start_folder_scan(&current);
         }
@@ -1942,7 +1955,9 @@ impl FluentMediaPlayer {
         // while they're hidden, so it doesn't sit bright over a video)
         let controls = ctx.animate_bool_with_time(egui::Id::new("overlay_vis"), self.show_controls, 0.2);
         let tab_alpha = 0.45 + 0.55 * controls;
-        let mut action = adjust::draw_playlist(ctx, &mut self.adjust_ui, &self.playlist_rows, current, mark, progress, &mut replay, &mut summary, self.playlist_selected, &mut shuffle, self.accent, tab_alpha);
+        // (a picture: the tab stays above the right-hand arrow, which keeps the middle)
+        let tab_above = self.is_picture().then(|| picture_arrow_rect(ctx.screen_rect(), false).top());
+        let mut action = adjust::draw_playlist(ctx, &mut self.adjust_ui, &self.playlist_rows, current, mark, progress, &mut replay, &mut summary, self.playlist_selected, &mut shuffle, self.accent, tab_alpha, tab_above);
         if summary && !self.adjust_ui.playlist_open {
             let noun = self.playlist_noun();
             // the next two in playing order
@@ -2479,19 +2494,21 @@ impl eframe::App for FluentMediaPlayer {
         // ── Pictures: zoom glides, the ones either side read ahead, wallpaper ──
         self.glide_picture();
         // The copy of the picture just left (see HOLD) gives way once mpv has the
-        // next one: it's open, and mpv has drawn a frame since (or it's been open
-        // a moment, the frame already drawn). In any case after 1.5 s.
-        if let Some((since, open)) = self.hold {
+        // next one ready (it says so: playback started) and has drawn a frame
+        // since, or a moment after (the frame drawn already). In any case after 1.5 s.
+        if let Some(mut h) = self.hold {
             let (state, frames) = HOLD.with(|s| s.get());
-            let open = open.or_else(|| (self.pic_size != (0.0, 0.0)).then(|| (std::time::Instant::now(), frames)));
+            if h.ready.is_none() && mpv_link::PLAYBACK_RESTARTS.load(std::sync::atomic::Ordering::Relaxed) > h.restarts {
+                h.ready = Some((std::time::Instant::now(), frames));
+            }
             let done = state == 0
-                || open.is_some_and(|(o, at)| frames > at || o.elapsed().as_secs_f32() > 0.12)
-                || since.elapsed().as_secs_f32() > 1.5;
+                || h.ready.is_some_and(|(r, at)| frames > at || r.elapsed().as_secs_f32() > 0.06)
+                || h.since.elapsed().as_secs_f32() > 1.5;
             if done {
                 HOLD.with(|s| s.set((0, 0)));
                 self.hold = None;
             } else {
-                self.hold = Some((since, open));
+                self.hold = Some(h);
                 ctx.request_repaint();
             }
         }
@@ -2539,11 +2556,12 @@ impl eframe::App for FluentMediaPlayer {
         let zip = self.zip_found.lock().ok().and_then(|mut s| s.take());
         if let Some(z) = zip {
             // (still on the file Explorer copied out, and nothing else opened since)
+            // Like a folder, not a playlist: previous / next go through it
             if z.gen == self.archive_gen && self.current_file == z.copy && self.playlist.is_none() {
-                let entries = z.files.into_iter().map(|f| PlaylistEntry { path: PathBuf::from(f), title: None, secs: None }).collect();
-                self.start_playlist_at(PathBuf::from(z.zip), entries, false, z.at);
-                // (like a folder: the list stays closed until asked for)
-                self.adjust_ui.playlist_open = false;
+                self.scan_gen += 1; // (the temporary folder's own scan: not wanted)
+                self.folder_files = z.files.into_iter().map(PathBuf::from).collect();
+                self.folder_index = Some(z.at);
+                self.zip_folder = true;
             }
         }
 

@@ -1769,6 +1769,14 @@ pub(crate) fn draw_picture_bar(app: &mut FluentMediaPlayer, ctx: &egui::Context,
     });
 }
 
+/// Where a picture's previous (left) / next arrow is: 70 × 160 at the side,
+/// in the middle
+pub(crate) fn picture_arrow_rect(screen: Rect, left: bool) -> Rect {
+    let (w, h) = (70.0, 160.0_f32.min(screen.height() - TOP_H - 90.0).max(60.0));
+    let x0 = if left { screen.left() } else { screen.right() - w };
+    Rect::from_min_size(pos2(x0, (screen.center().y - h / 2.0).round()), vec2(w, h))
+}
+
 /// Previous / next picture: a tall strip with a thin arrow at each side of the
 /// window, shown while the pointer is on it
 pub(crate) fn draw_picture_arrows(app: &mut FluentMediaPlayer, ctx: &egui::Context) {
@@ -1776,16 +1784,15 @@ pub(crate) fn draw_picture_arrows(app: &mut FluentMediaPlayer, ctx: &egui::Conte
         return;
     }
     let screen = ctx.screen_rect();
-    let (w, h) = (70.0, 160.0_f32.min(screen.height() - TOP_H - 90.0).max(60.0));
     for (delta, left) in [(-1_isize, true), (1, false)] {
         // (not on the side the playlist is open on)
         if app.step_index(delta).is_none() || (!left && app.adjust_ui.playlist_open) {
             continue;
         }
         let id = egui::Id::new(("picture_arrow", left));
-        let x0 = if left { screen.left() } else { screen.right() - w };
-        let mut r = Rect::from_min_size(pos2(x0, (screen.center().y - h / 2.0).round()), vec2(w, h));
-        // (clear of the playlist's tab on the right edge: below it)
+        let mut r = picture_arrow_rect(screen, left);
+        // (clear of the playlist's tab on the right edge, should a small window
+        // leave no room for the tab above it: below it)
         let tab = app.adjust_ui.playlist_tab;
         if !left && tab.is_positive() && r.intersects(tab.expand(6.0)) {
             r = r.translate(vec2(0.0, tab.bottom() + 8.0 - r.top()));

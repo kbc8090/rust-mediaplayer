@@ -100,6 +100,10 @@ enum Job {
     Wake,
 }
 
+/// How many times mpv has said playback (re)started: a file's first picture is
+/// ready (also after a seek). Counted by mpv's event thread.
+pub static PLAYBACK_RESTARTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 pub struct MpvLink {
     tx: mpsc::Sender<Job>,
     state: Arc<Mutex<Snapshot>>,
@@ -113,6 +117,23 @@ pub fn yn(b: bool) -> &'static str {
 
 impl MpvLink {
     pub fn start(mpv: Arc<Mutex<Mpv>>) -> Self {
+        // mpv's events, on a thread of their own (only one thing is listened
+        // for: a file's first picture being ready, see PLAYBACK_RESTARTS). mpv
+        // takes calls from any thread, so this waits without holding the lock.
+        if let Ok(guard) = mpv.lock() {
+            // (mpv lives as long as the player: it's never dropped, the process
+            // just ends)
+            let events: &'static Mpv = unsafe { std::mem::transmute::<&Mpv, &'static Mpv>(&*guard) };
+            let _ = std::thread::Builder::new().name("mpv-events".into()).spawn(move || loop {
+                match events.wait_event(1.0) {
+                    Some(Ok(libmpv2::events::Event::PlaybackRestart)) => {
+                        PLAYBACK_RESTARTS.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Some(Ok(libmpv2::events::Event::Shutdown)) => break,
+                    _ => {}
+                }
+            });
+        }
         let (tx, rx) = mpsc::channel();
         let state = Arc::new(Mutex::new(Snapshot::default()));
         let want_info = Arc::new(AtomicBool::new(false));

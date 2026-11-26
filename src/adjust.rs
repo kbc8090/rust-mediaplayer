@@ -2008,6 +2008,7 @@ pub fn draw_playlist(
     shuffle: &mut bool,
     accent: Color32,
     tab_alpha: f32,
+    tab_above: Option<f32>,
 ) -> PlaylistAction {
     if rows.is_empty() {
         ui_state.playlist_rect = Rect::NOTHING;
@@ -2031,8 +2032,13 @@ pub fn draw_playlist(
     let mut action = PlaylistAction::None;
 
     // The tab: on the right edge, level with the middle of the panel; ‹ while
-    // the panel is in, › while it's out
-    let tab = Rect::from_min_size(pos2(screen.right() - TAB_W, (open_rect.center().y - TAB_H / 2.0).round()), vec2(TAB_W, TAB_H));
+    // the panel is in, › while it's out. (Showing a picture: kept above the
+    // picture's right-hand arrow, `tab_above`, so the arrow can stay mid-window.)
+    let mut tab_y = (open_rect.center().y - TAB_H / 2.0).round();
+    if let Some(limit) = tab_above {
+        tab_y = tab_y.min((limit - 8.0 - TAB_H).round()).max(screen.top() + PANEL_TOP);
+    }
+    let tab = Rect::from_min_size(pos2(screen.right() - TAB_W, tab_y), vec2(TAB_W, TAB_H));
     ui_state.playlist_tab = tab;
     let tab_id = egui::Id::new("playlist_tab");
     egui::Area::new(tab_id).order(egui::Order::Foreground).fixed_pos(tab.min).show(ctx, |ui| {
