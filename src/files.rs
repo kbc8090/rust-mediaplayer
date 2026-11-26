@@ -228,3 +228,216 @@ pub(crate) fn has_ext(path: &str, exts: &[&str]) -> bool {
 pub(crate) fn is_media_file(path: &str) -> bool {
     media_kind(path).is_some()
 }
+
+// ── Archives (.zip, .rar, .7z) ────────────────────────────────────────────────
+// mpv plays the files inside an archive without unpacking it to disk, from
+// "archive://<the archive's path, %-escaped>|/<path inside>". Seeking is instant
+// in files stored as they are (usual for big videos in a RAR); in compressed
+// ones mpv has to unpack from the start up to the point, so long jumps there
+// take a moment.
+
+pub(crate) const ARCHIVE_EXTS: &[&str] = &["zip", "rar", "7z"];
+
+pub(crate) fn is_archive_file(path: &str) -> bool {
+    has_ext(path, ARCHIVE_EXTS) && !is_archive_entry(path)
+}
+
+/// A file inside an archive ("archive://…|/…")
+pub(crate) fn is_archive_entry(path: &str) -> bool {
+    path.starts_with("archive://")
+}
+
+/// The archive a file inside one is in ("C:\…\Album.zip")
+pub(crate) fn archive_of(entry: &str) -> Option<String> {
+    let escaped = entry.strip_prefix("archive://")?.split('|').next()?;
+    // (%XX → that byte; the bytes are UTF-8)
+    let b = escaped.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        let hex = |c: u8| (c as char).to_digit(16);
+        match (b[i], b.get(i + 1).copied().and_then(hex), b.get(i + 2).copied().and_then(hex)) {
+            (b'%', Some(h), Some(l)) => {
+                out.push((h * 16 + l) as u8);
+                i += 3;
+            }
+            (c, ..) => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    Some(String::from_utf8_lossy(&out).into_owned())
+}
+
+/// Where a file is inside its archive ("Season 1/Episode 2.mkv")
+fn inside_of(entry: &str) -> &str {
+    entry.split_once("|/").map_or("", |(_, inside)| inside)
+}
+
+/// What's in an archive, as far as playing goes
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum Inside {
+    /// Still being read (while dragged over the window)
+    Looking,
+    /// The files to play, in the same order as a folder's: all of one kind
+    /// (the kind most of its files are: an album's songs, not also its cover)
+    Media(Vec<String>),
+    /// Nothing the player plays
+    Nothing,
+    /// Not readable as an archive (damaged, password-protected, not one)
+    Unreadable,
+}
+
+/// The files in an archive that mpv plays, as mpv names them. None if mpv
+/// can't open it as an archive.
+fn archive_entries(archive: &str) -> Option<Vec<String>> {
+    // mpv itself lists it, so the names are exactly the ones it will look for
+    // again when one is played (names that aren't plain ASCII go through a
+    // character conversion in mpv that's easier asked than copied). A separate
+    // mpv that plays nothing: it starts in a few milliseconds and is gone again.
+    let mpv = libmpv2::Mpv::with_initializer(|init| {
+        for (k, v) in [
+            ("config", "no"),
+            ("terminal", "no"),
+            ("pause", "yes"),
+            ("vo", "null"),
+            ("ao", "null"),
+            ("vid", "no"),
+            ("aid", "no"),
+            ("sid", "no"),
+            ("ytdl", "no"),
+            ("load-scripts", "no"),
+            ("osc", "no"),
+            ("load-stats-overlay", "no"),
+            ("load-osd-console", "no"),
+            ("load-auto-profiles", "no"),
+            ("load-select", "no"),
+            ("load-positioning", "no"),
+            ("load-commands", "no"),
+            ("load-context-menu", "no"),
+            // (no nested archives or playlists inside it)
+            ("directory-filter-types", "video,audio,image"),
+        ] {
+            let _ = init.set_property(k, v);
+        }
+        Ok(())
+    })
+    .ok()?;
+    mpv.command("loadfile", &[archive]).ok()?;
+    // Opening an archive turns it into a list of what's in it, and that
+    // "file" ends. (A big RAR on an old hard drive can take a few seconds.)
+    // (An error instead: it didn't open as an archive.)
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        let left = until.saturating_duration_since(std::time::Instant::now()).as_secs_f64();
+        if left <= 0.0 {
+            return None;
+        }
+        match mpv.wait_event(left.min(0.5)) {
+            Some(Ok(libmpv2::events::Event::EndFile(_))) => break,
+            Some(Err(_)) | Some(Ok(libmpv2::events::Event::Shutdown)) => return None,
+            _ => {}
+        }
+    }
+    let count = mpv.get_property::<i64>("playlist-count").unwrap_or(0);
+    Some(
+        (0..count.min(100_000))
+            .filter_map(|i| mpv.get_property::<String>(&format!("playlist/{i}/filename")).ok())
+            .filter(|f| is_archive_entry(f))
+            .collect(),
+    )
+}
+
+/// What there is to play in an archive (reads it: run it on another thread)
+pub(crate) fn archive_media(archive: &str) -> Inside {
+    let Some(entries) = archive_entries(archive) else { return Inside::Unreadable };
+    let of = |k: MediaKind| entries.iter().filter(|e| media_kind(e) == Some(k)).count();
+    let (v, m, i) = (of(MediaKind::Video), of(MediaKind::Music), of(MediaKind::Image));
+    let kind = if v == 0 && m == 0 && i == 0 {
+        return Inside::Nothing;
+    } else if v >= m && v >= i {
+        MediaKind::Video
+    } else if m >= i {
+        MediaKind::Music
+    } else {
+        MediaKind::Image
+    };
+    let mut files: Vec<String> = entries.into_iter().filter(|e| media_kind(e) == Some(kind)).collect();
+    // (in the same order as a folder's files)
+    files.sort_by(|a, b| natural_cmp(inside_of(a), inside_of(b)));
+    Inside::Media(files)
+}
+
+/// A file Explorer copied out of a zip it shows (double-clicked, or dragged
+/// out) to the temporary folder, "…\Temp\Temp1_Videos.zip\Season 1\Ep 2.mkv":
+/// the zip's name ("Videos.zip") and the path inside it ("Season 1\Ep 2.mkv")
+pub(crate) fn explorer_zip_copy(path: &str) -> Option<(String, String)> {
+    let parts: Vec<&str> = path.split('\\').collect();
+    let temp = std::env::temp_dir().to_string_lossy().trim_end_matches('\\').to_lowercase();
+    for i in 1..parts.len().saturating_sub(1) {
+        // "Temp1_Videos.zip" (Temp, a number, _, the zip's name), in the temporary
+        // folder (…\Temp, or wherever TEMP points)
+        let folder = parts[i];
+        let Some(after) = folder.get(..4).filter(|t| t.eq_ignore_ascii_case("temp")).map(|_| &folder[4..]) else { continue };
+        let digits = after.chars().take_while(|c| c.is_ascii_digit()).count();
+        let Some(zip) = after[digits..].strip_prefix('_').filter(|z| digits > 0 && has_ext(z, &["zip"])) else { continue };
+        let in_temp = parts[i - 1].eq_ignore_ascii_case("temp") || parts[..i].join("\\").to_lowercase() == temp;
+        if in_temp {
+            return Some((zip.to_owned(), parts[i + 1..].join("\\")));
+        }
+    }
+    None
+}
+
+/// The same file name, give or take letter case, from Explorer and from mpv
+/// (whose names show "?" for letters it couldn't convert)
+fn same_name(explorer: &str, mpv: &str) -> bool {
+    let a: Vec<char> = explorer.chars().flat_map(char::to_lowercase).collect();
+    let b: Vec<char> = mpv.chars().flat_map(char::to_lowercase).collect();
+    a == b || (a.len() == b.len() && a.iter().zip(&b).all(|(x, y)| x == y || *y == '?'))
+}
+
+/// A file Explorer copied out of a zip (see `explorer_zip_copy`) and the
+/// rest of that folder of the zip, as a playlist: the files of the same kind,
+/// in the order the Explorer window shows them, the copy itself (which plays
+/// at once, and seeks fastest) in its place among them. None if the zip or
+/// its Explorer window can't be found. (Asks Explorer and reads the zip: run
+/// it on another thread.)
+pub(crate) fn explorer_zip_playlist(copy: &str) -> Option<(String, Vec<String>, usize)> {
+    let (zip, inside) = explorer_zip_copy(copy)?;
+    let shown = format!("{zip}\\{inside}");
+    let items = taskbar::explorer_zip_folder(shown.clone())?;
+    // "C:\Downloads\Videos.zip\Season 1\Ep 2.mkv" → the zip, "C:\Downloads\Videos.zip"
+    let want = format!("\\{shown}");
+    let ends = |s: &str| {
+        let n = want.chars().count();
+        let tail: String = s.chars().skip(s.chars().count().saturating_sub(n)).collect();
+        s.chars().count() > n && same_name(&want, &tail)
+    };
+    let clicked = items.iter().find(|s| ends(s))?;
+    let keep = clicked.chars().count() - inside.chars().count() - 1;
+    let archive: String = clicked.chars().take(keep).collect();
+    if !Path::new(&archive).is_file() {
+        return None;
+    }
+    let kind = media_kind(copy)?;
+    let listed = archive_entries(&archive)?;
+    let mut files = Vec::new();
+    let mut at = None;
+    for item in &items {
+        // (only what's in that zip's folder: its path inside the zip, / between folders)
+        if item.chars().count() <= keep + 1 || media_kind(item) != Some(kind) {
+            continue;
+        }
+        let rel: String = item.chars().skip(keep + 1).collect::<String>().replace('\\', "/");
+        if item == clicked {
+            at = Some(files.len());
+            files.push(copy.to_owned());
+        } else if let Some(e) = listed.iter().find(|e| same_name(&rel, inside_of(e))) {
+            files.push(e.clone());
+        }
+    }
+    let at = at?;
+    (files.len() > 1).then_some((zip, files, at))
+}

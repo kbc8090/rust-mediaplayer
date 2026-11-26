@@ -1240,12 +1240,38 @@ enum DropIcon {
     Unknown,
 }
 
-fn drop_preview(paths: &[String]) -> Option<DropPreview> {
+/// (`inside`: what's in it, when it's one archive)
+fn drop_preview(paths: &[String], inside: Option<&Inside>) -> Option<DropPreview> {
     if paths.is_empty() {
         return None;
     }
     let ext = |p: &str| Path::new(p).extension().map(|e| e.to_string_lossy().to_uppercase()).unwrap_or_default();
     let name = |p: &str| Path::new(p).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    // An archive: what's in it ("ZIP" while it's being looked into)
+    if let (Some(inside), [archive]) = (inside, paths) {
+        let (big, detail) = (ext(archive), name(archive));
+        return Some(match inside {
+            Inside::Looking => DropPreview { icon: DropIcon::Playlist, big, detail, action: "Looking inside\u{2026}", playable: true },
+            Inside::Media(files) if files.len() == 1 => {
+                let icon = match media_kind(&files[0]) {
+                    Some(MediaKind::Music) => DropIcon::Music,
+                    Some(MediaKind::Image) => DropIcon::Picture,
+                    _ => DropIcon::Video,
+                };
+                DropPreview { icon, big: ext(&files[0]), detail: name(&files[0]), action: "Drop to play", playable: true }
+            }
+            Inside::Media(files) => {
+                let noun = match media_kind(&files[0]) {
+                    Some(MediaKind::Music) => "SONGS",
+                    Some(MediaKind::Image) => "PICTURES",
+                    _ => "VIDEOS",
+                };
+                DropPreview { icon: DropIcon::Playlist, big: format!("{} {noun}", files.len()), detail, action: "Drop to play as a playlist", playable: true }
+            }
+            Inside::Nothing => DropPreview { icon: DropIcon::Unknown, big, detail, action: "Nothing to play inside", playable: false },
+            Inside::Unreadable => DropPreview { icon: DropIcon::Unknown, big, detail, action: "Can't open this archive", playable: false },
+        });
+    }
     let media: Vec<&String> = paths.iter().filter(|p| is_media_file(p)).collect();
     // One thing to play: that file (or a playlist file on its own)
     let single = match (paths.len(), media.len()) {
@@ -1390,7 +1416,11 @@ pub(crate) fn draw_drop_overlay(app: &mut FluentMediaPlayer, ctx: &egui::Context
         app.drop_seen = None;
         return;
     }
-    if let Some(d) = drop_preview(&paths) {
+    let inside = match paths.as_slice() {
+        [p] if is_archive_file(p) => Some(app.peek_archive(p)),
+        _ => None,
+    };
+    if let Some(d) = drop_preview(&paths, inside.as_ref()) {
         paint_drop(ctx, app.accent, &d, None);
         app.drop_seen = Some(d);
         return;

@@ -317,6 +317,16 @@ const VOL_MAX: f64 = 130.0;
 /// A background folder scan's result, shared with its thread: (scan number, files)
 type ScanResult = Arc<Mutex<Option<(u64, Vec<PathBuf>)>>>;
 
+/// A file Explorer copied out of a zip, and that folder of the zip as a
+/// playlist (see `files::explorer_zip_playlist`)
+struct ZipFound {
+    gen: u64,
+    copy: String,
+    zip: String,
+    files: Vec<String>,
+    at: usize,
+}
+
 struct FluentMediaPlayer {
     /// Only used (briefly, at startup) to create the render context; everything
     /// else goes through `link`, which talks to mpv on its own thread
@@ -546,6 +556,15 @@ struct FluentMediaPlayer {
     /// Background folder scan: its number, and its result (number, files)
     scan_gen: u64,
     scan_result: ScanResult,
+    /// Archives (.zip / .rar / .7z) being read on another thread, numbered so
+    /// that only the latest one opened counts: one being opened (its number,
+    /// path, contents); one being dragged over the window (path, contents); a
+    /// file Explorer copied out of a zip, with that folder of the zip as a
+    /// playlist (number, the copy, the zip's name, files, where the copy is)
+    archive_gen: u64,
+    archive_result: Arc<Mutex<Option<(u64, String, Inside)>>>,
+    pub(crate) archive_peek: Arc<Mutex<Option<(String, Inside)>>>,
+    zip_found: Arc<Mutex<Option<ZipFound>>>,
     egui_ctx: egui::Context,
     /// Order of previous / next in a folder
     sort_by: SortBy,
@@ -845,6 +864,10 @@ impl FluentMediaPlayer {
             last_tick: std::time::Instant::now(),
             scan_gen: 0,
             scan_result: Arc::new(Mutex::new(None)),
+            archive_gen: 0,
+            archive_result: Arc::new(Mutex::new(None)),
+            archive_peek: Arc::new(Mutex::new(None)),
+            zip_found: Arc::new(Mutex::new(None)),
             egui_ctx: cc.egui_ctx.clone(),
             sort_by: st.sort_by,
             sort_desc: st.sort_desc,
@@ -893,6 +916,8 @@ impl FluentMediaPlayer {
         } else if is_playlist_file(path) {
             let entries = read_playlist(Path::new(path));
             self.start_playlist(PathBuf::from(path), entries, false);
+        } else if is_archive_file(path) {
+            self.open_archive(path);
         } else {
             self.playlist = None;
             self.playlist_rows.clear();
@@ -905,13 +930,103 @@ impl FluentMediaPlayer {
             self.folder_index = Some(0);
             self.start_folder_scan(path);
             self.load_entry(path);
+            // A file Explorer copied out of a zip (double-clicked in it): it plays
+            // at once, and previous / next go through the rest of that folder of
+            // the zip as soon as it's been found (Explorer is asked which zip)
+            if explorer_zip_copy(path).is_some() {
+                let (gen, slot, ctx, copy) = (self.archive_gen, self.zip_found.clone(), self.egui_ctx.clone(), path.to_owned());
+                let _ = std::thread::Builder::new().name("zip".into()).spawn(move || {
+                    if let Some((zip, files, at)) = explorer_zip_playlist(&copy) {
+                        if let Ok(mut s) = slot.lock() {
+                            *s = Some(ZipFound { gen, copy, zip, files, at });
+                        }
+                        ctx.request_repaint();
+                    }
+                });
+            }
         }
+    }
+
+    /// Open an archive: what's in it plays as a playlist (one file: just that)
+    fn open_archive(&mut self, path: &str) {
+        // (looked inside already, while it was dragged over the window; read
+        // again next time, in case it changes)
+        let peeked = self.archive_peek.lock().ok().and_then(|mut s| s.take()).filter(|(p, _)| p == path).map(|(_, i)| i);
+        if let Some(inside) = peeked.filter(|i| *i != Inside::Looking) {
+            self.archive_opened(path, inside);
+            return;
+        }
+        self.archive_gen += 1;
+        let (gen, slot, ctx, path) = (self.archive_gen, self.archive_result.clone(), self.egui_ctx.clone(), path.to_owned());
+        let _ = std::thread::Builder::new().name("archive".into()).spawn(move || {
+            let inside = archive_media(&path);
+            if let Ok(mut s) = slot.lock() {
+                *s = Some((gen, path, inside));
+            }
+            ctx.request_repaint();
+        });
+    }
+
+    fn archive_opened(&mut self, path: &str, inside: Inside) {
+        match inside {
+            Inside::Media(files) if files.len() > 1 => {
+                let entries = files.into_iter().map(|f| PlaylistEntry { path: PathBuf::from(f), title: None, secs: None }).collect();
+                self.start_playlist(PathBuf::from(path), entries, false);
+            }
+            Inside::Media(files) if !files.is_empty() => {
+                self.playlist = None;
+                self.playlist_rows.clear();
+                self.play_order.clear();
+                self.adjust_ui.playlist_open = false;
+                self.scan_gen += 1;
+                self.folder_files = vec![PathBuf::from(&files[0])];
+                self.folder_index = Some(0);
+                self.load_entry(&files[0]);
+            }
+            Inside::Looking => {}
+            other => {
+                let detail = if other == Inside::Nothing {
+                    "There's nothing in it that the player plays."
+                } else {
+                    "It couldn't be read. It may be damaged or password-protected."
+                };
+                self.link_error = Some((std::time::Instant::now(), "Couldn't play this archive", detail.to_owned()));
+            }
+        }
+    }
+
+    /// What's in an archive being dragged over the window: read on another
+    /// thread the first time it's asked, Looking until then
+    pub(crate) fn peek_archive(&mut self, path: &str) -> Inside {
+        let Ok(mut slot) = self.archive_peek.lock() else { return Inside::Looking };
+        if let Some((p, inside)) = slot.as_ref() {
+            if p == path {
+                return inside.clone();
+            }
+        }
+        *slot = Some((path.to_owned(), Inside::Looking));
+        let (peek, ctx, path) = (self.archive_peek.clone(), self.egui_ctx.clone(), path.to_owned());
+        let _ = std::thread::Builder::new().name("archive peek".into()).spawn(move || {
+            let inside = archive_media(&path);
+            if let Ok(mut s) = peek.lock() {
+                if s.as_ref().is_some_and(|(p, _)| *p == path) {
+                    *s = Some((path, inside));
+                }
+            }
+            ctx.request_repaint();
+        });
+        Inside::Looking
     }
 
     /// Play a playlist (an .m3u's entries, or files dropped together) from its start
     /// (`selected`: files dropped together, which can be shuffled)
     fn start_playlist(&mut self, name: PathBuf, entries: Vec<PlaylistEntry>, selected: bool) {
-        let Some(first) = entries.first().map(|e| e.path.to_string_lossy().into_owned()) else { return };
+        self.start_playlist_at(name, entries, selected, 0);
+    }
+
+    /// The same, from its entry `at`
+    fn start_playlist_at(&mut self, name: PathBuf, entries: Vec<PlaylistEntry>, selected: bool, at: usize) {
+        let Some(first) = entries.get(at).map(|e| e.path.to_string_lossy().into_owned()) else { return };
         self.playlist = Some(name);
         self.playlist_selected = selected;
         self.playlist_shuffle = false;
@@ -924,7 +1039,7 @@ impl FluentMediaPlayer {
         let playing_it = self.has_file && self.current_file == first;
         self.start_playlist_rows(&entries);
         self.folder_files = entries.into_iter().map(|e| e.path).collect();
-        self.folder_index = Some(0);
+        self.folder_index = Some(at);
         if !playing_it {
             self.load_entry(&first);
         }
@@ -954,7 +1069,8 @@ impl FluentMediaPlayer {
                 if live.load(Ordering::SeqCst) != gen {
                     return; // (another playlist was opened)
                 }
-                if is_url(p) {
+                // (links, and files inside an archive: mpv reads them, not this)
+                if is_url(p) || is_archive_entry(p) {
                     continue;
                 }
                 let visualizer::SongInfo { title, secs, .. } = visualizer::song_info(p);
@@ -994,6 +1110,7 @@ impl FluentMediaPlayer {
 
     /// Start playing `path` (keeps the current previous / next list)
     fn load_entry(&mut self, path: &str) {
+        self.archive_gen += 1; // (an archive still being read for another file: not wanted now)
         self.current_file = path.to_owned();
         self.has_file = true;
         self.media_title.clear();
@@ -1054,7 +1171,7 @@ impl FluentMediaPlayer {
         self.heatmap = None;
         self.live = false;
         self.video_kind = VideoKind::Unknown;
-        if media_kind(path) == Some(MediaKind::Music) && !is_url(path) {
+        if media_kind(path) == Some(MediaKind::Music) && !is_url(path) && !is_archive_entry(path) {
             let (slot, p, ctx) = (self.song_info.clone(), path.to_owned(), self.egui_ctx.clone());
             let _ = std::thread::Builder::new().name("song info".into()).spawn(move || {
                 let info = visualizer::song_info(&p);
@@ -1146,7 +1263,7 @@ impl FluentMediaPlayer {
     fn set_sort(&mut self, by: SortBy, desc: bool) {
         self.sort_by = by;
         self.sort_desc = desc;
-        if self.playlist.is_none() && self.has_file && !is_url(&self.current_file) {
+        if self.playlist.is_none() && self.has_file && !is_url(&self.current_file) && !is_archive_entry(&self.current_file) {
             let current = self.current_file.clone();
             self.start_folder_scan(&current);
         }
@@ -1345,7 +1462,9 @@ impl FluentMediaPlayer {
 
     /// Windows' "Open" dialog, starting in the current video's folder
     fn show_open_dialog(&mut self) {
-        let dir = Path::new(&self.current_file)
+        // (a file inside an archive: the archive's folder)
+        let file = archive_of(&self.current_file).unwrap_or_else(|| self.current_file.clone());
+        let dir = Path::new(&file)
             .parent()
             .map(|d| d.to_string_lossy().into_owned())
             .filter(|d| !d.is_empty() && !is_url(&self.current_file));
@@ -1937,6 +2056,24 @@ impl eframe::App for FluentMediaPlayer {
                 }
             }
         });
+        // ── Archives read in the background ───────────────────────────────────
+        let opened = self.archive_result.lock().ok().and_then(|mut s| s.take());
+        if let Some((gen, path, inside)) = opened {
+            if gen == self.archive_gen {
+                self.archive_opened(&path, inside);
+            }
+        }
+        let zip = self.zip_found.lock().ok().and_then(|mut s| s.take());
+        if let Some(z) = zip {
+            // (still on the file Explorer copied out, and nothing else opened since)
+            if z.gen == self.archive_gen && self.current_file == z.copy && self.playlist.is_none() {
+                let entries = z.files.into_iter().map(|f| PlaylistEntry { path: PathBuf::from(f), title: None, secs: None }).collect();
+                self.start_playlist_at(PathBuf::from(z.zip), entries, false, z.at);
+                // (like a folder: the list stays closed until asked for)
+                self.adjust_ui.playlist_open = false;
+            }
+        }
+
         // ── Folder list from the background scan ──────────────────────────────
         let scanned = self.scan_result.lock().ok().and_then(|mut s| s.take());
         if let Some((gen, files)) = scanned {
@@ -2519,7 +2656,7 @@ impl eframe::App for FluentMediaPlayer {
             self.start_playlist(PathBuf::from("Dropped files"), entries, true);
         } else {
             for s in &inp.dropped {
-                if is_media_file(s) || is_playlist_file(s) { self.open_file(s); }
+                if is_media_file(s) || is_playlist_file(s) || is_archive_file(s) { self.open_file(s); }
             }
         }
         if inp.space { self.toggle_play_pause(); }

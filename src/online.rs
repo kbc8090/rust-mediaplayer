@@ -1341,7 +1341,7 @@ impl FluentMediaPlayer {
 
     /// Save clip as…: start setting up a clip, from the playhead
     pub(crate) fn start_clip(&mut self) {
-        if self.has_file && self.duration > 1.0 && !self.live && self.clip.is_none() {
+        if self.has_file && self.duration > 1.0 && !self.live && self.clip.is_none() && !is_archive_entry(&self.current_file) {
             self.clip = Some(ClipUi::new(self.time_pos, self.duration));
             self.main_menu = false;
         }

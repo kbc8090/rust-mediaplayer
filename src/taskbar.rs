@@ -842,11 +842,12 @@ unsafe fn run_open_dialog(owner: isize, initial_dir: Option<String>) -> Vec<Stri
         "Media files\0",
         "*.mp4;*.mkv;*.avi;*.mov;*.wmv;*.flv;*.webm;*.m4v;*.ts;*.m2ts;*.mts;*.mpg;*.mpeg;*.3gp;*.ogv;",
         "*.mp3;*.flac;*.wav;*.m4a;*.aac;*.ogg;*.oga;*.opus;*.wma;*.alac;*.aiff;*.aif;*.ape;*.wv;*.mka;",
-        "*.jpg;*.jpeg;*.png;*.gif;*.webp;*.avif;*.bmp;*.tif;*.tiff;*.jxl;*.m3u;*.m3u8\0",
+        "*.jpg;*.jpeg;*.png;*.gif;*.webp;*.avif;*.bmp;*.tif;*.tiff;*.jxl;*.m3u;*.m3u8;*.zip;*.rar;*.7z\0",
         "Video\0*.mp4;*.mkv;*.avi;*.mov;*.wmv;*.flv;*.webm;*.m4v;*.ts;*.m2ts;*.mts;*.mpg;*.mpeg;*.3gp;*.ogv\0",
         "Music\0*.mp3;*.flac;*.wav;*.m4a;*.aac;*.ogg;*.oga;*.opus;*.wma;*.alac;*.aiff;*.aif;*.ape;*.wv;*.mka\0",
         "Pictures\0*.jpg;*.jpeg;*.png;*.gif;*.webp;*.avif;*.bmp;*.tif;*.tiff;*.jxl\0",
         "Playlists\0*.m3u;*.m3u8\0",
+        "Archives\0*.zip;*.rar;*.7z\0",
         "All files\0*.*\0\0"
     )
         .encode_utf16()
@@ -1539,7 +1540,11 @@ const IID_ISHELL_ITEM_ARRAY: Guid = Guid { data1: 0xB63E_A76D, data2: 0x1F85, da
 // QueryActiveShellView 15; IFolderView Items 8; IShellItemArray GetCount 7,
 // GetItemAt 8
 const SVGIO_SELECTION: u32 = 0x1;
+const SVGIO_ALLVIEW: u32 = 0x2;
 const SVGIO_FLAG_VIEWORDER: u32 = 0x8000_0000;
+/// An item's full path as Explorer parses it: for a file inside a zip,
+/// "C:\…\Videos.zip\Season 1\Ep 2.mkv" (it has no file-system path)
+const SIGDN_DESKTOPABSOLUTEPARSING: u32 = 0x8002_8000;
 
 /// A COM object that's released when dropped
 struct Com(*mut c_void);
@@ -1623,7 +1628,7 @@ unsafe fn explorer_selection(wanted: &[String]) -> Option<Vec<String>> {
             continue;
         }
         let Some(window) = Com::new(out) else { continue };
-        if let Some(selection) = window_selection(&window) {
+        if let Some(selection) = window_items(&window, SVGIO_SELECTION, SIGDN_FILESYSPATH) {
             let lower: Vec<String> = selection.iter().map(|s| s.to_lowercase()).collect();
             if wanted.iter().all(|w| lower.contains(w)) {
                 return Some(selection);
@@ -1633,8 +1638,57 @@ unsafe fn explorer_selection(wanted: &[String]) -> Option<Vec<String>> {
     None
 }
 
-/// One Explorer window's selected items, in the order it shows them
-unsafe fn window_selection(window: &Com) -> Option<Vec<String>> {
+/// A file Explorer copied out of a zip it shows: the full paths of everything
+/// in that folder of the zip, in the order the window shows them, such as
+/// "C:\…\Videos.zip\Season 1\Ep 1.mkv". `shown`: the file as
+/// "Videos.zip\Season 1\Ep 2.mkv" (that window has it selected). None if no
+/// open window shows it.
+pub fn explorer_zip_folder(shown: String) -> Option<Vec<String>> {
+    let tail = format!("\\{}", shown.to_lowercase());
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let items = unsafe {
+            CoInitializeEx(std::ptr::null_mut(), 0x0 /* COINIT_MULTITHREADED */);
+            let items = explorer_zip(&tail);
+            CoUninitialize();
+            items
+        };
+        let _ = tx.send(items);
+    });
+    rx.recv_timeout(Duration::from_millis(1500)).ok().flatten()
+}
+
+unsafe fn explorer_zip(tail: &str) -> Option<Vec<String>> {
+    let mut out = std::ptr::null_mut();
+    if CoCreateInstance(&CLSID_SHELL_WINDOWS, std::ptr::null_mut(), 0x17 /* CLSCTX_ALL */, &IID_ISHELL_WINDOWS, &mut out) < 0 {
+        return None;
+    }
+    let windows = Com::new(out)?;
+    let get_count: unsafe extern "system" fn(*mut c_void, *mut i32) -> i32 = std::mem::transmute(method(windows.0, 7));
+    let item: unsafe extern "system" fn(*mut c_void, VariantI4, *mut *mut c_void) -> i32 = std::mem::transmute(method(windows.0, 8));
+    let mut count = 0;
+    if get_count(windows.0, &mut count) < 0 {
+        return None;
+    }
+    for i in 0..count.min(64) {
+        let mut out = std::ptr::null_mut();
+        let index = VariantI4 { vt: 3 /* VT_I4 */, reserved: [0; 3], value: i as i64, rest: 0 };
+        if item(windows.0, index, &mut out) < 0 {
+            continue;
+        }
+        let Some(window) = Com::new(out) else { continue };
+        let Some(selection) = window_items(&window, SVGIO_SELECTION, SIGDN_DESKTOPABSOLUTEPARSING) else { continue };
+        if selection.iter().any(|s| s.to_lowercase().ends_with(tail)) {
+            return window_items(&window, SVGIO_ALLVIEW, SIGDN_DESKTOPABSOLUTEPARSING);
+        }
+    }
+    None
+}
+
+/// One Explorer window's items (`which`: the selected ones, or all), in the
+/// order it shows them, as `name_kind` (a file-system path, or Explorer's
+/// own full path)
+unsafe fn window_items(window: &Com, which: u32, name_kind: u32) -> Option<Vec<String>> {
     let services = window.query(&IID_ISERVICE_PROVIDER)?;
     let query_service: unsafe extern "system" fn(*mut c_void, *const Guid, *const Guid, *mut *mut c_void) -> i32 =
         std::mem::transmute(method(services.0, 3));
@@ -1652,7 +1706,7 @@ unsafe fn window_selection(window: &Com) -> Option<Vec<String>> {
     let folder_view = view.query(&IID_IFOLDER_VIEW)?;
     let items: unsafe extern "system" fn(*mut c_void, u32, *const Guid, *mut *mut c_void) -> i32 = std::mem::transmute(method(folder_view.0, 8));
     let mut out = std::ptr::null_mut();
-    if items(folder_view.0, SVGIO_SELECTION | SVGIO_FLAG_VIEWORDER, &IID_ISHELL_ITEM_ARRAY, &mut out) < 0 {
+    if items(folder_view.0, which | SVGIO_FLAG_VIEWORDER, &IID_ISHELL_ITEM_ARRAY, &mut out) < 0 {
         return None; // (nothing selected)
     }
     let array = Com::new(out)?;
@@ -1671,7 +1725,7 @@ unsafe fn window_selection(window: &Com) -> Option<Vec<String>> {
         let Some(item) = Com::new(out) else { continue };
         let display_name: unsafe extern "system" fn(*mut c_void, u32, *mut *mut u16) -> i32 = std::mem::transmute(method(item.0, VT_GET_DISPLAY_NAME));
         let mut name: *mut u16 = std::ptr::null_mut();
-        if display_name(item.0, SIGDN_FILESYSPATH, &mut name) >= 0 && !name.is_null() {
+        if display_name(item.0, name_kind, &mut name) >= 0 && !name.is_null() {
             let mut n = 0;
             while n < 32768 && *name.add(n) != 0 {
                 n += 1;
