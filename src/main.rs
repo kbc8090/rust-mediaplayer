@@ -2586,6 +2586,8 @@ impl FluentMediaPlayer {
         let restarts = mpv_link::PLAYBACK_RESTARTS.load(std::sync::atomic::Ordering::Relaxed);
         self.link.command("loadfile", &[&path, "replace", "-1", PICTURE_OPTIONS]);
         self.preload = Some(Preload { path, delta, source, restarts });
+        // (this frame too: the picture was already set to be drawn from mpv)
+        PIC_FRAME.with(|p| p.set(PicFrame::Keep));
     }
 
     /// Whether the button `source` has a picture opening ahead (see step_press)

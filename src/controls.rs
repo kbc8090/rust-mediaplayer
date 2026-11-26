@@ -1824,7 +1824,9 @@ pub(crate) fn draw_picture_arrows(app: &mut FluentMediaPlayer, ctx: &egui::Conte
             r = r.translate(vec2(0.0, tab.bottom() + 8.0 - r.top()));
         }
         egui::Area::new(id).order(egui::Order::Foreground).fixed_pos(r.min).show(ctx, |ui| {
-            let resp = ui.interact(r, id.with("hit"), Sense::click());
+            // (a drag that starts on it is its own: not passed on to the picture
+            // underneath, which would move it or the window)
+            let resp = ui.interact(r, id.with("hit"), Sense::click_and_drag());
             let hot = resp.hovered();
             let a = ctx.animate_bool_with_time(id, hot, 0.12);
             if hot {
