@@ -936,11 +936,11 @@ impl FluentMediaPlayer {
             // A file Explorer copied out of a zip (double-clicked in it): it plays
             // at once, and previous / next go through the rest of that folder of
             // the zip as soon as it's been found (Explorer is asked which zip)
-            let zip_copy = explorer_zip_copy(path);
+            let zip_copy = temp_copy_name(path);
             if let Ok(mut s) = self.zip_status.lock() {
                 *s = Some(match &zip_copy {
-                    Some((zip, inside)) => format!("copy from {zip} ({inside}), looking\u{2026}"),
-                    None => format!("not a copy from a zip: {path}"),
+                    Some(_) => "in the temporary folder, asking Explorer\u{2026}".to_owned(),
+                    None => format!("not in the temporary folder: {}", path_shape(path)),
                 });
             }
             if zip_copy.is_some() {
@@ -951,7 +951,7 @@ impl FluentMediaPlayer {
                     let found = explorer_zip_playlist(&copy);
                     if let Ok(mut s) = status.lock() {
                         *s = Some(match &found {
-                            Ok((zip, files, at)) => format!("found {zip}: {} files, this is #{} ({} ms)", files.len(), at + 1, t0.elapsed().as_millis()),
+                            Ok((zip, files, at)) => format!("found {}: {} files, this is #{} ({} ms)", path_shape(zip), files.len(), at + 1, t0.elapsed().as_millis()),
                             Err(why) => format!("{why} ({} ms)", t0.elapsed().as_millis()),
                         });
                     }

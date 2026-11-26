@@ -1638,18 +1638,18 @@ unsafe fn explorer_selection(wanted: &[String]) -> Option<Vec<String>> {
     None
 }
 
-/// A file Explorer copied out of a zip it shows: the full paths of everything
-/// in that folder of the zip, in the order the window shows them, such as
-/// "C:\…\Videos.zip\Season 1\Ep 1.mkv". `shown`: the file as
-/// "Videos.zip\Season 1\Ep 2.mkv" (that window has it selected). None if no
-/// open window shows it (what it found instead, for the Tab overlay).
-pub fn explorer_zip_folder(shown: String) -> Result<Vec<String>, String> {
-    let tail = format!("\\{}", shown.to_lowercase());
+/// A file Explorer copied out of a zip it shows: the file as that window has
+/// it selected, and everything in that folder of the zip, in the order the
+/// window shows them, as full paths such as "C:\…\Videos.zip\Season 1\Ep 1.mkv".
+/// `name`: the file's name ("Ep 2.mkv"; the window's selected file of that
+/// name inside a zip). Err: what was found instead (for the Tab overlay).
+pub fn explorer_zip_folder(name: String) -> Result<(String, Vec<String>), String> {
+    let (inside, tail) = (".zip\\".to_owned(), format!("\\{}", name.to_lowercase()));
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let items = unsafe {
             CoInitializeEx(std::ptr::null_mut(), 0x0 /* COINIT_MULTITHREADED */);
-            let items = explorer_zip(&tail);
+            let items = explorer_zip(&inside, &tail);
             CoUninitialize();
             items
         };
@@ -1658,7 +1658,7 @@ pub fn explorer_zip_folder(shown: String) -> Result<Vec<String>, String> {
     rx.recv_timeout(Duration::from_millis(1500)).unwrap_or_else(|_| Err("Explorer didn't answer in time".to_owned()))
 }
 
-unsafe fn explorer_zip(tail: &str) -> Result<Vec<String>, String> {
+unsafe fn explorer_zip(inside: &str, tail: &str) -> Result<(String, Vec<String>), String> {
     let mut out = std::ptr::null_mut();
     if CoCreateInstance(&CLSID_SHELL_WINDOWS, std::ptr::null_mut(), 0x17 /* CLSCTX_ALL */, &IID_ISHELL_WINDOWS, &mut out) < 0 {
         return Err("couldn't ask Explorer for its windows".to_owned());
@@ -1683,10 +1683,15 @@ unsafe fn explorer_zip(tail: &str) -> Result<Vec<String>, String> {
             seen.push("(a window with nothing selected)".to_owned());
             continue;
         };
-        if selection.iter().any(|s| s.to_lowercase().ends_with(tail)) {
-            return window_items(&window, SVGIO_ALLVIEW, SIGDN_DESKTOPABSOLUTEPARSING).ok_or_else(|| "couldn't list that window's files".to_owned());
+        let picked = selection.iter().find(|s| {
+            let s = s.to_lowercase();
+            s.contains(inside) && s.ends_with(tail)
+        });
+        if let Some(picked) = picked {
+            let all = window_items(&window, SVGIO_ALLVIEW, SIGDN_DESKTOPABSOLUTEPARSING).ok_or("couldn't list that window's files")?;
+            return Ok((picked.clone(), all));
         }
-        seen.push(selection.first().cloned().unwrap_or_else(|| "(a selection without paths)".to_owned()));
+        seen.push(selection.first().map_or_else(|| "(a selection without paths)".to_owned(), |s| crate::files::path_shape(s)));
     }
     Err(format!("{count} Explorer windows, none with it selected; they had: {}", seen.join(" | ")))
 }

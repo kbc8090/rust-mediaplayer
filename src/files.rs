@@ -369,25 +369,30 @@ pub(crate) fn archive_media(archive: &str) -> Inside {
     Inside::Media(files)
 }
 
-/// A file Explorer copied out of a zip it shows (double-clicked, or dragged
-/// out) to the temporary folder, "…\Temp\Temp1_Videos.zip\Season 1\Ep 2.mkv":
-/// the zip's name ("Videos.zip") and the path inside it ("Season 1\Ep 2.mkv")
-pub(crate) fn explorer_zip_copy(path: &str) -> Option<(String, String)> {
-    let parts: Vec<&str> = path.split('\\').collect();
+/// A file in the temporary folder (where Explorer copies a file out of a zip
+/// it shows, when it's double-clicked or dragged out): its name there
+pub(crate) fn temp_copy_name(path: &str) -> Option<String> {
     let temp = std::env::temp_dir().to_string_lossy().trim_end_matches('\\').to_lowercase();
-    for i in 1..parts.len().saturating_sub(1) {
-        // "Temp1_Videos.zip" (Temp, a number, _, the zip's name), in the temporary
-        // folder (…\Temp, or wherever TEMP points)
-        let folder = parts[i];
-        let Some(after) = folder.get(..4).filter(|t| t.eq_ignore_ascii_case("temp")).map(|_| &folder[4..]) else { continue };
-        let digits = after.chars().take_while(|c| c.is_ascii_digit()).count();
-        let Some(zip) = after[digits..].strip_prefix('_').filter(|z| digits > 0 && has_ext(z, &["zip"])) else { continue };
-        let in_temp = parts[i - 1].eq_ignore_ascii_case("temp") || parts[..i].join("\\").to_lowercase() == temp;
-        if in_temp {
-            return Some((zip.to_owned(), parts[i + 1..].join("\\")));
-        }
-    }
-    None
+    let lower = path.to_lowercase();
+    // (TEMP itself, or any …\Temp\ folder: the path may be the short 8.3 form)
+    let in_temp = lower.strip_prefix(&temp).is_some_and(|r| r.starts_with('\\')) || lower.contains("\\temp\\");
+    let name = path.rsplit('\\').next().filter(|n| !n.is_empty())?;
+    in_temp.then(|| name.to_owned())
+}
+
+/// The path with every letter shown as x and every digit as 9 (for the Tab
+/// overlay while testing: its shape, without the names)
+pub(crate) fn path_shape(path: &str) -> String {
+    let temp = std::env::temp_dir().to_string_lossy().trim_end_matches('\\').to_owned();
+    let (head, rest) = match path.get(..temp.len()) {
+        Some(h) if h.eq_ignore_ascii_case(&temp) => ("%TEMP%", &path[temp.len()..]),
+        _ => ("", path),
+    };
+    let rest: String = rest
+        .chars()
+        .map(|c| if c.is_alphabetic() { 'x' } else if c.is_numeric() { '9' } else { c })
+        .collect();
+    format!("{head}{rest}")
 }
 
 /// The same file name, give or take letter case, from Explorer and from mpv
@@ -398,31 +403,28 @@ fn same_name(explorer: &str, mpv: &str) -> bool {
     a == b || (a.len() == b.len() && a.iter().zip(&b).all(|(x, y)| x == y || *y == '?'))
 }
 
-/// A file Explorer copied out of a zip (see `explorer_zip_copy`) and the
-/// rest of that folder of the zip, as a playlist: the files of the same kind,
-/// in the order the Explorer window shows them, the copy itself (which plays
-/// at once, and seeks fastest) in its place among them. Err: why the zip or
-/// its Explorer window couldn't be found (shown in the Tab overlay). (Asks
+/// A file Explorer copied out of a zip (see `temp_copy_name`) and the rest
+/// of that folder of the zip, as a playlist: the files of the same kind, in
+/// the order the Explorer window shows them, the copy itself (which plays at
+/// once, and seeks fastest) in its place among them. Err: why the zip or its
+/// Explorer window couldn't be found (shown in the Tab overlay). (Asks
 /// Explorer and reads the zip: run it on another thread.)
 pub(crate) fn explorer_zip_playlist(copy: &str) -> Result<(String, Vec<String>, usize), String> {
-    let (zip, inside) = explorer_zip_copy(copy).ok_or_else(|| format!("not a copy from a zip: {copy}"))?;
-    let shown = format!("{zip}\\{inside}");
-    let items = taskbar::explorer_zip_folder(shown.clone())?;
+    // (only the file's name is used from the copy: how Windows names the
+    // folder it copies to varies, and it may leave out the folders of the zip)
+    let name = temp_copy_name(copy).ok_or_else(|| format!("not in the temporary folder: {}", path_shape(copy)))?;
+    let (clicked, items) = taskbar::explorer_zip_folder(name)?;
     // "C:\Downloads\Videos.zip\Season 1\Ep 2.mkv" → the zip, "C:\Downloads\Videos.zip"
-    let want = format!("\\{shown}");
-    let ends = |s: &str| {
-        let n = want.chars().count();
-        let tail: String = s.chars().skip(s.chars().count().saturating_sub(n)).collect();
-        s.chars().count() > n && same_name(&want, &tail)
-    };
-    let clicked = items.iter().find(|s| ends(s)).ok_or_else(|| format!("{} files in the window, none ending in {want}", items.len()))?;
-    let keep = clicked.chars().count() - inside.chars().count() - 1;
-    let archive: String = clicked.chars().take(keep).collect();
-    if !Path::new(&archive).is_file() {
-        return Err(format!("the zip isn't a file here: {archive}"));
-    }
+    // (the first "….zip" along it that's a file: a folder could have such a name)
+    let chars: Vec<char> = clicked.chars().collect();
+    let keep = (4..chars.len())
+        .filter(|&k| chars[k] == '\\' && chars[k - 4..k].iter().collect::<String>().eq_ignore_ascii_case(".zip"))
+        .find(|&k| Path::new(&chars[..k].iter().collect::<String>()).is_file())
+        .ok_or_else(|| format!("couldn't find the zip along {}", path_shape(&clicked)))?;
+    let archive: String = chars[..keep].iter().collect();
+    let zip = Path::new(&archive).file_name().map_or_else(|| archive.clone(), |n| n.to_string_lossy().into_owned());
     let kind = media_kind(copy).ok_or("not a media file")?;
-    let listed = archive_entries(&archive).ok_or_else(|| format!("mpv couldn't read {archive}"))?;
+    let listed = archive_entries(&archive).ok_or_else(|| format!("mpv couldn't read {}", path_shape(&archive)))?;
     let mut files = Vec::new();
     let mut at = None;
     for item in &items {
@@ -431,7 +433,7 @@ pub(crate) fn explorer_zip_playlist(copy: &str) -> Result<(String, Vec<String>, 
             continue;
         }
         let rel: String = item.chars().skip(keep + 1).collect::<String>().replace('\\', "/");
-        if item == clicked {
+        if *item == clicked {
             at = Some(files.len());
             files.push(copy.to_owned());
         } else if let Some(e) = listed.iter().find(|e| same_name(&rel, inside_of(e))) {
@@ -446,7 +448,7 @@ pub(crate) fn explorer_zip_playlist(copy: &str) -> Result<(String, Vec<String>, 
             "only the clicked file matched: {} in the window, mpv listed {} (first: {})",
             items.len(),
             listed.len(),
-            listed.first().map_or("none", |e| inside_of(e))
+            listed.first().map_or_else(|| "none".to_owned(), |e| path_shape(inside_of(e)))
         ))
     }
 }
