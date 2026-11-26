@@ -845,6 +845,8 @@ struct FluentMediaPlayer {
     hold: Option<Holding>,
     /// The next / previous picture opened ahead while its button is held (see step_press)
     preload: Option<Preload>,
+    /// The window's icon now: 1 video, 2 picture, 3 music (see taskbar::set_window_icon)
+    window_icon: u16,
     /// A photo's details for the Tab overlay (read on another thread): the
     /// picture they're for, and them (None: none in it); and which was asked for
     photo: PhotoSlot,
@@ -931,6 +933,12 @@ fn gl_proc_address(_ctx: &*mut std::ffi::c_void, name: &str) -> *mut std::ffi::c
 impl FluentMediaPlayer {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let caption_font = install_fonts(&cc.egui_ctx);
+        // Videos, music and pictures registered with Windows, each kind with its
+        // own icon (see register_file_types; a moment after starting, out of its way)
+        let _ = std::thread::Builder::new().name("file types".into()).spawn(|| {
+            std::thread::sleep(std::time::Duration::from_secs(3));
+            taskbar::register_file_types(VIDEO_EXTS, MUSIC_EXTS, IMAGE_EXTS);
+        });
         taskbar::set_snap(load_settings().snap);
         let saved = load_window_state().unwrap_or(WinState::DEFAULT);
         // Maximized last time: the still-hidden window takes the screen's size
@@ -1179,6 +1187,7 @@ impl FluentMediaPlayer {
             pic_glide: None,
             hold: None,
             preload: None,
+            window_icon: 1,
             photo: Arc::new(Mutex::new(None)),
             photo_asked: String::new(),
             start_place,
@@ -2720,6 +2729,17 @@ impl FluentMediaPlayer {
 
 impl eframe::App for FluentMediaPlayer {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        // The window's icon follows what's open: a picture's, music's, or the
+        // player's own (videos, and nothing open)
+        let icon = match self.has_file.then(|| media_kind(&self.current_file)).flatten() {
+            Some(MediaKind::Image) => 2,
+            Some(MediaKind::Music) => 3,
+            _ => 1,
+        };
+        if icon != self.window_icon && self.hwnd != 0 {
+            self.window_icon = icon;
+            taskbar::set_window_icon(self.hwnd, icon);
+        }
         // A picture opened ahead whose button was let go without anything
         // seeing it (the button went away): not wanted
         if self.preload.is_some() && ctx.input(|i| !i.pointer.primary_down() && !i.pointer.primary_released()) {

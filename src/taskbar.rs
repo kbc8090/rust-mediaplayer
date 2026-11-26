@@ -2029,3 +2029,121 @@ fn base64_decode(text: &str) -> Option<Vec<u8>> {
     }
     Some(out)
 }
+
+// ── File types: each kind's icon in Explorer, and in the window ───────────────
+// The .exe carries three icons (see build.rs): 1 videos (also the program's own),
+// 2 pictures, 3 music.
+#[link(name = "user32")]
+unsafe extern "system" {
+    fn LoadImageW(instance: isize, name: *const u16, kind: u32, cx: i32, cy: i32, flags: u32) -> isize;
+}
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn GetModuleHandleW(name: *const u16) -> isize;
+}
+#[link(name = "shell32")]
+unsafe extern "system" {
+    fn SHChangeNotify(event: i32, flags: u32, item1: *const c_void, item2: *const c_void);
+}
+#[link(name = "advapi32")]
+unsafe extern "system" {
+    fn RegGetValueW(key: isize, sub_key: *const u16, value: *const u16, flags: u32, kind: *mut u32, data: *mut c_void, len: *mut u32) -> i32;
+}
+
+/// The window's icon (title, Alt+Tab, the taskbar button unless the player is
+/// pinned there): 1 video, 2 picture, 3 music, from the .exe's own icons
+pub fn set_window_icon(hwnd: isize, which: u16) {
+    const IMAGE_ICON: u32 = 1;
+    const LR_SHARED: u32 = 0x8000;
+    const WM_SETICON: u32 = 0x0080;
+    unsafe {
+        let module = GetModuleHandleW(std::ptr::null());
+        for (size_metric, kind) in [(11 /* SM_CXICON */, 1 /* ICON_BIG */), (49 /* SM_CXSMICON */, 0 /* ICON_SMALL */)] {
+            let s = GetSystemMetrics(size_metric);
+            // (a resource number in place of a name, as Windows allows)
+            let icon = LoadImageW(module, which as usize as *const u16, IMAGE_ICON, s, s, LR_SHARED);
+            if icon != 0 {
+                SendMessageW(hwnd, WM_SETICON, kind, icon);
+            }
+        }
+    }
+}
+
+/// Tell Windows the player opens these videos, music and pictures, each kind
+/// with its own icon: they show in Explorer once the player is the default
+/// for them (Settings > Apps > Default apps > Choose default apps by file
+/// type, or Open with > Always). All in the user's own part of the registry
+/// (no admin rights), redone only when the player has moved or this list
+/// changed. Windows doesn't let a program make itself the default; that
+/// stays the user's choice.
+pub fn register_file_types(video: &[&str], music: &[&str], pictures: &[&str]) {
+    const HKCU: isize = 0x8000_0001_u32 as i32 as isize;
+    const REG_NONE: u32 = 0;
+    const REG_SZ: u32 = 1;
+    const RRF_RT_REG_SZ: u32 = 0x2;
+    let Ok(exe) = std::env::current_exe() else { return };
+    let exe = exe.to_string_lossy().into_owned();
+    // (what was registered last: this .exe, and this version of the list)
+    let stamp = format!("{exe}|1|{}|{}|{}", video.len(), music.len(), pictures.len());
+    let set = |key: &str, name: Option<&str>, value: &str| unsafe {
+        let v = wide(value);
+        let n = name.map(wide);
+        RegSetKeyValueW(
+            HKCU,
+            wide(key).as_ptr(),
+            n.as_ref().map_or(std::ptr::null(), |n| n.as_ptr()),
+            REG_SZ,
+            v.as_ptr() as *const c_void,
+            (v.len() * 2) as u32,
+        );
+    };
+    unsafe {
+        let mut buf = vec![0u16; 2048];
+        let mut len = (buf.len() * 2) as u32;
+        let got = RegGetValueW(
+            HKCU,
+            wide("Software\\RustMediaPlayer").as_ptr(),
+            wide("Registered").as_ptr(),
+            RRF_RT_REG_SZ,
+            std::ptr::null_mut(),
+            buf.as_mut_ptr() as *mut c_void,
+            &mut len,
+        );
+        if got == 0 {
+            let s = String::from_utf16_lossy(&buf[..(len as usize / 2).saturating_sub(1)]);
+            if s == stamp {
+                return;
+            }
+        }
+    }
+    let caps = "Software\\RustMediaPlayer\\Capabilities";
+    set(caps, Some("ApplicationName"), "Rust Media Player");
+    set(caps, Some("ApplicationDescription"), "Plays videos, music and pictures");
+    for (exts, icon, word) in [(video, 1, "Video"), (music, 3, "Audio"), (pictures, 2, "Picture")] {
+        for ext in exts {
+            // One type per extension, so Explorer's Type column still says
+            // which ("MP4 Video", "FLAC Audio", "JPG Picture")
+            let progid = format!("RustMediaPlayer.{ext}");
+            let key = format!("Software\\Classes\\{progid}");
+            set(&key, None, &format!("{} {word}", ext.to_uppercase()));
+            set(&format!("{key}\\DefaultIcon"), None, &format!("{exe},-{icon}"));
+            set(&format!("{key}\\shell\\open\\command"), None, &format!("\"{exe}\" \"%1\""));
+            // (listed under Open with, and in Default apps)
+            unsafe {
+                RegSetKeyValueW(
+                    HKCU,
+                    wide(&format!("Software\\Classes\\.{ext}\\OpenWithProgids")).as_ptr(),
+                    wide(&progid).as_ptr(),
+                    REG_NONE,
+                    std::ptr::null(),
+                    0,
+                );
+            }
+            set(&format!("{caps}\\FileAssociations"), Some(&format!(".{ext}")), &progid);
+        }
+    }
+    set("Software\\RegisteredApplications", Some("Rust Media Player"), caps);
+    set("Software\\RustMediaPlayer", Some("Registered"), &stamp);
+    // Explorer: file types changed, redraw their icons
+    unsafe { SHChangeNotify(0x0800_0000 /* SHCNE_ASSOCCHANGED */, 0, std::ptr::null(), std::ptr::null()) };
+}
