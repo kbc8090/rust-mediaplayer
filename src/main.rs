@@ -2770,9 +2770,10 @@ impl eframe::App for FluentMediaPlayer {
         // The picture just left (see PicFrame::Keep) gives way once mpv has the
         // next file showing (it says so: playback started) and has drawn a frame
         // since, or a moment after (the frame drawn already). In any case after 1.5 s.
-        // A picture's size as mpv said it when it showed it (sooner than the
-        // regular readings, see mpv_link::RESTART)
-        if self.is_picture() && self.pic_size == (0.0, 0.0) {
+        // A picture's size as mpv said it when it showed it (see mpv_link::RESTART):
+        // the size and the file together, never another picture's size for a
+        // moment as the regular readings can have it
+        if self.is_picture() {
             let r = mpv_link::RESTART.lock().unwrap_or_else(|e| e.into_inner()).clone();
             if r.0 == self.current_file && r.1 > 0 && r.2 > 0 {
                 self.pic_size = (r.1 as f64, r.2 as f64);
@@ -2932,7 +2933,12 @@ impl eframe::App for FluentMediaPlayer {
             // video counts too); larger videos play without it. (Sizes still
             // from the previous file, just after switching, don't count.)
             let same_file = snap.path == self.current_file;
-            if same_file && snap.dwidth > 0 && snap.dheight > 0 {
+            // (a picture's size comes only with mpv's word that it's showing, see
+            // update: these readings can still have the previous picture's size
+            // for a moment after the file changed, the new name already; only if
+            // that word never came, after half a second, from here)
+            let late = self.pic_size == (0.0, 0.0) && self.pic_since.elapsed().as_secs_f32() > 0.5;
+            if same_file && snap.dwidth > 0 && snap.dheight > 0 && (!self.is_picture() || late) {
                 self.pic_size = (snap.dwidth as f64, snap.dheight as f64);
                 self.pic_turn = snap.rotate;
             }
