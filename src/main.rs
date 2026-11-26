@@ -3566,10 +3566,13 @@ impl eframe::App for FluentMediaPlayer {
                 let pic_rect = if self.is_picture() { self.picture_rect() } else { None };
                 let on_picture = |p: Option<Pos2>| p.is_some_and(|p| pic_rect.is_some_and(|r| r.contains(p)));
 
-                // Double-click → toggle fullscreen (on a picture: back to fitting the window)
+                // Double-click → toggle fullscreen. (A picture: on it, back to fitting
+                // the window; beside it nothing, full screen is its button only.)
                 if resp.double_clicked() {
-                    if on_picture(resp.interact_pointer_pos()) {
-                        self.picture_fit();
+                    if self.is_picture() {
+                        if on_picture(resp.interact_pointer_pos()) {
+                            self.picture_fit();
+                        }
                     } else {
                         self.toggle_fullscreen(ctx);
                     }

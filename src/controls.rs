@@ -492,12 +492,13 @@ pub(crate) fn draw_top_bar(app: &mut FluentMediaPlayer, ctx: &egui::Context, t: 
                 if bg.hovered() {
                     app.blank_hover = true;
                 }
-                if bg.double_clicked() {
+                if bg.double_clicked() && !app.is_picture() {
                     app.toggle_fullscreen(ctx);
                 }
             }
 
-            // Drag region: move the window; double-click goes fullscreen
+            // Drag region: move the window; double-click goes fullscreen (not
+            // for a picture: there only the full screen button does)
             // (The whole strip, not just its top part: the strip covers the video,
             // so any part of it that doesn't drag is a dead spot.)
             if !fullscreen {
@@ -513,7 +514,7 @@ pub(crate) fn draw_top_bar(app: &mut FluentMediaPlayer, ctx: &egui::Context, t: 
                 }
                 // (fullscreen, like double-clicking the video; the maximise button
                 // and dragging to the top of the screen still maximise)
-                if drag.double_clicked() {
+                if drag.double_clicked() && !app.is_picture() {
                     app.toggle_fullscreen(ctx);
                 }
             }
@@ -1687,9 +1688,6 @@ pub(crate) fn draw_picture_bar(app: &mut FluentMediaPlayer, ctx: &egui::Context,
         let bg = ui.interact(rect, ui.id().with("pill_bg"), Sense::click_and_drag());
         if bg.hovered() {
             app.blank_hover = true;
-        }
-        if bg.double_clicked() {
-            app.toggle_fullscreen(ctx);
         }
         let p = ui.painter().clone();
         // Lighter glass than the menus (it sits over the picture all the time);
