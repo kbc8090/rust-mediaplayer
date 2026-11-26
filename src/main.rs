@@ -140,9 +140,41 @@ unsafe fn paint_video(gl: &glow::Context, rc: &mut RenderContext<'static>, x: i3
         // The size is part of the picture too: a resize always redraws
         let size_changed = VIDEO_SIZE.with(|s| s.replace((w, h)) != (w, h));
         let drew = fresh || new_frame || size_changed;
+        // Keeping what's on screen (see HOLD): copy it before mpv draws over it
+        let mut hold = HOLD.with(|s| s.get());
+        if hold.0 == 1 {
+            hold = (0, 0);
+            if !fresh && !size_changed {
+                HOLD_TARGET.with(|ht| {
+                    let mut ht = ht.borrow_mut();
+                    if ht.as_ref().is_some_and(|k| k.w != v.w || k.h != v.h) {
+                        if let Some(old) = ht.take() {
+                            gl.delete_framebuffer(old.fbo);
+                            gl.delete_texture(old.tex);
+                        }
+                    }
+                    if ht.is_none() {
+                        *ht = make_target(gl, v.w, v.h);
+                    }
+                    if let Some(k) = ht.as_ref() {
+                        gl.bind_framebuffer(glow::READ_FRAMEBUFFER, Some(v.fbo));
+                        gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, Some(k.fbo));
+                        gl.blit_framebuffer(0, 0, w, h, 0, 0, w, h, glow::COLOR_BUFFER_BIT, glow::NEAREST);
+                        gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+                        hold = (2, 0);
+                    }
+                });
+            }
+        } else if hold.0 == 2 && (fresh || size_changed) {
+            hold = (0, 0); // (the window changed size: show what mpv draws)
+        }
         if drew {
             let _ = rc.render::<*mut std::os::raw::c_void>(v.fbo.0.get() as i32, w, h, true);
+            if hold.0 == 2 && new_frame {
+                hold.1 += 1;
+            }
         }
+        HOLD.with(|s| s.set(hold));
         if new_frame {
             VIDEO_STALE.with(|s| s.set(false));
         }
@@ -150,12 +182,34 @@ unsafe fn paint_video(gl: &glow::Context, rc: &mut RenderContext<'static>, x: i3
             // (the previous file's picture: leave the window black)
             return drew;
         }
-        gl.bind_framebuffer(glow::READ_FRAMEBUFFER, Some(v.fbo));
+        let from = if hold.0 == 2 { HOLD_TARGET.with(|ht| ht.borrow().as_ref().map(|k| k.fbo)) } else { None };
+        gl.bind_framebuffer(glow::READ_FRAMEBUFFER, Some(from.unwrap_or(v.fbo)));
         gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, None);
         gl.blit_framebuffer(0, 0, w, h, x, y, x + w, y + h, glow::COLOR_BUFFER_BIT, glow::NEAREST);
         gl.bind_framebuffer(glow::FRAMEBUFFER, None);
         drew
     })
+}
+
+/// An off-screen texture to draw into, `tw` × `th`
+unsafe fn make_target(gl: &glow::Context, tw: i32, th: i32) -> Option<VideoTarget> {
+    let (tex, fbo) = (gl.create_texture().ok()?, gl.create_framebuffer().ok()?);
+    gl.bind_texture(glow::TEXTURE_2D, Some(tex));
+    gl.tex_image_2d(glow::TEXTURE_2D, 0, glow::RGBA8 as i32, tw, th, 0, glow::RGBA, glow::UNSIGNED_BYTE, None);
+    gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::NEAREST as i32);
+    gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, glow::NEAREST as i32);
+    gl.bind_texture(glow::TEXTURE_2D, None);
+    gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
+    gl.framebuffer_texture_2d(glow::FRAMEBUFFER, glow::COLOR_ATTACHMENT0, glow::TEXTURE_2D, Some(tex), 0);
+    let ok = gl.check_framebuffer_status(glow::FRAMEBUFFER) == glow::FRAMEBUFFER_COMPLETE;
+    gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+    if ok {
+        Some(VideoTarget { fbo, tex, w: tw, h: th })
+    } else {
+        gl.delete_framebuffer(fbo);
+        gl.delete_texture(tex);
+        None
+    }
 }
 
 /// Draws mpv's picture into `rect`
@@ -188,6 +242,14 @@ thread_local! {
     /// every frame meanwhile: if it isn't, it waits up to 0.2 s for each one,
     /// which made new videos start a beat late.)
     static VIDEO_STALE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Keep showing what's on screen while the next picture opens. A file's own
+    /// settings (the zoom reset, the grey around a picture) are undone as it
+    /// ends, before the next file's take over, and mpv redraws the old picture
+    /// meanwhile: fitted again and on black, for a frame or more. A copy of
+    /// what was showing stays up instead, until mpv has drawn the new picture.
+    /// (0 off, 1 asked for, 2 showing the copy; and the frames mpv has drawn since)
+    static HOLD: std::cell::Cell<(u8, u32)> = const { std::cell::Cell::new((0, 0)) };
+    static HOLD_TARGET: std::cell::RefCell<Option<VideoTarget>> = const { std::cell::RefCell::new(None) };
 }
 
 /// End the process immediately, without running any DLL or runtime shutdown code.
@@ -607,6 +669,10 @@ struct FluentMediaPlayer {
     pic_drag: bool,
     /// Gliding to a new zoom
     pic_glide: Option<ZoomGlide>,
+    /// Showing a copy of the picture just left (see HOLD): since when,
+    /// and since when the next one has been open (and how many frames mpv
+    /// had drawn by then)
+    hold: Option<(std::time::Instant, Option<(std::time::Instant, u32)>)>,
     /// A photo's details for the Tab overlay (read on another thread): the
     /// picture they're for, and them (None: none in it); and which was asked for
     photo: PhotoSlot,
@@ -937,6 +1003,7 @@ impl FluentMediaPlayer {
             pic_turn: 0,
             pic_drag: false,
             pic_glide: None,
+            hold: None,
             photo: Arc::new(Mutex::new(None)),
             photo_asked: String::new(),
             start_place,
@@ -1187,6 +1254,12 @@ impl FluentMediaPlayer {
     fn load_entry(&mut self, path: &str) {
         self.archive_gen += 1; // (an archive still being read for another file: not wanted now)
         self.archive_choice = None;
+        // Leaving a picture for another: keep it on screen as it is until the
+        // next one is drawn (see HOLD)
+        if self.is_picture() && media_kind(path) == Some(MediaKind::Image) {
+            HOLD.with(|s| s.set((1, 0)));
+            self.hold = Some((std::time::Instant::now(), None));
+        }
         self.current_file = path.to_owned();
         self.has_file = true;
         self.media_title.clear();
@@ -2405,6 +2478,23 @@ impl eframe::App for FluentMediaPlayer {
         });
         // ── Pictures: zoom glides, the ones either side read ahead, wallpaper ──
         self.glide_picture();
+        // The copy of the picture just left (see HOLD) gives way once mpv has the
+        // next one: it's open, and mpv has drawn a frame since (or it's been open
+        // a moment, the frame already drawn). In any case after 1.5 s.
+        if let Some((since, open)) = self.hold {
+            let (state, frames) = HOLD.with(|s| s.get());
+            let open = open.or_else(|| (self.pic_size != (0.0, 0.0)).then(|| (std::time::Instant::now(), frames)));
+            let done = state == 0
+                || open.is_some_and(|(o, at)| frames > at || o.elapsed().as_secs_f32() > 0.12)
+                || since.elapsed().as_secs_f32() > 1.5;
+            if done {
+                HOLD.with(|s| s.set((0, 0)));
+                self.hold = None;
+            } else {
+                self.hold = Some((since, open));
+                ctx.request_repaint();
+            }
+        }
         // (so the next / previous one opens without waiting on the disk; just
         // read through, which leaves them in Windows' file cache)
         if self.is_picture() {

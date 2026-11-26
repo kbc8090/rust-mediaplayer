@@ -1809,9 +1809,9 @@ pub(crate) fn draw_picture_arrows(app: &mut FluentMediaPlayer, ctx: &egui::Conte
                 // looks centred: a chevron's weight is in its open side)
                 let c = r.center() + vec2(if left { -3.0 } else { 3.0 }, 0.0);
                 let dx = if left { 10.0 } else { -10.0 };
-                let stroke = Stroke::new(1.7_f32, Color32::WHITE.gamma_multiply(a));
-                p.line_segment([pos2(c.x + dx, c.y - 22.0), pos2(c.x - dx, c.y)], stroke);
-                p.line_segment([pos2(c.x - dx, c.y), pos2(c.x + dx, c.y + 22.0)], stroke);
+                // (one joined line, 2.6 px, so the point is clean; bolder than before)
+                let stroke = Stroke::new(2.6_f32, Color32::WHITE.gamma_multiply(a));
+                p.add(egui::Shape::line(vec![pos2(c.x + dx, c.y - 22.0), pos2(c.x - dx, c.y), pos2(c.x + dx, c.y + 22.0)], stroke));
             }
             if resp.clicked() {
                 app.play_adjacent(delta);
