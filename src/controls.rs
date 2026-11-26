@@ -1757,7 +1757,7 @@ pub(crate) fn draw_picture_arrows(app: &mut FluentMediaPlayer, ctx: &egui::Conte
         return;
     }
     let screen = ctx.screen_rect();
-    let (w, h) = (70.0, 170.0_f32.min(screen.height() - TOP_H - 90.0).max(60.0));
+    let (w, h) = (70.0, 160.0_f32.min(screen.height() - TOP_H - 90.0).max(60.0));
     for (delta, left) in [(-1_isize, true), (1, false)] {
         // (not on the side the playlist is open on)
         if app.step_index(delta).is_none() || (!left && app.adjust_ui.playlist_open) {

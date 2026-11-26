@@ -410,6 +410,33 @@ pub fn hook_window(hwnd: isize) -> bool {
     }
 }
 
+#[link(name = "user32")]
+unsafe extern "system" {
+    fn GetDC(hwnd: isize) -> isize;
+    fn ReleaseDC(hwnd: isize, dc: isize) -> i32;
+    fn FillRect(dc: isize, rect: *const RectI, brush: isize) -> i32;
+    fn GetClientRect(hwnd: isize, rect: *mut RectI) -> i32;
+}
+#[link(name = "gdi32")]
+unsafe extern "system" {
+    fn GetStockObject(which: i32) -> isize;
+}
+
+/// Fill the window black at once, before OpenGL has drawn anything in it
+/// (Windows shows a new window white until then)
+pub fn paint_black(hwnd: isize) {
+    unsafe {
+        let mut r: RectI = std::mem::zeroed();
+        if GetClientRect(hwnd, &mut r) != 0 {
+            let dc = GetDC(hwnd);
+            if dc != 0 {
+                FillRect(dc, &r, GetStockObject(4 /* BLACK_BRUSH */));
+                ReleaseDC(hwnd, dc);
+            }
+        }
+    }
+}
+
 /// Hide the window from the screen while it stays open and sized as it is
 /// (DWM "cloaking"), or show it again: so it can be maximized before anything
 /// is drawn in it, without a white flash

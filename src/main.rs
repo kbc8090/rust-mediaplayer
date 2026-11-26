@@ -317,6 +317,18 @@ const VOL_MAX: f64 = 130.0;
 /// A background folder scan's result, shared with its thread: (scan number, files)
 type ScanResult = Arc<Mutex<Option<(u64, Vec<PathBuf>)>>>;
 
+/// A picture gliding to a new zoom over a moment (the wheel, the zoom buttons,
+/// fit / 1:1): from where it was to where it's going, about the spot under
+/// the pointer (that spot stays put all the way), or straight across (None)
+struct ZoomGlide {
+    from_zoom: f64,
+    to_zoom: f64,
+    from_pan: (f64, f64),
+    to_pan: (f64, f64),
+    about: Option<(f64, f64)>,
+    start: std::time::Instant,
+}
+
 /// A file Explorer copied out of a zip, and that folder of the zip as a
 /// playlist (see `files::explorer_zip_playlist`)
 struct ZipFound {
@@ -586,6 +598,8 @@ struct FluentMediaPlayer {
     pic_turn: i64,
     /// Being dragged around (zoomed in past the window)
     pic_drag: bool,
+    /// Gliding to a new zoom
+    pic_glide: Option<ZoomGlide>,
     /// Frames still to draw before the window, maximized at startup while
     /// hidden from the screen, is shown (0: shown)
     uncloak_in: u8,
@@ -900,6 +914,7 @@ impl FluentMediaPlayer {
             pic_size: (0.0, 0.0),
             pic_turn: 0,
             pic_drag: false,
+            pic_glide: None,
             uncloak_in: 0,
             pic_prefetch: (String::new(), 0),
             wallpaper_result: Arc::new(Mutex::new(None)),
@@ -1159,6 +1174,7 @@ impl FluentMediaPlayer {
         self.pic_size = (0.0, 0.0);
         self.pic_turn = 0;
         self.pic_drag = false;
+        self.pic_glide = None;
         if self.pic_zoom != 0.0 || self.pic_pan != (0.0, 0.0) {
             self.pic_zoom = 0.0;
             self.pic_pan = (0.0, 0.0);
@@ -1580,25 +1596,72 @@ impl FluentMediaPlayer {
         self.pic_pan = pan;
     }
 
-    /// Zoom in (steps > 0) or out by 20 % a step, keeping the spot under the
-    /// pointer where it is (`at`; None: the middle of the window)
+    /// Zoom in (steps > 0) or out by 10 % a step, gliding there, the spot under
+    /// the pointer staying where it is (`at`; None: the middle of the window).
+    /// Steps while it glides add up: it glides on to the new zoom from where it is.
     pub(crate) fn picture_zoom_by(&mut self, steps: f64, at: Option<Pos2>) {
-        let (Some((w, h)), Some(fit)) = (self.picture_size(), self.fit_scale()) else { return };
-        let z0 = self.pic_zoom;
+        let Some(fit) = self.fit_scale() else { return };
+        let goal = self.pic_glide.as_ref().map_or(self.pic_zoom, |g| g.to_zoom);
         // (from an eighth of fitting the window up to 32 times its own size)
-        let z1 = (z0 + steps * 1.2_f64.log2()).clamp(-3.0, (32.0 / fit).log2().max(0.0));
-        if z1 == z0 {
+        let to = (goal + steps * 1.1_f64.log2()).clamp(-3.0, (32.0 / fit).log2().max(0.0));
+        if to == goal {
             return;
         }
         let ppp = self.egui_ctx.pixels_per_point();
         let mid = self.egui_ctx.screen_rect().center();
-        let (cx, cy) = at.map_or((0.0, 0.0), |p| (((p.x - mid.x) * ppp) as f64, ((p.y - mid.y) * ppp) as f64));
-        // The spot under the pointer, as a part of the picture's shown size,
-        // stays under it: pan = c / new size − c / old size + pan before
-        let (w0, h0) = (w * fit * z0.exp2(), h * fit * z0.exp2());
-        let (w1, h1) = (w * fit * z1.exp2(), h * fit * z1.exp2());
-        let pan = (cx / w1 - cx / w0 + self.pic_pan.0, cy / h1 - cy / h0 + self.pic_pan.1);
-        self.set_picture_view(z1, pan);
+        let about = at.map_or((0.0, 0.0), |p| (((p.x - mid.x) * ppp) as f64, ((p.y - mid.y) * ppp) as f64));
+        self.pic_glide = Some(ZoomGlide {
+            from_zoom: self.pic_zoom,
+            to_zoom: to,
+            from_pan: self.pic_pan,
+            to_pan: self.pic_pan,
+            about: Some(about),
+            start: std::time::Instant::now(),
+        });
+        self.egui_ctx.request_repaint();
+    }
+
+    /// Glide to `zoom` and `pan`, straight across
+    fn glide_picture_to(&mut self, zoom: f64, pan: (f64, f64)) {
+        self.pic_glide = Some(ZoomGlide {
+            from_zoom: self.pic_zoom,
+            to_zoom: zoom,
+            from_pan: self.pic_pan,
+            to_pan: pan,
+            about: None,
+            start: std::time::Instant::now(),
+        });
+        self.egui_ctx.request_repaint();
+    }
+
+    /// The zoom glide's next step (each frame)
+    fn glide_picture(&mut self) {
+        const SECS: f32 = 0.16;
+        let Some(g) = self.pic_glide.as_ref() else { return };
+        let (Some((w, h)), Some(fit)) = (self.picture_size(), self.fit_scale()) else {
+            self.pic_glide = None;
+            return;
+        };
+        let k = (g.start.elapsed().as_secs_f32() / SECS).min(1.0);
+        let e = 1.0 - (1.0 - k as f64).powi(3); // (eased out)
+        let zoom = g.from_zoom + (g.to_zoom - g.from_zoom) * e;
+        let pan = match g.about {
+            // The spot `about` (from the window's middle, in pixels), as a part
+            // of the picture's shown size, stays under it: pan = c / size now −
+            // c / size at the start + pan at the start
+            Some((cx, cy)) => {
+                let (w0, h0) = (w * fit * g.from_zoom.exp2(), h * fit * g.from_zoom.exp2());
+                let (w1, h1) = (w * fit * zoom.exp2(), h * fit * zoom.exp2());
+                (cx / w1 - cx / w0 + g.from_pan.0, cy / h1 - cy / h0 + g.from_pan.1)
+            }
+            None => (g.from_pan.0 + (g.to_pan.0 - g.from_pan.0) * e, g.from_pan.1 + (g.to_pan.1 - g.from_pan.1) * e),
+        };
+        self.set_picture_view(zoom, pan);
+        if k >= 1.0 {
+            self.pic_glide = None;
+        } else {
+            self.egui_ctx.request_repaint();
+        }
     }
 
     /// Move a zoomed picture by a drag of `dx`, `dy` points
@@ -1607,18 +1670,19 @@ impl FluentMediaPlayer {
         let s = fit * self.pic_zoom.exp2();
         let ppp = self.egui_ctx.pixels_per_point() as f64;
         let pan = (self.pic_pan.0 + dx as f64 * ppp / (w * s), self.pic_pan.1 + dy as f64 * ppp / (h * s));
+        self.pic_glide = None;
         self.set_picture_view(self.pic_zoom, pan);
     }
 
     /// The whole picture in the window
     pub(crate) fn picture_fit(&mut self) {
-        self.set_picture_view(0.0, (0.0, 0.0));
+        self.glide_picture_to(0.0, (0.0, 0.0));
     }
 
     /// The picture at its own size, pixel for pixel (centred)
     pub(crate) fn picture_actual(&mut self) {
         if let Some(fit) = self.fit_scale() {
-            self.set_picture_view(-fit.log2(), (0.0, 0.0));
+            self.glide_picture_to(-fit.log2(), (0.0, 0.0));
         }
     }
 
@@ -2249,7 +2313,8 @@ impl eframe::App for FluentMediaPlayer {
                 }
             }
         });
-        // ── Pictures: read the ones either side ahead, set as wallpaper ───────
+        // ── Pictures: zoom glides, the ones either side read ahead, wallpaper ──
+        self.glide_picture();
         // (so the next / previous one opens without waiting on the disk; just
         // read through, which leaves them in Windows' file cache)
         if self.is_picture() {
@@ -2497,6 +2562,8 @@ impl eframe::App for FluentMediaPlayer {
                     if IsZoomed(self.hwnd) == 0 {
                         taskbar::cloak(self.hwnd, true);
                         ShowWindow(self.hwnd, 3); // SW_MAXIMIZE
+                        // (in case it shows before it's hidden: black, not white)
+                        taskbar::paint_black(self.hwnd);
                         self.uncloak_in = 3;
                     }
                 }
@@ -2976,7 +3043,7 @@ impl eframe::App for FluentMediaPlayer {
         // panels (the wheel adjusts the setting there) or the shortcuts list.
         let over_panels = inp.pointer.is_some_and(|p| self.adjust_ui.contains(p));
         if picture {
-            // A picture: the wheel zooms it, toward the pointer (20 % a notch)
+            // A picture: the wheel zooms it, toward the pointer (10 % a notch)
             if !over_panels && !self.show_keys && inp.scroll_y != 0.0 {
                 self.picture_zoom_by(inp.scroll_y as f64 / 50.0, inp.pointer);
             }
