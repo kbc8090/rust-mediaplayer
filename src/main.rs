@@ -586,6 +586,9 @@ struct FluentMediaPlayer {
     pic_turn: i64,
     /// Being dragged around (zoomed in past the window)
     pic_drag: bool,
+    /// Frames still to draw before the window, maximized at startup while
+    /// hidden from the screen, is shown (0: shown)
+    uncloak_in: u8,
     /// The pictures either side already read ahead for this one (its path, and
     /// how many files the folder had then)
     pic_prefetch: (String, usize),
@@ -897,6 +900,7 @@ impl FluentMediaPlayer {
             pic_size: (0.0, 0.0),
             pic_turn: 0,
             pic_drag: false,
+            uncloak_in: 0,
             pic_prefetch: (String::new(), 0),
             wallpaper_result: Arc::new(Mutex::new(None)),
             snap: st.snap,
@@ -1576,13 +1580,13 @@ impl FluentMediaPlayer {
         self.pic_pan = pan;
     }
 
-    /// Zoom in (steps > 0) or out by 25 % a step, keeping the spot under the
+    /// Zoom in (steps > 0) or out by 20 % a step, keeping the spot under the
     /// pointer where it is (`at`; None: the middle of the window)
     pub(crate) fn picture_zoom_by(&mut self, steps: f64, at: Option<Pos2>) {
         let (Some((w, h)), Some(fit)) = (self.picture_size(), self.fit_scale()) else { return };
         let z0 = self.pic_zoom;
         // (from an eighth of fitting the window up to 32 times its own size)
-        let z1 = (z0 + steps * 1.25_f64.log2()).clamp(-3.0, (32.0 / fit).log2().max(0.0));
+        let z1 = (z0 + steps * 1.2_f64.log2()).clamp(-3.0, (32.0 / fit).log2().max(0.0));
         if z1 == z0 {
             return;
         }
@@ -2484,12 +2488,16 @@ impl eframe::App for FluentMediaPlayer {
             taskbar::hook_window(self.hwnd);
             // Maximized last time: maximize now, before the window is first shown
             // (it used to appear at its normal size and maximize half a second
-            // later). Its normal size is still the one to restore to.
+            // later). Its normal size is still the one to restore to. Kept off
+            // the screen until it has drawn itself at the new size: shown
+            // straight away, it flashed white.
             if self.start_max && !self.start_max_done {
                 self.start_max_done = true;
                 unsafe {
                     if IsZoomed(self.hwnd) == 0 {
+                        taskbar::cloak(self.hwnd, true);
                         ShowWindow(self.hwnd, 3); // SW_MAXIMIZE
+                        self.uncloak_in = 3;
                     }
                 }
                 ctx.request_repaint();
@@ -2499,6 +2507,16 @@ impl eframe::App for FluentMediaPlayer {
             // (smooth motion needs the window to find the monitor's refresh rate)
             if self.adjust.smooth {
                 self.apply_smooth();
+            }
+        } else if self.uncloak_in > 0 {
+            self.uncloak_in -= 1;
+            // (a few frames: the one drawn at the old size, then at the new; or
+            // in any case after a second)
+            if self.uncloak_in == 0 || self.start_time.elapsed().as_secs_f32() > 1.0 {
+                self.uncloak_in = 0;
+                taskbar::cloak(self.hwnd, false);
+            } else {
+                ctx.request_repaint();
             }
         }
         if taskbar::take_fullscreen_failed() {
@@ -2958,7 +2976,7 @@ impl eframe::App for FluentMediaPlayer {
         // panels (the wheel adjusts the setting there) or the shortcuts list.
         let over_panels = inp.pointer.is_some_and(|p| self.adjust_ui.contains(p));
         if picture {
-            // A picture: the wheel zooms it, toward the pointer (25 % a notch)
+            // A picture: the wheel zooms it, toward the pointer (20 % a notch)
             if !over_panels && !self.show_keys && inp.scroll_y != 0.0 {
                 self.picture_zoom_by(inp.scroll_y as f64 / 50.0, inp.pointer);
             }

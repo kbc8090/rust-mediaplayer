@@ -1646,32 +1646,23 @@ fn icon_fit(p: &egui::Painter, c: Pos2, col: Color32) {
 }
 
 /// A picture's tools, in a frosted pill floating at the bottom in place of the
-/// controls: where it is in the folder, zoom out / the zoom / zoom in, fit to
-/// the window, its own size, rotate, mirror, full screen
+/// controls: zoom out / the zoom / zoom in, fit to the window, its own size,
+/// rotate, mirror, full screen
 pub(crate) fn draw_picture_bar(app: &mut FluentMediaPlayer, ctx: &egui::Context, t: f32) {
     let screen = ctx.screen_rect();
     let white = Color32::WHITE.gamma_multiply(t);
     let accent = app.accent.gamma_multiply(t);
     let tint = |on: bool| if on { accent } else { white };
-    let dim = Color32::from_rgb(190, 190, 198).gamma_multiply(t);
-
-    // ("12 / 48" when there are others to go through)
-    let n = app.folder_files.len();
-    let counter = (n > 1).then(|| format!("{} / {n}", app.folder_index.map_or(0, |i| i + 1)));
     let percent = app.picture_percent();
     let zoom_txt = percent.map_or_else(|| "\u{2013}".to_owned(), |z| format!("{z:.0}%"));
 
-    // Laid out left to right: [counter |] − 62% + | fit 1:1 | rotate mirror | full screen
+    // Laid out left to right: − 62% + | fit 1:1 | rotate mirror | full screen
     const PAD: f32 = 8.0;
     const SEP: f32 = 17.0;
     const ZOOM_W: f32 = 50.0;
-    let count_font = FontId::proportional(12.5);
-    let count_w = counter.as_ref().map_or(0.0, |c| {
-        ctx.fonts(|f| f.layout_no_wrap(c.clone(), count_font.clone(), white).size().x) + 16.0
-    });
-    let w = PAD * 2.0 + count_w + if counter.is_some() { SEP } else { 0.0 } + BTN_STEP * 2.0 + ZOOM_W + SEP + BTN_STEP * 2.0 + SEP + BTN_STEP * 2.0 + SEP + BTN_STEP;
+    let w = PAD * 2.0 + BTN_STEP * 2.0 + ZOOM_W + SEP + BTN_STEP * 2.0 + SEP + BTN_STEP * 2.0 + SEP + BTN_STEP;
     let h = 42.0;
-    let rect = Rect::from_min_size(pos2((screen.center().x - w / 2.0).round(), screen.bottom() - 16.0 - h), vec2(w, h));
+    let rect = Rect::from_min_size(pos2((screen.center().x - w / 2.0).round(), screen.bottom() - 12.0 - h), vec2(w, h));
 
     egui::Area::new(egui::Id::new("picture_bar")).order(egui::Order::Foreground).fixed_pos(rect.min).show(ctx, |ui| {
         // (its blank parts are like the picture behind: right-click for the menu)
@@ -1683,26 +1674,21 @@ pub(crate) fn draw_picture_bar(app: &mut FluentMediaPlayer, ctx: &egui::Context,
             app.toggle_fullscreen(ctx);
         }
         let p = ui.painter().clone();
-        crate::glass::fill(&p, rect, 14.0, crate::glass::MENU_BG.gamma_multiply(0.92), t);
-        p.rect_stroke(rect.shrink(0.5), 13.5, Stroke::new(1.0_f32, crate::glass::BORDER.gamma_multiply(t)));
+        // Lighter glass than the menus (it sits over the picture all the time);
+        // edge and dividers as the menus have them
+        crate::glass::fill_tinted(&p, rect, 14.0, crate::glass::MENU_BG.gamma_multiply(0.85), t, 0.42);
+        p.rect_stroke(rect.shrink(0.5), 13.5, Stroke::new(1.0_f32, crate::glass::edge(crate::glass::BORDER).gamma_multiply(t)));
 
         let y = rect.center().y;
         let mut x = rect.left() + PAD;
         let sep = |p: &egui::Painter, x: f32| {
-            p.line_segment([pos2(x, y - 9.0), pos2(x, y + 9.0)], Stroke::new(1.0_f32, Color32::from_white_alpha((40.0 * t) as u8)));
+            p.line_segment([pos2(x, y - 9.0), pos2(x, y + 9.0)], Stroke::new(1.0_f32, crate::glass::BORDER.gamma_multiply(t)));
         };
         let button = |ui: &mut egui::Ui, x: &mut f32, id: &str, tip: &str| {
             let c = pos2(*x + BTN_STEP / 2.0, y);
             *x += BTN_STEP;
             (hit(ui, c, id, tip, t).activated(), c)
         };
-
-        if let Some(c) = &counter {
-            p.text(pos2(x + count_w / 2.0, y), Align2::CENTER_CENTER, c, count_font.clone(), dim);
-            x += count_w;
-            sep(&p, x + SEP / 2.0);
-            x += SEP;
-        }
 
         let (go, c) = button(ui, &mut x, "zoom_out", "Zoom out (mouse wheel)");
         icon_zoom(&p, c, white, false);
@@ -1765,29 +1751,19 @@ pub(crate) fn draw_picture_bar(app: &mut FluentMediaPlayer, ctx: &egui::Context,
 }
 
 /// Previous / next picture: a tall strip with a thin arrow at each side of the
-/// window, shown while the pointer is near that side
+/// window, shown while the pointer is on it
 pub(crate) fn draw_picture_arrows(app: &mut FluentMediaPlayer, ctx: &egui::Context) {
     if app.folder_files.len() < 2 {
         return;
     }
     let screen = ctx.screen_rect();
-    let pointer = ctx.input(|i| i.pointer.hover_pos());
-    let (w, h) = (60.0, 150.0_f32.min(screen.height() - TOP_H - 90.0).max(60.0));
+    let (w, h) = (70.0, 170.0_f32.min(screen.height() - TOP_H - 90.0).max(60.0));
     for (delta, left) in [(-1_isize, true), (1, false)] {
-        let id = egui::Id::new(("picture_arrow", left));
-        // (near: within 140 px of that side, between the title bar and the pill;
-        // not over the playlist or other panels, and not on the side the
-        // playlist is open on)
-        let near = app.step_index(delta).is_some()
-            && (left || !app.adjust_ui.playlist_open)
-            && pointer.is_some_and(|p| {
-                let from_side = if left { p.x - screen.left() } else { screen.right() - p.x };
-                from_side < 140.0 && p.y > screen.top() + TOP_H * 0.6 && p.y < screen.bottom() - 70.0 && !app.adjust_ui.contains(p)
-            });
-        let a = ctx.animate_bool_with_time(id, near, 0.15);
-        if a <= 0.0 {
+        // (not on the side the playlist is open on)
+        if app.step_index(delta).is_none() || (!left && app.adjust_ui.playlist_open) {
             continue;
         }
+        let id = egui::Id::new(("picture_arrow", left));
         let x0 = if left { screen.left() } else { screen.right() - w };
         let mut r = Rect::from_min_size(pos2(x0, (screen.center().y - h / 2.0).round()), vec2(w, h));
         // (clear of the playlist's tab on the right edge: below it)
@@ -1798,23 +1774,25 @@ pub(crate) fn draw_picture_arrows(app: &mut FluentMediaPlayer, ctx: &egui::Conte
         egui::Area::new(id).order(egui::Order::Foreground).fixed_pos(r.min).show(ctx, |ui| {
             let resp = ui.interact(r, id.with("hit"), Sense::click());
             let hot = resp.hovered();
+            let a = ctx.animate_bool_with_time(id, hot, 0.12);
             if hot {
                 ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
             }
-            let p = ui.painter();
-            let rounding = if left {
-                egui::Rounding { nw: 0.0, sw: 0.0, ne: 10.0, se: 10.0 }
-            } else {
-                egui::Rounding { nw: 10.0, sw: 10.0, ne: 0.0, se: 0.0 }
-            };
-            p.rect_filled(r, rounding, Color32::from_black_alpha(((if hot { 150.0 } else { 105.0 }) * a) as u8));
-            // A thin chevron, 40 px tall
-            let c = r.center();
-            let dx = if left { 9.0 } else { -9.0 };
-            let col = Color32::WHITE.gamma_multiply(a * if hot { 1.0 } else { 0.85 });
-            let stroke = Stroke::new(1.6_f32, col);
-            p.line_segment([pos2(c.x + dx, c.y - 20.0), pos2(c.x - dx, c.y)], stroke);
-            p.line_segment([pos2(c.x - dx, c.y), pos2(c.x + dx, c.y + 20.0)], stroke);
+            if a > 0.0 {
+                let p = ui.painter();
+                let rounding = if left {
+                    egui::Rounding { nw: 0.0, sw: 0.0, ne: 10.0, se: 10.0 }
+                } else {
+                    egui::Rounding { nw: 10.0, sw: 10.0, ne: 0.0, se: 0.0 }
+                };
+                p.rect_filled(r, rounding, Color32::from_black_alpha((140.0 * a) as u8));
+                // A thin chevron, 44 px tall
+                let c = r.center();
+                let dx = if left { 10.0 } else { -10.0 };
+                let stroke = Stroke::new(1.7_f32, Color32::WHITE.gamma_multiply(a));
+                p.line_segment([pos2(c.x + dx, c.y - 22.0), pos2(c.x - dx, c.y)], stroke);
+                p.line_segment([pos2(c.x - dx, c.y), pos2(c.x + dx, c.y + 22.0)], stroke);
+            }
             if resp.clicked() {
                 app.play_adjacent(delta);
             }

@@ -410,6 +410,16 @@ pub fn hook_window(hwnd: isize) -> bool {
     }
 }
 
+/// Hide the window from the screen while it stays open and sized as it is
+/// (DWM "cloaking"), or show it again: so it can be maximized before anything
+/// is drawn in it, without a white flash
+pub fn cloak(hwnd: isize, on: bool) {
+    let v: i32 = on as i32;
+    unsafe {
+        DwmSetWindowAttribute(hwnd, 13 /* DWMWA_CLOAK */, &v as *const i32 as *const c_void, 4);
+    }
+}
+
 // ── Windows 11 corners and border ─────────────────────────────────────────────
 /// The window gets Windows 11's own rounded corners (and the thin border Windows
 /// draws with them). Our window has no standard frame, so Windows has to be asked.

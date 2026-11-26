@@ -55,6 +55,12 @@ pub fn edge(solid: Color32) -> Color32 {
 /// Fill a panel's background: frosted glass, or the solid colour when glass is off.
 /// `alpha` fades the whole thing (tooltips fade in).
 pub fn fill(p: &egui::Painter, rect: Rect, radius: f32, solid: Color32, alpha: f32) {
+    fill_tinted(p, rect, radius, solid, alpha, TINT.1);
+}
+
+/// The same with the dark tint at `tint` strength (0: just the blur; the menus
+/// use 0.64): lighter glass, for the picture tools floating over a picture
+pub fn fill_tinted(p: &egui::Painter, rect: Rect, radius: f32, solid: Color32, alpha: f32, tint: f32) {
     if !active() {
         p.rect_filled(rect, radius, solid.gamma_multiply(alpha));
         return;
@@ -79,7 +85,7 @@ pub fn fill(p: &egui::Painter, rect: Rect, radius: f32, solid: Color32, alpha: f
                 }
                 if let Some(state) = g.as_mut() {
                     unsafe {
-                        state.draw(gl, [vp.left_px, vp.from_bottom_px, vp.width_px, vp.height_px], [sw as i32, sh as i32], r, alpha)
+                        state.draw(gl, [vp.left_px, vp.from_bottom_px, vp.width_px, vp.height_px], [sw as i32, sh as i32], r, alpha, tint)
                     };
                 }
             });
@@ -325,7 +331,8 @@ impl Gl {
     }
 
     /// `vp`: the panel in screen pixels (x, y from the bottom, w, h)
-    unsafe fn draw(&mut self, gl: &glow::Context, vp: [i32; 4], screen: [i32; 2], radius: f32, alpha: f32) {
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn draw(&mut self, gl: &glow::Context, vp: [i32; 4], screen: [i32; 2], radius: f32, alpha: f32, tint: f32) {
         let [x, y, w, h] = vp;
         if w <= 0 || h <= 0 {
             return;
@@ -390,7 +397,7 @@ impl Gl {
         );
         gl.uniform_2_f32(self.comp_size.as_ref(), w as f32, h as f32);
         gl.uniform_1_f32(self.comp_radius.as_ref(), radius);
-        let (grey, k) = TINT;
+        let (grey, k) = (TINT.0, tint);
         gl.uniform_4_f32(self.comp_tint.as_ref(), grey * k, grey * k, grey * k, k);
         gl.uniform_1_f32(self.comp_alpha.as_ref(), alpha);
         self.quad(gl);
