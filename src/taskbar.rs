@@ -1747,3 +1747,35 @@ unsafe fn window_items(window: &Com, which: u32, name_kind: u32) -> Option<Vec<S
     }
     Some(paths)
 }
+
+// ── Desktop wallpaper ─────────────────────────────────────────────────────────
+#[link(name = "user32")]
+unsafe extern "system" {
+    fn SystemParametersInfoW(action: u32, param: u32, pv: *mut c_void, flags: u32) -> i32;
+}
+#[link(name = "advapi32")]
+unsafe extern "system" {
+    fn RegSetKeyValueW(key: isize, sub_key: *const u16, name: *const u16, kind: u32, data: *const c_void, len: u32) -> i32;
+}
+
+/// Make the picture at `path` (a file Windows can read: JPG, PNG, BMP, TIFF,
+/// GIF) the desktop wallpaper, filling the screen. Windows normally saves a JPG
+/// it's given again at about 85 % quality; asked for 100 here first.
+pub fn set_wallpaper(path: &str) -> bool {
+    const HKCU: isize = 0x8000_0001_u32 as i32 as isize;
+    const REG_SZ: u32 = 1;
+    const REG_DWORD: u32 = 4;
+    unsafe {
+        let key = wide("Control Panel\\Desktop");
+        let quality: u32 = 100;
+        RegSetKeyValueW(HKCU, key.as_ptr(), wide("JPEGImportQuality").as_ptr(), REG_DWORD, &quality as *const u32 as *const c_void, 4);
+        // Fill: the screen covered, the picture's shape kept (cropped to fit)
+        for (name, value) in [("WallpaperStyle", "10"), ("TileWallpaper", "0")] {
+            let v = wide(value);
+            RegSetKeyValueW(HKCU, key.as_ptr(), wide(name).as_ptr(), REG_SZ, v.as_ptr() as *const c_void, (v.len() * 2) as u32);
+        }
+        let mut file = wide(path);
+        // SPI_SETDESKWALLPAPER; SPIF_UPDATEINIFILE | SPIF_SENDCHANGE (kept after a restart)
+        SystemParametersInfoW(0x0014, 0, file.as_mut_ptr() as *mut c_void, 0x01 | 0x02) != 0
+    }
+}

@@ -576,6 +576,21 @@ struct FluentMediaPlayer {
     /// mirrored left-right. Both go back to normal for the next file.
     rotation: i32,
     mirror: bool,
+    /// A picture's zoom, as mpv's video-zoom (a power of 2: 0 fits the window,
+    /// 1 is twice that), and where it's moved to (video-pan, in parts of its
+    /// shown size). Back to fitting for each new picture.
+    pic_zoom: f64,
+    pic_pan: (f64, f64),
+    /// The picture's size in pixels, and the turn the file itself asks for
+    pic_size: (f64, f64),
+    pic_turn: i64,
+    /// Being dragged around (zoomed in past the window)
+    pic_drag: bool,
+    /// The pictures either side already read ahead for this one (its path, and
+    /// how many files the folder had then)
+    pic_prefetch: (String, usize),
+    /// Setting the wallpaper (on another thread): what came of it
+    wallpaper_result: Arc<Mutex<Option<Result<(), String>>>>,
     /// Window edges snap to the screen edges
     snap: bool,
     /// Multiple player windows allowed (takes effect for the next file opened from Explorer)
@@ -877,6 +892,13 @@ impl FluentMediaPlayer {
             sort_desc: st.sort_desc,
             rotation: 0,
             mirror: false,
+            pic_zoom: 0.0,
+            pic_pan: (0.0, 0.0),
+            pic_size: (0.0, 0.0),
+            pic_turn: 0,
+            pic_drag: false,
+            pic_prefetch: (String::new(), 0),
+            wallpaper_result: Arc::new(Mutex::new(None)),
             snap: st.snap,
             multi: st.multi,
             normalize: st.normalize,
@@ -1128,6 +1150,17 @@ impl FluentMediaPlayer {
         if !is_url(path) {
             self.url_load = None;
             self.link_error = None;
+        }
+        // (each picture starts fitted to the window; its size comes from mpv)
+        self.pic_size = (0.0, 0.0);
+        self.pic_turn = 0;
+        self.pic_drag = false;
+        if self.pic_zoom != 0.0 || self.pic_pan != (0.0, 0.0) {
+            self.pic_zoom = 0.0;
+            self.pic_pan = (0.0, 0.0);
+            self.link.set("video-zoom", 0.0);
+            self.link.set("video-pan-x", 0.0);
+            self.link.set("video-pan-y", 0.0);
         }
         if self.rotation != 0 || self.mirror {
             self.rotation = 0;
@@ -1452,6 +1485,9 @@ impl FluentMediaPlayer {
         }
         self.rotation = (self.rotation + 90) % 360;
         self.apply_view();
+        if self.is_picture() {
+            self.picture_fit();
+        }
     }
 
     /// Mirror the picture left-right (a left-handed golf swing becomes right-handed)
@@ -1461,6 +1497,148 @@ impl FluentMediaPlayer {
         }
         self.mirror = !self.mirror;
         self.apply_view();
+    }
+
+    // ── Pictures ──────────────────────────────────────────────────────────────
+    /// A picture is showing (picture mode: zoom tools in place of the controls)
+    pub(crate) fn is_picture(&self) -> bool {
+        self.has_file && media_kind(&self.current_file) == Some(MediaKind::Image)
+    }
+
+    /// The picture's size as shown, turned by the file's own rotation and by R
+    pub(crate) fn picture_size(&self) -> Option<(f64, f64)> {
+        let (w, h) = self.pic_size;
+        if w <= 0.0 || h <= 0.0 {
+            return None;
+        }
+        let turn = (self.pic_turn + self.rotation as i64).rem_euclid(360);
+        Some(if turn % 180 == 90 { (h, w) } else { (w, h) })
+    }
+
+    /// The window's size in pixels (what mpv draws into)
+    fn window_px(&self) -> (f64, f64) {
+        let (r, ppp) = (self.egui_ctx.screen_rect(), self.egui_ctx.pixels_per_point() as f64);
+        (r.width() as f64 * ppp, r.height() as f64 * ppp)
+    }
+
+    /// How much fitting the window scales the picture (1 = its own size)
+    fn fit_scale(&self) -> Option<f64> {
+        let (w, h) = self.picture_size()?;
+        let (ww, wh) = self.window_px();
+        Some((ww / w).min(wh / h)).filter(|s| *s > 0.0)
+    }
+
+    /// The zoom in percent of the picture's own size ("62%"), once its size is known
+    pub(crate) fn picture_percent(&self) -> Option<f64> {
+        Some(self.fit_scale()? * self.pic_zoom.exp2() * 100.0)
+    }
+
+    /// Shown at its own size, pixel for pixel
+    pub(crate) fn picture_is_actual(&self) -> bool {
+        self.picture_percent().is_some_and(|p| (p - 100.0).abs() < 0.5)
+    }
+
+    /// Bigger than the window, so dragging moves it about (rather than the window)
+    pub(crate) fn picture_overflows(&self) -> bool {
+        let (Some((w, h)), Some(fit)) = (self.picture_size(), self.fit_scale()) else { return false };
+        let s = fit * self.pic_zoom.exp2();
+        let (ww, wh) = self.window_px();
+        w * s > ww + 1.0 || h * s > wh + 1.0
+    }
+
+    /// Set the zoom and where the picture sits, kept so it never leaves a gap at
+    /// an edge it's bigger than (smaller than the window: centred that way)
+    fn set_picture_view(&mut self, zoom: f64, pan: (f64, f64)) {
+        let mut pan = pan;
+        if let (Some((w, h)), Some(fit)) = (self.picture_size(), self.fit_scale()) {
+            let s = fit * zoom.exp2();
+            let (ww, wh) = self.window_px();
+            let keep = |p: f64, shown: f64, room: f64| {
+                if shown <= room {
+                    0.0
+                } else {
+                    let most = (shown - room) / 2.0 / shown;
+                    p.clamp(-most, most)
+                }
+            };
+            pan = (keep(pan.0, w * s, ww), keep(pan.1, h * s, wh));
+        }
+        if zoom != self.pic_zoom {
+            self.link.set("video-zoom", zoom);
+        }
+        if pan.0 != self.pic_pan.0 {
+            self.link.set("video-pan-x", pan.0);
+        }
+        if pan.1 != self.pic_pan.1 {
+            self.link.set("video-pan-y", pan.1);
+        }
+        self.pic_zoom = zoom;
+        self.pic_pan = pan;
+    }
+
+    /// Zoom in (steps > 0) or out by 25 % a step, keeping the spot under the
+    /// pointer where it is (`at`; None: the middle of the window)
+    pub(crate) fn picture_zoom_by(&mut self, steps: f64, at: Option<Pos2>) {
+        let (Some((w, h)), Some(fit)) = (self.picture_size(), self.fit_scale()) else { return };
+        let z0 = self.pic_zoom;
+        // (from an eighth of fitting the window up to 32 times its own size)
+        let z1 = (z0 + steps * 1.25_f64.log2()).clamp(-3.0, (32.0 / fit).log2().max(0.0));
+        if z1 == z0 {
+            return;
+        }
+        let ppp = self.egui_ctx.pixels_per_point();
+        let mid = self.egui_ctx.screen_rect().center();
+        let (cx, cy) = at.map_or((0.0, 0.0), |p| (((p.x - mid.x) * ppp) as f64, ((p.y - mid.y) * ppp) as f64));
+        // The spot under the pointer, as a part of the picture's shown size,
+        // stays under it: pan = c / new size − c / old size + pan before
+        let (w0, h0) = (w * fit * z0.exp2(), h * fit * z0.exp2());
+        let (w1, h1) = (w * fit * z1.exp2(), h * fit * z1.exp2());
+        let pan = (cx / w1 - cx / w0 + self.pic_pan.0, cy / h1 - cy / h0 + self.pic_pan.1);
+        self.set_picture_view(z1, pan);
+    }
+
+    /// Move a zoomed picture by a drag of `dx`, `dy` points
+    fn picture_pan_by(&mut self, dx: f32, dy: f32) {
+        let (Some((w, h)), Some(fit)) = (self.picture_size(), self.fit_scale()) else { return };
+        let s = fit * self.pic_zoom.exp2();
+        let ppp = self.egui_ctx.pixels_per_point() as f64;
+        let pan = (self.pic_pan.0 + dx as f64 * ppp / (w * s), self.pic_pan.1 + dy as f64 * ppp / (h * s));
+        self.set_picture_view(self.pic_zoom, pan);
+    }
+
+    /// The whole picture in the window
+    pub(crate) fn picture_fit(&mut self) {
+        self.set_picture_view(0.0, (0.0, 0.0));
+    }
+
+    /// The picture at its own size, pixel for pixel (centred)
+    pub(crate) fn picture_actual(&mut self) {
+        if let Some(fit) = self.fit_scale() {
+            self.set_picture_view(-fit.log2(), (0.0, 0.0));
+        }
+    }
+
+    /// Make the picture the desktop wallpaper, at full quality. A JPG, PNG, BMP
+    /// or TIFF goes to Windows as it is; anything else (or turned / mirrored
+    /// here) is first saved as a PNG next to the settings, by ffmpeg.
+    pub(crate) fn set_wallpaper(&mut self) {
+        let path = self.current_file.clone();
+        let (rotation, mirror) = (self.rotation, self.mirror);
+        let as_is = has_ext(&path, &["jpg", "jpeg", "jfif", "png", "bmp", "tif", "tiff"]) && rotation == 0 && !mirror;
+        let (slot, ctx) = (self.wallpaper_result.clone(), self.egui_ctx.clone());
+        let _ = std::thread::Builder::new().name("wallpaper".into()).spawn(move || {
+            let result = if as_is {
+                if taskbar::set_wallpaper(&path) { Ok(()) } else { Err("Windows didn't take it.".to_owned()) }
+            } else {
+                wallpaper_png(&path, rotation, mirror).and_then(|png| {
+                    if taskbar::set_wallpaper(&png.to_string_lossy()) { Ok(()) } else { Err("Windows didn't take it.".to_owned()) }
+                })
+            };
+            if let Ok(mut s) = slot.lock() {
+                *s = Some(result);
+            }
+            ctx.request_repaint();
+        });
     }
 
     /// Send rotation / mirroring to mpv (and the thumbnail player, so previews match)
@@ -2067,6 +2245,41 @@ impl eframe::App for FluentMediaPlayer {
                 }
             }
         });
+        // ── Pictures: read the ones either side ahead, set as wallpaper ───────
+        // (so the next / previous one opens without waiting on the disk; just
+        // read through, which leaves them in Windows' file cache)
+        if self.is_picture() {
+            let key = (self.current_file.clone(), self.folder_files.len());
+            if self.pic_prefetch != key {
+                self.pic_prefetch = key;
+                let near: Vec<PathBuf> = [1, -1, 2]
+                    .iter()
+                    .filter_map(|&d| self.step_index(d))
+                    .filter_map(|i| self.folder_files.get(i).cloned())
+                    .filter(|p| {
+                        let s = p.to_string_lossy();
+                        !is_url(&s) && !is_archive_entry(&s)
+                    })
+                    .collect();
+                if !near.is_empty() {
+                    let _ = std::thread::Builder::new().name("read ahead".into()).spawn(move || {
+                        for p in near {
+                            // (not huge files: a 300 MB TIFF isn't worth it)
+                            if std::fs::metadata(&p).is_ok_and(|m| m.len() < 256 << 20) {
+                                if let Ok(mut f) = std::fs::File::open(&p) {
+                                    let _ = std::io::copy(&mut f, &mut std::io::sink());
+                                }
+                            }
+                        }
+                    });
+                }
+            }
+        }
+        let wallpaper = self.wallpaper_result.lock().ok().and_then(|mut s| s.take());
+        if let Some(Err(why)) = wallpaper {
+            self.link_error = Some((std::time::Instant::now(), "Couldn't set the wallpaper", why));
+        }
+
         // ── Archives read in the background ───────────────────────────────────
         let opened = self.archive_result.lock().ok().and_then(|mut s| s.take());
         if let Some((gen, path, inside)) = opened {
@@ -2167,6 +2380,10 @@ impl eframe::App for FluentMediaPlayer {
             // video counts too); larger videos play without it. (Sizes still
             // from the previous file, just after switching, don't count.)
             let same_file = snap.path == self.current_file;
+            if same_file && snap.dwidth > 0 && snap.dheight > 0 {
+                self.pic_size = (snap.dwidth as f64, snap.dheight as f64);
+                self.pic_turn = snap.rotate;
+            }
             let pixels = if same_file { snap.dwidth.max(0) * snap.dheight.max(0) } else { 0 };
             let ok = pixels > 0 && pixels <= 1920 * 1088;
             if ok != self.denoise_ok {
@@ -2265,6 +2482,18 @@ impl eframe::App for FluentMediaPlayer {
         if self.hwnd != 0 && !self.taskbar_tried {
             self.taskbar_tried = true;
             taskbar::hook_window(self.hwnd);
+            // Maximized last time: maximize now, before the window is first shown
+            // (it used to appear at its normal size and maximize half a second
+            // later). Its normal size is still the one to restore to.
+            if self.start_max && !self.start_max_done {
+                self.start_max_done = true;
+                unsafe {
+                    if IsZoomed(self.hwnd) == 0 {
+                        ShowWindow(self.hwnd, 3); // SW_MAXIMIZE
+                    }
+                }
+                ctx.request_repaint();
+            }
             self.taskbar = taskbar::Taskbar::new(self.hwnd);
             self.win11_frame = taskbar::round_corners(self.hwnd);
             // (smooth motion needs the window to find the monitor's refresh rate)
@@ -2673,8 +2902,10 @@ impl eframe::App for FluentMediaPlayer {
             }
         }
         if inp.space { self.toggle_play_pause(); }
-        if inp.right { self.step(5.0); }
-        if inp.left  { self.step(-5.0); }
+        // (a picture: the next / previous one)
+        let picture = self.is_picture();
+        if inp.right { if picture { self.play_adjacent(1) } else { self.step(5.0) } }
+        if inp.left  { if picture { self.play_adjacent(-1) } else { self.step(-5.0) } }
         if inp.up    { self.nudge_volume(5.0); }
         if inp.down  { self.nudge_volume(-5.0); }
         if inp.m     { let m = !self.muted; self.set_mute(m); self.volume_osd = Some(std::time::Instant::now()); self.seek_osd = None; }
@@ -2726,7 +2957,12 @@ impl eframe::App for FluentMediaPlayer {
         // (egui reports one wheel notch as 50 points). Not over the Picture & sound
         // panels (the wheel adjusts the setting there) or the shortcuts list.
         let over_panels = inp.pointer.is_some_and(|p| self.adjust_ui.contains(p));
-        if !over_panels && !self.show_keys {
+        if picture {
+            // A picture: the wheel zooms it, toward the pointer (25 % a notch)
+            if !over_panels && !self.show_keys && inp.scroll_y != 0.0 {
+                self.picture_zoom_by(inp.scroll_y as f64 / 50.0, inp.pointer);
+            }
+        } else if !over_panels && !self.show_keys {
             self.scroll_accum += inp.scroll_y;
         }
         let steps = (self.scroll_accum / 50.0).trunc();
@@ -2797,8 +3033,25 @@ impl eframe::App for FluentMediaPlayer {
                     self.toggle_fullscreen(ctx);
                 }
 
+                // A picture bigger than the window: dragging moves it about
+                let pan = self.is_picture() && self.picture_overflows();
+                if pan && resp.drag_started_by(egui::PointerButton::Primary) {
+                    self.pic_drag = true;
+                }
+                if self.pic_drag {
+                    if resp.dragged_by(egui::PointerButton::Primary) {
+                        let d = resp.drag_delta();
+                        self.picture_pan_by(d.x, d.y);
+                        ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
+                    } else {
+                        self.pic_drag = false;
+                    }
+                } else if pan && resp.hovered() {
+                    ctx.set_cursor_icon(egui::CursorIcon::Grab);
+                }
+
                 // Drag anywhere on the video (left button) → move the window
-                if resp.drag_started_by(egui::PointerButton::Primary) && !self.is_fullscreen && edge.is_none() {
+                if !pan && resp.drag_started_by(egui::PointerButton::Primary) && !self.is_fullscreen && edge.is_none() {
                     ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
                 }
 
@@ -2836,7 +3089,14 @@ impl eframe::App for FluentMediaPlayer {
         } else {
             self.main_menu = false;
         }
-        if t > 0.0 {
+        if self.is_picture() {
+            // A picture: its tools in a pill, and arrows at the window's sides
+            self.speed_menu = false;
+            if t > 0.0 {
+                draw_picture_bar(self, ctx, t);
+            }
+            draw_picture_arrows(self, ctx);
+        } else if t > 0.0 {
             draw_bottom_bar(self, ctx, t);
             draw_speed_menu(self, ctx);
         } else {
@@ -3239,6 +3499,47 @@ fn hit_edge(p: Pos2, screen: Rect) -> Option<(egui::viewport::ResizeDirection, e
 }
 
 // ── Windows accent colour ─────────────────────────────────────────────────────
+/// The picture at `path` saved as a PNG for the wallpaper (turned `rotation`
+/// degrees and mirrored, as shown), next to the settings: for formats Windows
+/// can't take as wallpaper itself (WebP, AVIF, JPEG XL, HEIC…)
+fn wallpaper_png(path: &str, rotation: i32, mirror: bool) -> Result<PathBuf, String> {
+    let ffmpeg = std::env::current_exe()
+        .ok()
+        .and_then(|e| e.parent().map(|d| d.join("ffmpeg.exe")))
+        .filter(|p| p.is_file())
+        .ok_or("ffmpeg.exe isn't in the player's folder.")?;
+    let out = settings_path().ok_or("No settings folder.")?.with_file_name("wallpaper.png");
+    if let Some(dir) = out.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    // (mirrored first, then turned: the order the player shows it in)
+    let mut filters: Vec<&str> = Vec::new();
+    if mirror {
+        filters.push("hflip");
+    }
+    filters.extend(match rotation {
+        90 => &["transpose=1"][..],
+        180 => &["transpose=1", "transpose=1"][..],
+        270 => &["transpose=2"][..],
+        _ => &[][..],
+    });
+    let mut cmd = std::process::Command::new(ffmpeg);
+    cmd.args(["-y", "-v", "error", "-i"]).arg(path).args(["-frames:v", "1"]);
+    if !filters.is_empty() {
+        cmd.arg("-vf").arg(filters.join(","));
+    }
+    cmd.arg(&out);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    match cmd.status() {
+        Ok(s) if s.success() && out.is_file() => Ok(out),
+        _ => Err("ffmpeg couldn't convert the picture.".to_owned()),
+    }
+}
+
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }

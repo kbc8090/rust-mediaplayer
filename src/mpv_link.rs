@@ -35,6 +35,9 @@ pub struct Snapshot {
     /// Displayed video size (0 for audio-only / nothing loaded)
     pub dwidth: i64,
     pub dheight: i64,
+    /// The turn the file itself asks for (a phone photo or video held upright),
+    /// in degrees; the size above is before it
+    pub rotate: i64,
     /// The video's frame rate (0 if unknown / no video)
     pub fps: f64,
     /// The file these details belong to (as passed to loadfile)
@@ -267,6 +270,7 @@ fn run(mpv: Arc<Mutex<Mpv>>, rx: mpsc::Receiver<Job>, state: Arc<Mutex<Snapshot>
             eof: m.get_property::<bool>("eof-reached").unwrap_or(false),
             dwidth: m.get_property::<i64>("dwidth").unwrap_or(0),
             dheight: m.get_property::<i64>("dheight").unwrap_or(0),
+            rotate: m.get_property::<i64>("video-params/rotate").unwrap_or(0),
             fps: m
                 .get_property::<f64>("container-fps")
                 .ok()

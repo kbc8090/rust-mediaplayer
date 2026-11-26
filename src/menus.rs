@@ -12,6 +12,8 @@ pub(crate) const SHORTCUTS: &[(&[&str], &str)] = &[
     (&["F"], "Next frame"),
     (&["\u{2191}", "\u{2193}"], "Volume up / down"),
     (&["Mouse wheel"], "Volume up / down"),
+    (&["\u{2190}", "\u{2192}"], "Pictures: previous / next"),
+    (&["Mouse wheel"], "Pictures: zoom"),
     (&["M"], "Mute"),
     (&["P"], "Previous file"),
     (&["N"], "Next file"),
@@ -391,6 +393,10 @@ pub(crate) fn draw_main_menu(app: &mut FluentMediaPlayer, ctx: &egui::Context) {
     if app.has_file && app.duration > 1.0 && !app.live && !is_archive_entry(&app.current_file) {
         rows.push(MenuRow::Item { key: "clip", label: "Save clip as\u{2026}", hint: Some("Ctrl+Shift+S"), mark: Mark::None });
     }
+    // Set as wallpaper, for a picture that's a file here (not one inside an archive)
+    if app.is_picture() && !is_url(&app.current_file) && !is_archive_entry(&app.current_file) {
+        rows.push(MenuRow::Item { key: "wallpaper", label: "Set as wallpaper", hint: None, mark: Mark::None });
+    }
     rows.extend([
         MenuRow::Sep,
         MenuRow::Item { key: "adjust", label: "Picture & Sound", hint: Some("E"), mark: Mark::None },
@@ -541,6 +547,7 @@ pub(crate) fn draw_main_menu(app: &mut FluentMediaPlayer, ctx: &egui::Context) {
         Some("open_url") => app.show_url_box(),
         Some("save") => app.ask_save_folder(),
         Some("clip") => app.start_clip(),
+        Some("wallpaper") => app.set_wallpaper(),
         Some("cancel_save") => app.save = None,
         Some("adjust") => {
             app.adjust_ui.open = true;
