@@ -103,8 +103,9 @@ enum Job {
 /// How many times mpv has said playback (re)started: a file's first picture is
 /// ready (also after a seek). Counted by mpv's event thread.
 pub static PLAYBACK_RESTARTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-/// The file playback last (re)started for, as given to mpv
-pub static RESTART_PATH: Mutex<String> = Mutex::new(String::new());
+/// What playback last (re)started for: the file, as given to mpv, and its
+/// picture's size and own rotation then (mpv's dwidth, dheight, rotate)
+pub static RESTART: Mutex<(String, i64, i64, i64)> = Mutex::new((String::new(), 0, 0, 0));
 
 pub struct MpvLink {
     tx: mpsc::Sender<Job>,
@@ -121,7 +122,7 @@ impl MpvLink {
     pub fn start(mpv: Arc<Mutex<Mpv>>) -> Self {
         // mpv's events, on a thread of their own (only one thing is listened
         // for: a file's first picture being ready, see PLAYBACK_RESTARTS and
-        // RESTART_PATH). mpv
+        // RESTART). mpv
         // takes calls from any thread, so this waits without holding the lock.
         if let Ok(guard) = mpv.lock() {
             // (mpv lives as long as the player: it's never dropped, the process
@@ -131,7 +132,10 @@ impl MpvLink {
                 match events.wait_event(1.0) {
                     Some(Ok(libmpv2::events::Event::PlaybackRestart)) => {
                         let path = events.get_property::<String>("path").unwrap_or_default();
-                        *RESTART_PATH.lock().unwrap_or_else(|e| e.into_inner()) = path;
+                        let w = events.get_property::<i64>("dwidth").unwrap_or(0);
+                        let h = events.get_property::<i64>("dheight").unwrap_or(0);
+                        let rotate = events.get_property::<i64>("video-params/rotate").unwrap_or(0);
+                        *RESTART.lock().unwrap_or_else(|e| e.into_inner()) = (path, w, h, rotate);
                         PLAYBACK_RESTARTS.fetch_add(1, Ordering::Relaxed);
                     }
                     Some(Ok(libmpv2::events::Event::Shutdown)) => break,

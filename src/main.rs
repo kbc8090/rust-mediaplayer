@@ -526,6 +526,11 @@ type PhotoSlot = Arc<Mutex<Option<(String, Option<PhotoDetails>)>>>;
 /// The dark grey around a picture (mpv's background-color, and the window's)
 const PICTURE_BACKDROP: &str = "#2B2C30";
 const PICTURE_GREY: (u8, u8, u8) = (0x2B, 0x2C, 0x30);
+/// A picture's own settings as it's opened: taken for what its first bytes say.
+/// (mpv's check of a file's format wants more certainty than a JPEG gives it, so
+/// it read on and checked again, 2 KB, 4 KB, 8 KB... up to the whole file: half a
+/// second for a 5 MB photo before decoding even started.)
+const PICTURE_OPTIONS: &str = "demuxer-lavf-probescore=25";
 
 /// Keeping the picture just left on screen (see PicFrame::Keep): since when, how
 /// many times playback had (re)started by then (see PLAYBACK_RESTARTS), and since
@@ -535,6 +540,18 @@ struct Holding {
     since: std::time::Instant,
     restarts: u64,
     ready: Option<(std::time::Instant, u32)>,
+    /// Only once this very picture is showing (see cancel_step)
+    strict: bool,
+}
+
+/// The next / previous picture being opened ahead, while the button for it is
+/// held down (see step_press): which file, which way, which button, and how many
+/// times playback had (re)started then
+struct Preload {
+    path: String,
+    delta: isize,
+    source: egui::Id,
+    restarts: u64,
 }
 
 /// A picture gliding to a new zoom over a moment (the wheel, the zoom buttons,
@@ -826,6 +843,8 @@ struct FluentMediaPlayer {
     pic_glide: Option<ZoomGlide>,
     /// Keeping the picture just left on screen (see PicFrame::Keep)
     hold: Option<Holding>,
+    /// The next / previous picture opened ahead while its button is held (see step_press)
+    preload: Option<Preload>,
     /// A photo's details for the Tab overlay (read on another thread): the
     /// picture they're for, and them (None: none in it); and which was asked for
     photo: PhotoSlot,
@@ -1159,6 +1178,7 @@ impl FluentMediaPlayer {
             pic_drag: false,
             pic_glide: None,
             hold: None,
+            preload: None,
             photo: Arc::new(Mutex::new(None)),
             photo_asked: String::new(),
             start_place,
@@ -1413,9 +1433,13 @@ impl FluentMediaPlayer {
         // Leaving a picture: it stays on screen as it is until the next file
         // shows (see PicFrame::Keep). (Already leaving one, quickly: the first
         // file to show after it will do, so going through quickly shows them.)
-        if self.is_picture() && self.hold.is_none() {
-            let restarts = mpv_link::PLAYBACK_RESTARTS.load(std::sync::atomic::Ordering::Relaxed);
-            self.hold = Some(Holding { since: std::time::Instant::now(), restarts, ready: None });
+        // (opened ahead already, while its button was held: mpv has it, or is on it)
+        let preloaded = self.preload.take().filter(|p| p.path == path);
+        if self.is_picture() && (self.hold.is_none() || preloaded.is_some()) {
+            let restarts = preloaded
+                .as_ref()
+                .map_or_else(|| mpv_link::PLAYBACK_RESTARTS.load(std::sync::atomic::Ordering::Relaxed), |p| p.restarts);
+            self.hold = Some(Holding { since: std::time::Instant::now(), restarts, ready: None, strict: false });
         }
         self.current_file = path.to_owned();
         self.has_file = true;
@@ -1474,17 +1498,15 @@ impl FluentMediaPlayer {
         self.link.set("background-color", if picture { PICTURE_BACKDROP } else { "#000000" });
         // Started part way through if right-clicked along its row in the playlist
         let mut options = Vec::new();
-        // A picture: taken for what its first bytes say. (mpv's check of a file's
-        // format wants more certainty than a JPEG gives it, so it read on and
-        // checked again, 2 KB, 4 KB, 8 KB... up to the whole file: half a second
-        // for a 5 MB photo before decoding even started.)
         if picture {
-            options.push("demuxer-lavf-probescore=25".to_owned());
+            options.push(PICTURE_OPTIONS.to_owned());
         }
         if let Some(f) = self.start_at.take() {
             options.push(format!("start={:.2}%", f * 100.0));
         }
-        self.link.command("loadfile", &[path, "replace", "-1", &options.join(",")]);
+        if preloaded.is_none() {
+            self.link.command("loadfile", &[path, "replace", "-1", &options.join(",")]);
+        }
         self.link.set("pause", "no");
         self.is_playing = true;
         self.time_pos = 0.0;
@@ -1834,14 +1856,18 @@ impl FluentMediaPlayer {
     /// How the picture shows this frame (see PicFrame): the one just left while
     /// the next file opens; this one from its own texture once mpv has it showing
     /// and its size is known; until then as mpv draws it
+    /// mpv has said this file is showing (see mpv_link::RESTART)
+    fn restarted_here(&self) -> bool {
+        mpv_link::RESTART.lock().unwrap_or_else(|e| e.into_inner()).0 == self.current_file
+    }
+
     /// (`area`: where the video goes)
     fn pic_frame(&self, area: Rect) -> PicFrame {
-        if self.hold.is_some() {
+        if self.hold.is_some() || self.preload.is_some() {
             return PicFrame::Keep;
         }
         // (mpv says when it's showing a file; and in case it never says, after a moment)
-        let showing = *mpv_link::RESTART_PATH.lock().unwrap_or_else(|e| e.into_inner()) == self.current_file
-            || self.pic_since.elapsed().as_secs_f32() > 0.5;
+        let showing = self.restarted_here() || self.pic_since.elapsed().as_secs_f32() > 0.5;
         if !self.is_picture() || !showing {
             return PicFrame::Off;
         }
@@ -2543,6 +2569,52 @@ impl FluentMediaPlayer {
         }
     }
 
+    /// The previous / next picture button (`source`) pressed: mpv starts opening
+    /// that picture straight away, unseen (the one showing stays, and nothing
+    /// else changes), so it's ready sooner once the button is let go
+    /// (step_release). Only from a picture to a picture.
+    pub(crate) fn step_press(&mut self, delta: isize, source: egui::Id) {
+        if !self.is_picture() || self.preload.is_some() {
+            return;
+        }
+        let Some(path) = self.step_index(delta).and_then(|i| self.folder_files.get(i)).map(|p| p.to_string_lossy().into_owned()) else {
+            return;
+        };
+        if media_kind(&path) != Some(MediaKind::Image) || is_url(&path) {
+            return;
+        }
+        let restarts = mpv_link::PLAYBACK_RESTARTS.load(std::sync::atomic::Ordering::Relaxed);
+        self.link.command("loadfile", &[&path, "replace", "-1", PICTURE_OPTIONS]);
+        self.preload = Some(Preload { path, delta, source, restarts });
+    }
+
+    /// Whether the button `source` has a picture opening ahead (see step_press)
+    pub(crate) fn step_pressed(&self, source: egui::Id) -> bool {
+        self.preload.as_ref().is_some_and(|p| p.source == source)
+    }
+
+    /// Its button let go: on the button, that picture (already opening);
+    /// elsewhere, never mind
+    pub(crate) fn step_release(&mut self, over: bool) {
+        match self.preload.as_ref().map(|p| p.delta) {
+            Some(delta) if over => self.play_adjacent(delta),
+            Some(_) => self.cancel_step(),
+            None => {}
+        }
+    }
+
+    /// The picture opened ahead isn't wanted after all: mpv back on the one
+    /// showing, which stays on screen as it is meanwhile
+    fn cancel_step(&mut self) {
+        if self.preload.take().is_none() {
+            return;
+        }
+        let restarts = mpv_link::PLAYBACK_RESTARTS.load(std::sync::atomic::Ordering::Relaxed);
+        self.hold = Some(Holding { since: std::time::Instant::now(), restarts, ready: None, strict: true });
+        let path = self.current_file.clone();
+        self.link.command("loadfile", &[&path, "replace", "-1", PICTURE_OPTIONS]);
+    }
+
     /// Skip with the keys / taskbar buttons, and show "+5 sec" (adding up quick repeats
     /// in the same direction)
     fn step(&mut self, secs: f64) {
@@ -2646,6 +2718,11 @@ impl FluentMediaPlayer {
 
 impl eframe::App for FluentMediaPlayer {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        // A picture opened ahead whose button was let go without anything
+        // seeing it (the button went away): not wanted
+        if self.preload.is_some() && ctx.input(|i| !i.pointer.primary_down() && !i.pointer.primary_released()) {
+            self.cancel_step();
+        }
         self.blank_hover_prev = std::mem::take(&mut self.blank_hover);
         // No button ever keeps keyboard focus. egui moves focus between buttons with
         // Tab (our info key), and a focused button also "clicks" on Space / Enter,
@@ -2671,12 +2748,25 @@ impl eframe::App for FluentMediaPlayer {
         // The picture just left (see PicFrame::Keep) gives way once mpv has the
         // next file showing (it says so: playback started) and has drawn a frame
         // since, or a moment after (the frame drawn already). In any case after 1.5 s.
+        // A picture's size as mpv said it when it showed it (sooner than the
+        // regular readings, see mpv_link::RESTART)
+        if self.is_picture() && self.pic_size == (0.0, 0.0) {
+            let r = mpv_link::RESTART.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            if r.0 == self.current_file && r.1 > 0 && r.2 > 0 {
+                self.pic_size = (r.1 as f64, r.2 as f64);
+                self.pic_turn = r.3;
+            }
+        }
         if let Some(mut h) = self.hold {
             let frames = WIN_FRAMES.with(|f| f.get());
             if h.ready.is_none() && mpv_link::PLAYBACK_RESTARTS.load(std::sync::atomic::Ordering::Relaxed) > h.restarts {
                 h.ready = Some((std::time::Instant::now(), frames));
             }
-            let done = h.ready.is_some_and(|(r, at)| frames > at || r.elapsed().as_secs_f32() > 0.06)
+            // (going to another picture: as soon as mpv says it's showing it,
+            // with its size, since it's drawn from mpv straight away then)
+            let picture_ready = self.is_picture() && h.ready.is_some() && self.restarted_here() && self.pic_size != (0.0, 0.0);
+            let done = picture_ready
+                || (!h.strict && h.ready.is_some_and(|(r, at)| frames > at || r.elapsed().as_secs_f32() > 0.06))
                 || h.since.elapsed().as_secs_f32() > 1.5;
             if done {
                 self.hold = None;

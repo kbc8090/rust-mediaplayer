@@ -1648,6 +1648,12 @@ fn icon_wallpaper(p: &egui::Painter, c: Pos2, col: Color32) {
     p.circle_stroke(at(15.6, 8.0), 1.2 * K, Stroke::new(SW, col));
 }
 
+/// Previous / next picture: a chevron, like the arrows at the window's edges
+fn icon_chevron(p: &egui::Painter, c: Pos2, col: Color32, left: bool) {
+    let s = if left { 1.0 } else { -1.0 };
+    kpoly(p, c, &[(3.5 * s, -7.5), (-4.0 * s, 0.0), (3.5 * s, 7.5)], col, SW);
+}
+
 /// Fit to window: a small frame inside four corners
 fn icon_fit(p: &egui::Painter, c: Pos2, col: Color32) {
     for (sx, sy) in [(-1.0_f32, -1.0_f32), (1.0, -1.0), (-1.0, 1.0), (1.0, 1.0)] {
@@ -1657,7 +1663,7 @@ fn icon_fit(p: &egui::Painter, c: Pos2, col: Color32) {
 }
 
 /// A picture's tools, in a frosted pill floating at the bottom in place of the
-/// controls: zoom out / the zoom / zoom in, fit to the window, its own size,
+/// controls: previous / next, zoom out / the zoom / zoom in, fit to the window, its own size,
 /// rotate, mirror, set as wallpaper (a file here), full screen
 pub(crate) fn draw_picture_bar(app: &mut FluentMediaPlayer, ctx: &egui::Context, t: f32) {
     let screen = ctx.screen_rect();
@@ -1667,12 +1673,12 @@ pub(crate) fn draw_picture_bar(app: &mut FluentMediaPlayer, ctx: &egui::Context,
     let percent = app.picture_percent();
     let zoom_txt = percent.map_or_else(|| "\u{2013}".to_owned(), |z| format!("{z:.0}%"));
 
-    // Laid out left to right: − 62% + | fit 1:1 | rotate mirror wallpaper | full screen
+    // Laid out left to right: ‹ › | − 62% + | fit 1:1 | rotate mirror wallpaper | full screen
     const PAD: f32 = 8.0;
     const SEP: f32 = 17.0;
     const ZOOM_W: f32 = 50.0;
     let wallpaper = app.can_set_wallpaper();
-    let w = PAD * 2.0 + BTN_STEP * 2.0 + ZOOM_W + SEP + BTN_STEP * 2.0 + SEP + BTN_STEP * if wallpaper { 3.0 } else { 2.0 } + SEP + BTN_STEP;
+    let w = PAD * 2.0 + BTN_STEP * 2.0 + SEP + BTN_STEP * 2.0 + ZOOM_W + SEP + BTN_STEP * 2.0 + SEP + BTN_STEP * if wallpaper { 3.0 } else { 2.0 } + SEP + BTN_STEP;
     let h = 42.0;
     let rect = Rect::from_min_size(pos2((screen.center().x - w / 2.0).round(), screen.bottom() - 12.0 - h), vec2(w, h));
 
@@ -1702,22 +1708,28 @@ pub(crate) fn draw_picture_bar(app: &mut FluentMediaPlayer, ctx: &egui::Context,
             (hit(ui, c, id, tip, t).activated(), c)
         };
 
+        // Previous / next picture (greyed out at either end of the folder)
+        for (delta, left) in [(-1_isize, true), (1, false)] {
+            let tip = if left { "Previous picture (\u{2190})" } else { "Next picture (\u{2192})" };
+            let c = pos2(x + BTN_STEP / 2.0, y);
+            x += BTN_STEP;
+            let resp = hit(ui, c, if left { "pic_prev" } else { "pic_next" }, tip, t);
+            let can = app.step_index(delta).is_some();
+            icon_chevron(&p, c, if can { white } else { white.gamma_multiply(0.35) }, left);
+            if can {
+                step_clicks(app, ctx, &resp, delta);
+            }
+        }
+        sep(&p, x + SEP / 2.0);
+        x += SEP;
+
         let (go, c) = button(ui, &mut x, "zoom_out", "Zoom out (mouse wheel)");
         icon_zoom(&p, c, white, false);
         if go {
             app.picture_zoom_by(-1.0, None);
         }
-        // The zoom: click it to fit the window again
+        // The zoom (just shown: fit has its own button)
         let zr = Rect::from_min_size(pos2(x, y - 15.0), vec2(ZOOM_W, 30.0));
-        let zresp = ui.interact(zr, ui.id().with("zoom_pct"), Sense::click());
-        if zresp.hovered() {
-            ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
-            p.rect_filled(zr, 8.0, Color32::from_white_alpha((6.0 * t) as u8));
-        }
-        hover_tooltip(ctx, &zresp, zr, "Zoom (click: fit the window)", true);
-        if zresp.clicked() {
-            app.picture_fit();
-        }
         p.text(zr.center(), Align2::CENTER_CENTER, &zoom_txt, FontId::new(12.5, FontFamily::Name("semibold".into())), white);
         x += ZOOM_W;
         let (go, c) = button(ui, &mut x, "zoom_in", "Zoom in (mouse wheel)");
@@ -1777,6 +1789,22 @@ pub(crate) fn picture_arrow_rect(screen: Rect, left: bool) -> Rect {
     Rect::from_min_size(pos2(x0, (screen.center().y - h / 2.0).round()), vec2(w, h))
 }
 
+/// A previous / next picture button's clicks. Pressing it starts opening that
+/// picture already, unseen; letting go on it shows it, letting go elsewhere
+/// forgets it (see step_press)
+fn step_clicks(app: &mut FluentMediaPlayer, ctx: &egui::Context, resp: &egui::Response, delta: isize) {
+    let (pressed, released, from, at) =
+        ctx.input(|i| (i.pointer.primary_pressed(), i.pointer.primary_released(), i.pointer.press_origin(), i.pointer.latest_pos()));
+    if pressed && from.is_some_and(|p| resp.rect.contains(p)) {
+        app.step_press(delta, resp.id);
+    }
+    if released && app.step_pressed(resp.id) {
+        app.step_release(at.is_some_and(|p| resp.rect.contains(p)));
+    } else if resp.clicked() {
+        app.play_adjacent(delta);
+    }
+}
+
 /// Previous / next picture: a tall strip with a thin arrow at each side of the
 /// window, shown while the pointer is on it
 pub(crate) fn draw_picture_arrows(app: &mut FluentMediaPlayer, ctx: &egui::Context) {
@@ -1811,8 +1839,7 @@ pub(crate) fn draw_picture_arrows(app: &mut FluentMediaPlayer, ctx: &egui::Conte
                 } else {
                     egui::Rounding { nw: 10.0, sw: 10.0, ne: 0.0, se: 0.0 }
                 };
-                // (about the bottom bar's dark tint, a touch darker, without its blur)
-                p.rect_filled(r, rounding, Color32::from_rgba_unmultiplied(0x20, 0x21, 0x24, (122.0 * a) as u8));
+                p.rect_filled(r, rounding, Color32::from_black_alpha((128.0 * a) as u8));
                 // A thin chevron, 44 px tall (a little toward the window's edge, so it
                 // looks centred: a chevron's weight is in its open side)
                 let c = r.center() + vec2(if left { -3.0 } else { 3.0 }, 0.0);
@@ -1821,9 +1848,7 @@ pub(crate) fn draw_picture_arrows(app: &mut FluentMediaPlayer, ctx: &egui::Conte
                 let stroke = Stroke::new(2.6_f32, Color32::WHITE.gamma_multiply(a));
                 p.add(egui::Shape::line(vec![pos2(c.x + dx, c.y - 22.0), pos2(c.x - dx, c.y), pos2(c.x + dx, c.y + 22.0)], stroke));
             }
-            if resp.clicked() {
-                app.play_adjacent(delta);
-            }
+            step_clicks(app, ctx, &resp, delta);
         });
     }
 }
