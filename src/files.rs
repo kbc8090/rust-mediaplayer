@@ -106,7 +106,7 @@ pub(crate) const MUSIC_EXTS: &[&str] = &[
 ];
 
 pub(crate) const IMAGE_EXTS: &[&str] = &[
-    "jpg", "jpeg", "png", "gif", "webp", "avif", "bmp", "tif", "tiff", "jxl",
+    "jpg", "jpeg", "png", "gif", "webp", "avif", "bmp", "tif", "tiff", "jxl", "heic", "heif",
 ];
 
 pub(crate) const PLAYLIST_EXTS: &[&str] = &["m3u", "m3u8"];
@@ -401,11 +401,11 @@ fn same_name(explorer: &str, mpv: &str) -> bool {
 /// A file Explorer copied out of a zip (see `explorer_zip_copy`) and the
 /// rest of that folder of the zip, as a playlist: the files of the same kind,
 /// in the order the Explorer window shows them, the copy itself (which plays
-/// at once, and seeks fastest) in its place among them. None if the zip or
-/// its Explorer window can't be found. (Asks Explorer and reads the zip: run
-/// it on another thread.)
-pub(crate) fn explorer_zip_playlist(copy: &str) -> Option<(String, Vec<String>, usize)> {
-    let (zip, inside) = explorer_zip_copy(copy)?;
+/// at once, and seeks fastest) in its place among them. Err: why the zip or
+/// its Explorer window couldn't be found (shown in the Tab overlay). (Asks
+/// Explorer and reads the zip: run it on another thread.)
+pub(crate) fn explorer_zip_playlist(copy: &str) -> Result<(String, Vec<String>, usize), String> {
+    let (zip, inside) = explorer_zip_copy(copy).ok_or_else(|| format!("not a copy from a zip: {copy}"))?;
     let shown = format!("{zip}\\{inside}");
     let items = taskbar::explorer_zip_folder(shown.clone())?;
     // "C:\Downloads\Videos.zip\Season 1\Ep 2.mkv" → the zip, "C:\Downloads\Videos.zip"
@@ -415,14 +415,14 @@ pub(crate) fn explorer_zip_playlist(copy: &str) -> Option<(String, Vec<String>, 
         let tail: String = s.chars().skip(s.chars().count().saturating_sub(n)).collect();
         s.chars().count() > n && same_name(&want, &tail)
     };
-    let clicked = items.iter().find(|s| ends(s))?;
+    let clicked = items.iter().find(|s| ends(s)).ok_or_else(|| format!("{} files in the window, none ending in {want}", items.len()))?;
     let keep = clicked.chars().count() - inside.chars().count() - 1;
     let archive: String = clicked.chars().take(keep).collect();
     if !Path::new(&archive).is_file() {
-        return None;
+        return Err(format!("the zip isn't a file here: {archive}"));
     }
-    let kind = media_kind(copy)?;
-    let listed = archive_entries(&archive)?;
+    let kind = media_kind(copy).ok_or("not a media file")?;
+    let listed = archive_entries(&archive).ok_or_else(|| format!("mpv couldn't read {archive}"))?;
     let mut files = Vec::new();
     let mut at = None;
     for item in &items {
@@ -438,6 +438,15 @@ pub(crate) fn explorer_zip_playlist(copy: &str) -> Option<(String, Vec<String>, 
             files.push(e.clone());
         }
     }
-    let at = at?;
-    (files.len() > 1).then_some((zip, files, at))
+    let at = at.ok_or("lost the clicked file")?;
+    if files.len() > 1 {
+        Ok((zip, files, at))
+    } else {
+        Err(format!(
+            "only the clicked file matched: {} in the window, mpv listed {} (first: {})",
+            items.len(),
+            listed.len(),
+            listed.first().map_or("none", |e| inside_of(e))
+        ))
+    }
 }

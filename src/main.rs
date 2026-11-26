@@ -565,6 +565,8 @@ struct FluentMediaPlayer {
     archive_result: Arc<Mutex<Option<(u64, String, Inside)>>>,
     pub(crate) archive_peek: Arc<Mutex<Option<(String, Inside)>>>,
     zip_found: Arc<Mutex<Option<ZipFound>>>,
+    /// (temporary, while testing: how the last zip lookup went, for Tab)
+    zip_status: Arc<Mutex<Option<String>>>,
     egui_ctx: egui::Context,
     /// Order of previous / next in a folder
     sort_by: SortBy,
@@ -868,6 +870,7 @@ impl FluentMediaPlayer {
             archive_result: Arc::new(Mutex::new(None)),
             archive_peek: Arc::new(Mutex::new(None)),
             zip_found: Arc::new(Mutex::new(None)),
+            zip_status: Arc::new(Mutex::new(None)),
             egui_ctx: cc.egui_ctx.clone(),
             sort_by: st.sort_by,
             sort_desc: st.sort_desc,
@@ -933,15 +936,31 @@ impl FluentMediaPlayer {
             // A file Explorer copied out of a zip (double-clicked in it): it plays
             // at once, and previous / next go through the rest of that folder of
             // the zip as soon as it's been found (Explorer is asked which zip)
-            if explorer_zip_copy(path).is_some() {
+            let zip_copy = explorer_zip_copy(path);
+            if let Ok(mut s) = self.zip_status.lock() {
+                *s = Some(match &zip_copy {
+                    Some((zip, inside)) => format!("copy from {zip} ({inside}), looking\u{2026}"),
+                    None => format!("not a copy from a zip: {path}"),
+                });
+            }
+            if zip_copy.is_some() {
                 let (gen, slot, ctx, copy) = (self.archive_gen, self.zip_found.clone(), self.egui_ctx.clone(), path.to_owned());
+                let status = self.zip_status.clone();
                 let _ = std::thread::Builder::new().name("zip".into()).spawn(move || {
-                    if let Some((zip, files, at)) = explorer_zip_playlist(&copy) {
+                    let t0 = std::time::Instant::now();
+                    let found = explorer_zip_playlist(&copy);
+                    if let Ok(mut s) = status.lock() {
+                        *s = Some(match &found {
+                            Ok((zip, files, at)) => format!("found {zip}: {} files, this is #{} ({} ms)", files.len(), at + 1, t0.elapsed().as_millis()),
+                            Err(why) => format!("{why} ({} ms)", t0.elapsed().as_millis()),
+                        });
+                    }
+                    if let Ok((zip, files, at)) = found {
                         if let Ok(mut s) = slot.lock() {
                             *s = Some(ZipFound { gen, copy, zip, files, at });
                         }
-                        ctx.request_repaint();
                     }
+                    ctx.request_repaint();
                 });
             }
         }
@@ -1838,6 +1857,15 @@ impl FluentMediaPlayer {
         if let Some((ws, private)) = process_memory_mb() {
             rows.push(InfoRow::Item("Memory", format!("{ws:.0} MB  \u{b7}  {private:.0} MB private")));
         }
+        // (temporary, while testing the zip lookup)
+        if let Some(z) = self.zip_status.lock().ok().and_then(|s| s.clone()) {
+            rows.push(InfoRow::Section("Zip lookup"));
+            // (in short lines, so the panel doesn't grow wide)
+            let chars: Vec<char> = z.chars().collect();
+            for (i, line) in chars.chunks(70).enumerate() {
+                rows.push(InfoRow::Item(if i == 0 { "Result" } else { "" }, line.iter().collect()));
+            }
+        }
         self.info_rows = rows;
     }
 
@@ -2066,7 +2094,19 @@ impl eframe::App for FluentMediaPlayer {
         let zip = self.zip_found.lock().ok().and_then(|mut s| s.take());
         if let Some(z) = zip {
             // (still on the file Explorer copied out, and nothing else opened since)
-            if z.gen == self.archive_gen && self.current_file == z.copy && self.playlist.is_none() {
+            let used = z.gen == self.archive_gen && self.current_file == z.copy && self.playlist.is_none();
+            if !used {
+                if let Ok(mut s) = self.zip_status.lock() {
+                    *s = Some(format!(
+                        "found it, but not used: gen {} vs {}, same file {}, playlist {}",
+                        z.gen,
+                        self.archive_gen,
+                        self.current_file == z.copy,
+                        self.playlist.is_some()
+                    ));
+                }
+            }
+            if used {
                 let entries = z.files.into_iter().map(|f| PlaylistEntry { path: PathBuf::from(f), title: None, secs: None }).collect();
                 self.start_playlist_at(PathBuf::from(z.zip), entries, false, z.at);
                 // (like a folder: the list stays closed until asked for)

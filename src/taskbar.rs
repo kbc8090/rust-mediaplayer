@@ -842,10 +842,10 @@ unsafe fn run_open_dialog(owner: isize, initial_dir: Option<String>) -> Vec<Stri
         "Media files\0",
         "*.mp4;*.mkv;*.avi;*.mov;*.wmv;*.flv;*.webm;*.m4v;*.ts;*.m2ts;*.mts;*.mpg;*.mpeg;*.3gp;*.ogv;",
         "*.mp3;*.flac;*.wav;*.m4a;*.aac;*.ogg;*.oga;*.opus;*.wma;*.alac;*.aiff;*.aif;*.ape;*.wv;*.mka;",
-        "*.jpg;*.jpeg;*.png;*.gif;*.webp;*.avif;*.bmp;*.tif;*.tiff;*.jxl;*.m3u;*.m3u8;*.zip;*.rar;*.7z\0",
+        "*.jpg;*.jpeg;*.png;*.gif;*.webp;*.avif;*.bmp;*.tif;*.tiff;*.jxl;*.heic;*.heif;*.m3u;*.m3u8;*.zip;*.rar;*.7z\0",
         "Video\0*.mp4;*.mkv;*.avi;*.mov;*.wmv;*.flv;*.webm;*.m4v;*.ts;*.m2ts;*.mts;*.mpg;*.mpeg;*.3gp;*.ogv\0",
         "Music\0*.mp3;*.flac;*.wav;*.m4a;*.aac;*.ogg;*.oga;*.opus;*.wma;*.alac;*.aiff;*.aif;*.ape;*.wv;*.mka\0",
-        "Pictures\0*.jpg;*.jpeg;*.png;*.gif;*.webp;*.avif;*.bmp;*.tif;*.tiff;*.jxl\0",
+        "Pictures\0*.jpg;*.jpeg;*.png;*.gif;*.webp;*.avif;*.bmp;*.tif;*.tiff;*.jxl;*.heic;*.heif\0",
         "Playlists\0*.m3u;*.m3u8\0",
         "Archives\0*.zip;*.rar;*.7z\0",
         "All files\0*.*\0\0"
@@ -1642,8 +1642,8 @@ unsafe fn explorer_selection(wanted: &[String]) -> Option<Vec<String>> {
 /// in that folder of the zip, in the order the window shows them, such as
 /// "C:\…\Videos.zip\Season 1\Ep 1.mkv". `shown`: the file as
 /// "Videos.zip\Season 1\Ep 2.mkv" (that window has it selected). None if no
-/// open window shows it.
-pub fn explorer_zip_folder(shown: String) -> Option<Vec<String>> {
+/// open window shows it (what it found instead, for the Tab overlay).
+pub fn explorer_zip_folder(shown: String) -> Result<Vec<String>, String> {
     let tail = format!("\\{}", shown.to_lowercase());
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
@@ -1655,21 +1655,23 @@ pub fn explorer_zip_folder(shown: String) -> Option<Vec<String>> {
         };
         let _ = tx.send(items);
     });
-    rx.recv_timeout(Duration::from_millis(1500)).ok().flatten()
+    rx.recv_timeout(Duration::from_millis(1500)).unwrap_or_else(|_| Err("Explorer didn't answer in time".to_owned()))
 }
 
-unsafe fn explorer_zip(tail: &str) -> Option<Vec<String>> {
+unsafe fn explorer_zip(tail: &str) -> Result<Vec<String>, String> {
     let mut out = std::ptr::null_mut();
     if CoCreateInstance(&CLSID_SHELL_WINDOWS, std::ptr::null_mut(), 0x17 /* CLSCTX_ALL */, &IID_ISHELL_WINDOWS, &mut out) < 0 {
-        return None;
+        return Err("couldn't ask Explorer for its windows".to_owned());
     }
-    let windows = Com::new(out)?;
+    let windows = Com::new(out).ok_or("no Explorer window list")?;
     let get_count: unsafe extern "system" fn(*mut c_void, *mut i32) -> i32 = std::mem::transmute(method(windows.0, 7));
     let item: unsafe extern "system" fn(*mut c_void, VariantI4, *mut *mut c_void) -> i32 = std::mem::transmute(method(windows.0, 8));
     let mut count = 0;
     if get_count(windows.0, &mut count) < 0 {
-        return None;
+        return Err("couldn't count Explorer's windows".to_owned());
     }
+    // (what was seen, should it not be found)
+    let mut seen = Vec::new();
     for i in 0..count.min(64) {
         let mut out = std::ptr::null_mut();
         let index = VariantI4 { vt: 3 /* VT_I4 */, reserved: [0; 3], value: i as i64, rest: 0 };
@@ -1677,12 +1679,16 @@ unsafe fn explorer_zip(tail: &str) -> Option<Vec<String>> {
             continue;
         }
         let Some(window) = Com::new(out) else { continue };
-        let Some(selection) = window_items(&window, SVGIO_SELECTION, SIGDN_DESKTOPABSOLUTEPARSING) else { continue };
+        let Some(selection) = window_items(&window, SVGIO_SELECTION, SIGDN_DESKTOPABSOLUTEPARSING) else {
+            seen.push("(a window with nothing selected)".to_owned());
+            continue;
+        };
         if selection.iter().any(|s| s.to_lowercase().ends_with(tail)) {
-            return window_items(&window, SVGIO_ALLVIEW, SIGDN_DESKTOPABSOLUTEPARSING);
+            return window_items(&window, SVGIO_ALLVIEW, SIGDN_DESKTOPABSOLUTEPARSING).ok_or_else(|| "couldn't list that window's files".to_owned());
         }
+        seen.push(selection.first().cloned().unwrap_or_else(|| "(a selection without paths)".to_owned()));
     }
-    None
+    Err(format!("{count} Explorer windows, none with it selected; they had: {}", seen.join(" | ")))
 }
 
 /// One Explorer window's items (`which`: the selected ones, or all), in the
