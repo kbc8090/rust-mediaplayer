@@ -275,14 +275,20 @@ fn inside_of(entry: &str) -> &str {
     entry.split_once("|/").map_or("", |(_, inside)| inside)
 }
 
+/// Each kind of file in an archive, with its files
+pub(crate) type KindFiles = Vec<(MediaKind, Vec<String>)>;
+
 /// What's in an archive, as far as playing goes
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum Inside {
     /// Still being read (while dragged over the window)
     Looking,
     /// The files to play, in the same order as a folder's: all of one kind
-    /// (the kind most of its files are: an album's songs, not also its cover)
+    /// (an album's songs, not also its cover picture)
     Media(Vec<String>),
+    /// Several kinds worth playing (305 pictures, 160 videos): each kind's
+    /// files, the kind there's most of first. Which plays is asked.
+    Mixed(KindFiles),
     /// Nothing the player plays
     Nothing,
     /// Not readable as an archive (damaged, password-protected, not one)
@@ -352,21 +358,27 @@ fn archive_entries(archive: &str) -> Option<Vec<String>> {
 /// What there is to play in an archive (reads it: run it on another thread)
 pub(crate) fn archive_media(archive: &str) -> Inside {
     let Some(entries) = archive_entries(archive) else { return Inside::Unreadable };
-    let of = |k: MediaKind| entries.iter().filter(|e| media_kind(e) == Some(k)).count();
-    let (v, m, i) = (of(MediaKind::Video), of(MediaKind::Music), of(MediaKind::Image));
-    let kind = if v == 0 && m == 0 && i == 0 {
-        return Inside::Nothing;
-    } else if v >= m && v >= i {
-        MediaKind::Video
-    } else if m >= i {
-        MediaKind::Music
-    } else {
-        MediaKind::Image
-    };
-    let mut files: Vec<String> = entries.into_iter().filter(|e| media_kind(e) == Some(kind)).collect();
-    // (in the same order as a folder's files)
-    files.sort_by(|a, b| natural_cmp(inside_of(a), inside_of(b)));
-    Inside::Media(files)
+    let mut kinds: KindFiles = [MediaKind::Video, MediaKind::Music, MediaKind::Image]
+        .into_iter()
+        .map(|k| {
+            let mut files: Vec<String> = entries.iter().filter(|e| media_kind(e) == Some(k)).cloned().collect();
+            // (in the same order as a folder's files)
+            files.sort_by(|a, b| natural_cmp(inside_of(a), inside_of(b)));
+            (k, files)
+        })
+        .filter(|(_, files)| !files.is_empty())
+        .collect();
+    // A few pictures next to songs or videos are covers and scans (cover.jpg,
+    // back.jpg…), not something to choose to play
+    if kinds.iter().any(|(k, _)| *k != MediaKind::Image) {
+        kinds.retain(|(k, files)| *k != MediaKind::Image || files.len() > 5);
+    }
+    kinds.sort_by_key(|(_, files)| std::cmp::Reverse(files.len()));
+    match kinds.len() {
+        0 => Inside::Nothing,
+        1 => Inside::Media(kinds.remove(0).1),
+        _ => Inside::Mixed(kinds),
+    }
 }
 
 /// A file in the temporary folder (where Explorer copies a file out of a zip
@@ -380,8 +392,8 @@ pub(crate) fn temp_copy_name(path: &str) -> Option<String> {
     in_temp.then(|| name.to_owned())
 }
 
-/// The path with every letter shown as x and every digit as 9 (for the Tab
-/// overlay while testing: its shape, without the names)
+/// The path with every letter shown as x and every digit as 9 (for error
+/// messages: its shape, without the names)
 pub(crate) fn path_shape(path: &str) -> String {
     let temp = std::env::temp_dir().to_string_lossy().trim_end_matches('\\').to_owned();
     let (head, rest) = match path.get(..temp.len()) {
@@ -404,11 +416,10 @@ fn same_name(explorer: &str, mpv: &str) -> bool {
 }
 
 /// A file Explorer copied out of a zip (see `temp_copy_name`) and the rest
-/// of that folder of the zip, as a playlist: the files of the same kind, in
-/// the order the Explorer window shows them, the copy itself (which plays at
-/// once, and seeks fastest) in its place among them. Err: why the zip or its
-/// Explorer window couldn't be found (shown in the Tab overlay). (Asks
-/// Explorer and reads the zip: run it on another thread.)
+/// of that folder of the zip, as a playlist: the files of the same kind, by
+/// name, the copy itself (which plays at once, and seeks fastest) in its
+/// place among them. Err: why the zip or its Explorer window couldn't be
+/// found. (Asks Explorer and reads the zip: run it on another thread.)
 pub(crate) fn explorer_zip_playlist(copy: &str) -> Result<(String, Vec<String>, usize), String> {
     // (only the file's name is used from the copy: how Windows names the
     // folder it copies to varies, and it may leave out the folders of the zip)
@@ -425,8 +436,9 @@ pub(crate) fn explorer_zip_playlist(copy: &str) -> Result<(String, Vec<String>, 
     let zip = Path::new(&archive).file_name().map_or_else(|| archive.clone(), |n| n.to_string_lossy().into_owned());
     let kind = media_kind(copy).ok_or("not a media file")?;
     let listed = archive_entries(&archive).ok_or_else(|| format!("mpv couldn't read {}", path_shape(&archive)))?;
-    let mut files = Vec::new();
-    let mut at = None;
+    // (each with its name, to sort by: Explorer hands a zip's files over in the
+    // zip's own order, not the one it shows)
+    let mut found: Vec<(String, String)> = Vec::new();
     for item in &items {
         // (only what's in that zip's folder: its path inside the zip, / between folders)
         if item.chars().count() <= keep + 1 || media_kind(item) != Some(kind) {
@@ -434,13 +446,15 @@ pub(crate) fn explorer_zip_playlist(copy: &str) -> Result<(String, Vec<String>, 
         }
         let rel: String = item.chars().skip(keep + 1).collect::<String>().replace('\\', "/");
         if *item == clicked {
-            at = Some(files.len());
-            files.push(copy.to_owned());
+            found.push((rel, copy.to_owned()));
         } else if let Some(e) = listed.iter().find(|e| same_name(&rel, inside_of(e))) {
-            files.push(e.clone());
+            found.push((rel, e.clone()));
         }
     }
-    let at = at.ok_or("lost the clicked file")?;
+    // By name, in natural order (Ep 2 before Ep 10), as a zip's files usually are
+    found.sort_by(|a, b| natural_cmp(&a.0, &b.0));
+    let at = found.iter().position(|(_, f)| f == copy).ok_or("lost the clicked file")?;
+    let files: Vec<String> = found.into_iter().map(|(_, f)| f).collect();
     if files.len() > 1 {
         Ok((zip, files, at))
     } else {

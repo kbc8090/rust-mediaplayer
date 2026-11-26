@@ -565,8 +565,9 @@ struct FluentMediaPlayer {
     archive_result: Arc<Mutex<Option<(u64, String, Inside)>>>,
     pub(crate) archive_peek: Arc<Mutex<Option<(String, Inside)>>>,
     zip_found: Arc<Mutex<Option<ZipFound>>>,
-    /// (temporary, while testing: how the last zip lookup went, for Tab)
-    zip_status: Arc<Mutex<Option<String>>>,
+    /// An archive with several kinds in it, asking which to play (its path,
+    /// each kind's files)
+    archive_choice: Option<(String, KindFiles)>,
     egui_ctx: egui::Context,
     /// Order of previous / next in a folder
     sort_by: SortBy,
@@ -870,7 +871,7 @@ impl FluentMediaPlayer {
             archive_result: Arc::new(Mutex::new(None)),
             archive_peek: Arc::new(Mutex::new(None)),
             zip_found: Arc::new(Mutex::new(None)),
-            zip_status: Arc::new(Mutex::new(None)),
+            archive_choice: None,
             egui_ctx: cc.egui_ctx.clone(),
             sort_by: st.sort_by,
             sort_desc: st.sort_desc,
@@ -936,31 +937,15 @@ impl FluentMediaPlayer {
             // A file Explorer copied out of a zip (double-clicked in it): it plays
             // at once, and previous / next go through the rest of that folder of
             // the zip as soon as it's been found (Explorer is asked which zip)
-            let zip_copy = temp_copy_name(path);
-            if let Ok(mut s) = self.zip_status.lock() {
-                *s = Some(match &zip_copy {
-                    Some(_) => "in the temporary folder, asking Explorer\u{2026}".to_owned(),
-                    None => format!("not in the temporary folder: {}", path_shape(path)),
-                });
-            }
-            if zip_copy.is_some() {
+            if temp_copy_name(path).is_some() {
                 let (gen, slot, ctx, copy) = (self.archive_gen, self.zip_found.clone(), self.egui_ctx.clone(), path.to_owned());
-                let status = self.zip_status.clone();
                 let _ = std::thread::Builder::new().name("zip".into()).spawn(move || {
-                    let t0 = std::time::Instant::now();
-                    let found = explorer_zip_playlist(&copy);
-                    if let Ok(mut s) = status.lock() {
-                        *s = Some(match &found {
-                            Ok((zip, files, at)) => format!("found {}: {} files, this is #{} ({} ms)", path_shape(zip), files.len(), at + 1, t0.elapsed().as_millis()),
-                            Err(why) => format!("{why} ({} ms)", t0.elapsed().as_millis()),
-                        });
-                    }
-                    if let Ok((zip, files, at)) = found {
+                    if let Ok((zip, files, at)) = explorer_zip_playlist(&copy) {
                         if let Ok(mut s) = slot.lock() {
                             *s = Some(ZipFound { gen, copy, zip, files, at });
                         }
+                        ctx.request_repaint();
                     }
-                    ctx.request_repaint();
                 });
             }
         }
@@ -988,20 +973,9 @@ impl FluentMediaPlayer {
 
     fn archive_opened(&mut self, path: &str, inside: Inside) {
         match inside {
-            Inside::Media(files) if files.len() > 1 => {
-                let entries = files.into_iter().map(|f| PlaylistEntry { path: PathBuf::from(f), title: None, secs: None }).collect();
-                self.start_playlist(PathBuf::from(path), entries, false);
-            }
-            Inside::Media(files) if !files.is_empty() => {
-                self.playlist = None;
-                self.playlist_rows.clear();
-                self.play_order.clear();
-                self.adjust_ui.playlist_open = false;
-                self.scan_gen += 1;
-                self.folder_files = vec![PathBuf::from(&files[0])];
-                self.folder_index = Some(0);
-                self.load_entry(&files[0]);
-            }
+            Inside::Media(files) if !files.is_empty() => self.play_archive_files(path, files),
+            // (several kinds: the drop box asks which, see update)
+            Inside::Mixed(kinds) => self.archive_choice = Some((path.to_owned(), kinds)),
             Inside::Looking => {}
             other => {
                 let detail = if other == Inside::Nothing {
@@ -1011,6 +985,23 @@ impl FluentMediaPlayer {
                 };
                 self.link_error = Some((std::time::Instant::now(), "Couldn't play this archive", detail.to_owned()));
             }
+        }
+    }
+
+    /// Play files from an archive: a playlist of them (one file: just that)
+    fn play_archive_files(&mut self, path: &str, files: Vec<String>) {
+        if files.len() > 1 {
+            let entries = files.into_iter().map(|f| PlaylistEntry { path: PathBuf::from(f), title: None, secs: None }).collect();
+            self.start_playlist(PathBuf::from(path), entries, false);
+        } else if let Some(file) = files.first() {
+            self.playlist = None;
+            self.playlist_rows.clear();
+            self.play_order.clear();
+            self.adjust_ui.playlist_open = false;
+            self.scan_gen += 1;
+            self.folder_files = vec![PathBuf::from(file)];
+            self.folder_index = Some(0);
+            self.load_entry(file);
         }
     }
 
@@ -1130,6 +1121,7 @@ impl FluentMediaPlayer {
     /// Start playing `path` (keeps the current previous / next list)
     fn load_entry(&mut self, path: &str) {
         self.archive_gen += 1; // (an archive still being read for another file: not wanted now)
+        self.archive_choice = None;
         self.current_file = path.to_owned();
         self.has_file = true;
         self.media_title.clear();
@@ -1857,15 +1849,6 @@ impl FluentMediaPlayer {
         if let Some((ws, private)) = process_memory_mb() {
             rows.push(InfoRow::Item("Memory", format!("{ws:.0} MB  \u{b7}  {private:.0} MB private")));
         }
-        // (temporary, while testing the zip lookup)
-        if let Some(z) = self.zip_status.lock().ok().and_then(|s| s.clone()) {
-            rows.push(InfoRow::Section("Zip lookup"));
-            // (in short lines, so the panel doesn't grow wide)
-            let chars: Vec<char> = z.chars().collect();
-            for (i, line) in chars.chunks(70).enumerate() {
-                rows.push(InfoRow::Item(if i == 0 { "Result" } else { "" }, line.iter().collect()));
-            }
-        }
         self.info_rows = rows;
     }
 
@@ -2094,19 +2077,7 @@ impl eframe::App for FluentMediaPlayer {
         let zip = self.zip_found.lock().ok().and_then(|mut s| s.take());
         if let Some(z) = zip {
             // (still on the file Explorer copied out, and nothing else opened since)
-            let used = z.gen == self.archive_gen && self.current_file == z.copy && self.playlist.is_none();
-            if !used {
-                if let Ok(mut s) = self.zip_status.lock() {
-                    *s = Some(format!(
-                        "found it, but not used: gen {} vs {}, same file {}, playlist {}",
-                        z.gen,
-                        self.archive_gen,
-                        self.current_file == z.copy,
-                        self.playlist.is_some()
-                    ));
-                }
-            }
-            if used {
+            if z.gen == self.archive_gen && self.current_file == z.copy && self.playlist.is_none() {
                 let entries = z.files.into_iter().map(|f| PlaylistEntry { path: PathBuf::from(f), title: None, secs: None }).collect();
                 self.start_playlist_at(PathBuf::from(z.zip), entries, false, z.at);
                 // (like a folder: the list stays closed until asked for)
@@ -2610,7 +2581,9 @@ impl eframe::App for FluentMediaPlayer {
                 || i.events.iter().any(|e| matches!(e, egui::Event::Key { pressed: true, .. })),
             pointer: i.pointer.hover_pos(),
         });
-        if self.url_box.is_some() || self.clip.as_ref().is_some_and(|c| c.editing.is_some()) {
+        // (the keys are the box's while it's up; asking what to play from an
+        // archive: only Esc, to cancel)
+        if self.url_box.is_some() || self.clip.as_ref().is_some_and(|c| c.editing.is_some()) || self.archive_choice.is_some() {
             inp.keys_for_typing();
         }
         // Alt+Tab back to the player, letting go of Alt a moment before Tab: Windows
@@ -2766,7 +2739,9 @@ impl eframe::App for FluentMediaPlayer {
         if inp.d     { self.frame_step(false); }
         if inp.enter { self.toggle_fullscreen(ctx); }
         if inp.esc {
-            if let Some(b) = self.url_box.as_mut().filter(|b| b.menu.is_some()) {
+            if self.archive_choice.is_some() {
+                self.archive_choice = None;
+            } else if let Some(b) = self.url_box.as_mut().filter(|b| b.menu.is_some()) {
                 b.menu = None;
             } else if self.url_box.is_some() {
                 self.url_box = None;
@@ -2920,6 +2895,15 @@ impl eframe::App for FluentMediaPlayer {
         }
         draw_shortcuts(self, ctx);
         draw_drop_overlay(self, ctx);
+        // An archive with several kinds in it: which to play
+        if let Some((path, kinds)) = &self.archive_choice {
+            if let Some(i) = draw_archive_choice(ctx, path, kinds, self.accent) {
+                if let Some((path, mut kinds)) = self.archive_choice.take() {
+                    let files = kinds.swap_remove(i).1;
+                    self.play_archive_files(&path, files);
+                }
+            }
+        }
 
         // Online video settings panel, the Open URL box, and a link opening / failed
         let online_before = self.online;

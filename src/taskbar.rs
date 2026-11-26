@@ -1642,7 +1642,7 @@ unsafe fn explorer_selection(wanted: &[String]) -> Option<Vec<String>> {
 /// it selected, and everything in that folder of the zip, in the order the
 /// window shows them, as full paths such as "C:\…\Videos.zip\Season 1\Ep 1.mkv".
 /// `name`: the file's name ("Ep 2.mkv"; the window's selected file of that
-/// name inside a zip). Err: what was found instead (for the Tab overlay).
+/// name inside a zip). Err: what was found instead.
 pub fn explorer_zip_folder(name: String) -> Result<(String, Vec<String>), String> {
     let (inside, tail) = (".zip\\".to_owned(), format!("\\{}", name.to_lowercase()));
     let (tx, rx) = std::sync::mpsc::channel();

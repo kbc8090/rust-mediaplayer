@@ -1229,6 +1229,8 @@ pub(crate) struct DropPreview {
     /// "Drop to play", "Drop to play as a playlist", "Can't play this file"
     action: &'static str,
     playable: bool,
+    /// An archive with several kinds in it: what to play is asked once it's dropped
+    choose: bool,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -1251,14 +1253,14 @@ fn drop_preview(paths: &[String], inside: Option<&Inside>) -> Option<DropPreview
     if let (Some(inside), [archive]) = (inside, paths) {
         let (big, detail) = (ext(archive), name(archive));
         return Some(match inside {
-            Inside::Looking => DropPreview { icon: DropIcon::Playlist, big, detail, action: "Looking inside\u{2026}", playable: true },
+            Inside::Looking => DropPreview { icon: DropIcon::Playlist, big, detail, action: "Looking inside\u{2026}", playable: true, choose: false },
             Inside::Media(files) if files.len() == 1 => {
                 let icon = match media_kind(&files[0]) {
                     Some(MediaKind::Music) => DropIcon::Music,
                     Some(MediaKind::Image) => DropIcon::Picture,
                     _ => DropIcon::Video,
                 };
-                DropPreview { icon, big: ext(&files[0]), detail: name(&files[0]), action: "Drop to play", playable: true }
+                DropPreview { icon, big: ext(&files[0]), detail: name(&files[0]), action: "Drop to play", playable: true, choose: false }
             }
             Inside::Media(files) => {
                 let noun = match media_kind(&files[0]) {
@@ -1266,10 +1268,14 @@ fn drop_preview(paths: &[String], inside: Option<&Inside>) -> Option<DropPreview
                     Some(MediaKind::Image) => "PICTURES",
                     _ => "VIDEOS",
                 };
-                DropPreview { icon: DropIcon::Playlist, big: format!("{} {noun}", files.len()), detail, action: "Drop to play as a playlist", playable: true }
+                DropPreview { icon: DropIcon::Playlist, big: format!("{} {noun}", files.len()), detail, action: "Drop to play as a playlist", playable: true, choose: false }
             }
-            Inside::Nothing => DropPreview { icon: DropIcon::Unknown, big, detail, action: "Nothing to play inside", playable: false },
-            Inside::Unreadable => DropPreview { icon: DropIcon::Unknown, big, detail, action: "Can't open this archive", playable: false },
+            Inside::Mixed(kinds) => {
+                let n: usize = kinds.iter().map(|(_, f)| f.len()).sum();
+                DropPreview { icon: DropIcon::Playlist, big: format!("{n} FILES"), detail, action: "Drop, then choose what to play", playable: true, choose: true }
+            }
+            Inside::Nothing => DropPreview { icon: DropIcon::Unknown, big, detail, action: "Nothing to play inside", playable: false, choose: false },
+            Inside::Unreadable => DropPreview { icon: DropIcon::Unknown, big, detail, action: "Can't open this archive", playable: false, choose: false },
         });
     }
     let media: Vec<&String> = paths.iter().filter(|p| is_media_file(p)).collect();
@@ -1293,10 +1299,10 @@ fn drop_preview(paths: &[String], inside: Option<&Inside>) -> Option<DropPreview
             e => e,
         };
         let action = if playable { "Drop to play" } else { "Can't play this file" };
-        return Some(DropPreview { icon, big, detail: name(p), action, playable });
+        return Some(DropPreview { icon, big, detail: name(p), action, playable, choose: false });
     }
     if media.is_empty() {
-        return Some(DropPreview { icon: DropIcon::Unknown, big: format!("{} FILES", paths.len()), detail: String::new(), action: "Can't play these files", playable: false });
+        return Some(DropPreview { icon: DropIcon::Unknown, big: format!("{} FILES", paths.len()), detail: String::new(), action: "Can't play these files", playable: false, choose: false });
     }
     // Several: a playlist of them ("8 SONGS", or videos, or just files when mixed)
     let n = media.len();
@@ -1314,7 +1320,7 @@ fn drop_preview(paths: &[String], inside: Option<&Inside>) -> Option<DropPreview
     }
     counts.sort_by_key(|c| std::cmp::Reverse(c.1));
     let detail = counts.iter().take(4).map(|(e, c)| format!("{e} \u{d7}{c}")).collect::<Vec<_>>().join(" \u{b7} ");
-    Some(DropPreview { icon: DropIcon::Playlist, big: format!("{n} {noun}"), detail, action: "Drop to play as a playlist", playable: true })
+    Some(DropPreview { icon: DropIcon::Playlist, big: format!("{n} {noun}"), detail, action: "Drop to play as a playlist", playable: true, choose: false })
 }
 
 /// Text whose colour runs across it along `colour(0…1)` (each glyph's
@@ -1430,7 +1436,8 @@ pub(crate) fn draw_drop_overlay(app: &mut FluentMediaPlayer, ctx: &egui::Context
     // everything fades; refused: it shakes its head, then fades. (Dragged away
     // again: it just goes.)
     if let Some(d) = app.drop_seen.take() {
-        if ctx.input(|i| !i.raw.dropped_files.is_empty()) && d.icon != DropIcon::Video {
+        // (nor for an archive that asks what to play: the question takes its place)
+        if ctx.input(|i| !i.raw.dropped_files.is_empty()) && d.icon != DropIcon::Video && !d.choose {
             app.drop_anim = Some((d, std::time::Instant::now()));
         }
     }
@@ -1523,4 +1530,89 @@ fn paint_drop(ctx: &egui::Context, accent: Color32, d: &DropPreview, after: Opti
     y += 18.0 + 8.0;
     let col = if d.playable { Color32::WHITE } else { Color32::from_rgb(200, 200, 206) };
     p.text(pos2(cx, y), Align2::CENTER_TOP, d.action, FontId::new(16.0, FontFamily::Name("semibold".into())), col.gamma_multiply(alpha));
+}
+
+/// An archive with several kinds of file in it (305 pictures, 160 videos) was
+/// opened: the drop box stays up and asks which to play, a button for each.
+/// The number of the one clicked.
+pub(crate) fn draw_archive_choice(ctx: &egui::Context, archive: &str, kinds: &[(MediaKind, Vec<String>)], accent: Color32) -> Option<usize> {
+    let screen = ctx.screen_rect();
+    let area = Rect::from_min_max(
+        pos2(screen.left(), screen.top() + WIN_BTN_H + 1.0),
+        pos2(screen.right(), screen.bottom() - SEEK_FROM_BOTTOM - 12.0),
+    );
+    // (where the drop box was, so it carries straight on from the drop)
+    let fr = area.shrink(10.0);
+    if fr.height() < 40.0 {
+        return None;
+    }
+    let mut picked = None;
+    egui::Area::new(egui::Id::new("archive_choice")).order(egui::Order::Foreground).fixed_pos(fr.min).show(ctx, |ui| {
+        // (clicks around the buttons don't reach the video underneath)
+        ui.allocate_rect(fr, Sense::click_and_drag());
+        let p = ui.painter().clone();
+        let r = 16.0;
+        crate::glass::fill(&p, fr, r, Color32::from_black_alpha(170), 1.0);
+        p.rect_stroke(fr.shrink(1.0), r - 1.0, Stroke::new(2.0_f32, accent));
+
+        let cx = fr.center().x;
+        let semibold = |size: f32| FontId::new(size, FontFamily::Name("semibold".into()));
+        // The question, the buttons, and how to back out: centred
+        let name = Path::new(archive).file_name().map_or_else(|| archive.to_owned(), |n| n.to_string_lossy().into_owned());
+        let q1 = p.layout_no_wrap("What do you want to play from".to_owned(), FontId::proportional(17.0), Color32::from_rgb(226, 226, 232));
+        let q2 = elide(&p, &format!("{name}?"), semibold(17.0), Color32::WHITE, fr.width() - 60.0);
+        let (btn_h, gap) = (58.0, 16.0);
+        let block = q1.size().y + 4.0 + q2.size().y + 28.0 + btn_h + 22.0 + 16.0;
+        let mut y = fr.center().y - block / 2.0;
+        p.galley(pos2(cx - q1.size().x / 2.0, y), q1.clone(), Color32::WHITE);
+        y += q1.size().y + 4.0;
+        p.galley(pos2(cx - q2.size().x / 2.0, y), q2.clone(), Color32::WHITE);
+        y += q2.size().y + 28.0;
+
+        // A button for each kind: its icon, how many, and what they are
+        let icon_size = 28.0;
+        let parts: Vec<(DropIcon, std::sync::Arc<egui::Galley>, std::sync::Arc<egui::Galley>)> = kinds
+            .iter()
+            .map(|(k, files)| {
+                let one = files.len() == 1;
+                let (icon, noun) = match k {
+                    MediaKind::Video => (DropIcon::Video, if one { "video" } else { "videos" }),
+                    MediaKind::Music => (DropIcon::Music, if one { "song" } else { "songs" }),
+                    MediaKind::Image => (DropIcon::Picture, if one { "picture" } else { "pictures" }),
+                };
+                let n = p.layout_no_wrap(files.len().to_string(), semibold(26.0), Color32::WHITE);
+                let w = p.layout_no_wrap(noun.to_owned(), FontId::proportional(16.0), Color32::WHITE);
+                (icon, n, w)
+            })
+            .collect();
+        let widths: Vec<f32> = parts.iter().map(|(_, n, w)| (22.0 + icon_size + 12.0 + n.size().x + 8.0 + w.size().x + 24.0).round()).collect();
+        let total = widths.iter().sum::<f32>() + gap * (widths.len().saturating_sub(1)) as f32;
+        let mut x = (cx - total / 2.0).round();
+        for (i, ((icon, n, w), bw)) in parts.into_iter().zip(&widths).enumerate() {
+            let b = Rect::from_min_size(pos2(x, y), vec2(*bw, btn_h));
+            let resp = ui.interact(b, ui.id().with(("archive_kind", i)), Sense::click());
+            let hot = resp.hovered();
+            if hot {
+                ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+            let (fill, edge) = if hot { (accent.gamma_multiply(0.16), accent) } else { (Color32::from_white_alpha(14), crate::glass::BORDER) };
+            p.rect_filled(b, 12.0, fill);
+            p.rect_stroke(b.shrink(0.5), 11.5, Stroke::new(1.0_f32, edge));
+            let icon_col = if hot { accent } else { Color32::from_rgb(232, 232, 238) };
+            let mut bx = b.left() + 22.0;
+            drop_icon(&p, pos2(bx + icon_size / 2.0, b.center().y), icon_size, icon, &move |_| icon_col);
+            bx += icon_size + 12.0;
+            p.galley(pos2(bx, b.center().y - n.size().y / 2.0), n.clone(), Color32::WHITE);
+            bx += n.size().x + 8.0;
+            let dim = Color32::from_rgb(207, 207, 214);
+            p.galley(pos2(bx, b.center().y - w.size().y / 2.0 + 2.0), w, dim);
+            if resp.clicked() {
+                picked = Some(i);
+            }
+            x += bw + gap;
+        }
+        y += btn_h + 22.0;
+        p.text(pos2(cx, y), Align2::CENTER_TOP, "Esc to cancel", FontId::proportional(12.5), Color32::from_rgb(154, 154, 163));
+    });
+    picked
 }
