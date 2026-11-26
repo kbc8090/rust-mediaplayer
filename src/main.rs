@@ -390,6 +390,44 @@ thread_local! {
     static WIN_FRAMES: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
     /// The graphics card's largest texture (0: not asked yet)
     static MAX_TEX: std::cell::Cell<i32> = const { std::cell::Cell::new(0) };
+    /// The window's OpenGL, for drawing straight after a resize (see paint_after_resize)
+    static RESIZE_GL: std::cell::RefCell<Option<Arc<glow::Context>>> = const { std::cell::RefCell::new(None) };
+    /// The last frame showed a video, nothing over it but the controls (see paint_after_resize)
+    static RESIZE_VIDEO: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The window has just been resized into or out of full screen (from inside
+/// the resize, see taskbar::set_resize_painter): a video is drawn at the new
+/// size and shown at once, before Windows shows the resized window with the
+/// old frame in its corner. The controls follow with the next regular frame.
+/// (Pictures: their next frame is quick enough by itself.)
+fn paint_after_resize(hwnd: isize) {
+    if !RESIZE_VIDEO.with(|v| v.get()) {
+        return;
+    }
+    let Some(gl) = RESIZE_GL.with(|g| g.borrow().clone()) else { return };
+    let Some((w, h)) = taskbar::client_size(hwnd) else { return };
+    if w <= 0 || h <= 0 {
+        return;
+    }
+    let drawn = TLS_RENDER_CTX.with(|c| match c.try_borrow_mut() {
+        Ok(mut c) => match c.as_mut() {
+            Some(rc) => unsafe {
+                gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+                gl.viewport(0, 0, w, h);
+                gl.disable(glow::SCISSOR_TEST);
+                gl.clear_color(0.0, 0.0, 0.0, 1.0);
+                gl.clear(glow::COLOR_BUFFER_BIT);
+                paint_video(&gl, rc, 0, 0, w, h);
+                true
+            },
+            None => false,
+        },
+        Err(_) => false,
+    });
+    if drawn {
+        taskbar::swap_buffers(hwnd);
+    }
 }
 
 /// End the process immediately, without running any DLL or runtime shutdown code.
@@ -3269,6 +3307,10 @@ impl eframe::App for FluentMediaPlayer {
                 let tx = self.repaint_tx.clone();
                 rc.set_update_callback(move || { let _ = tx.try_send(()); });
                 TLS_RENDER_CTX.with(|c| *c.borrow_mut() = Some(rc));
+                if let Some(gl) = frame.gl() {
+                    RESIZE_GL.with(|g| *g.borrow_mut() = Some(gl.clone()));
+                    taskbar::set_resize_painter(paint_after_resize);
+                }
                 self.render_ctx_initialized = true;
             }
         }
@@ -3646,6 +3688,7 @@ impl eframe::App for FluentMediaPlayer {
                     self.scope.stop();
                 }
                 self.video_shown = false;
+                RESIZE_VIDEO.with(|v| v.set(false));
                 if !self.has_file {
                     splash::draw(ui.painter(), rect, self.accent);
                 } else if music {
@@ -3655,6 +3698,7 @@ impl eframe::App for FluentMediaPlayer {
                     // new file.)
                     let frame = self.pic_frame(rect);
                     PIC_FRAME.with(|p| p.set(frame));
+                    RESIZE_VIDEO.with(|v| v.set(matches!(frame, PicFrame::Off) && !self.is_picture()));
                     ui.painter().add(video_callback(rect));
                     self.video_shown = self.video_kind == VideoKind::Video;
                 }
