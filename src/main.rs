@@ -191,13 +191,22 @@ unsafe fn paint_picture(gl: &glow::Context, rc: &mut RenderContext<'static>, are
     // Drawn by mpv: up to its own size, or a small picture up to the window's area;
     // never more than the graphics card takes, nor 50 million pixels
     let most = ((w as f32 * h as f32) / (pw * ph)).sqrt().max(1.0).min(max / pw).min(max / ph).min((50.0e6 / (pw * ph)).sqrt());
-    let s = v.scale.min(most);
     let size = |s: f32| (((pw * s).round() as i32).max(1), ((ph * s).round() as i32).max(1));
-    let (tw, th) = size(s);
+    let need = v.scale.min(most);
     PIC_TARGET.with(|pt| {
         let mut pt = pt.borrow_mut();
         let pending = PIC_NEW.with(|p| p.get());
         let changed = pt.as_ref().is_none_or(|p| p.size != v.size);
+        // While it glides to a new zoom, mpv draws it once, at the larger of
+        // where it started and where it's going, and that is shrunk as it goes
+        // (drawing it anew every frame at every size was slow for big photos);
+        // still, it's drawn at exactly its size
+        let s = match pt.as_ref() {
+            Some(p) if v.moving && !pending && !changed && p.scale >= need * 0.999 && p.scale <= need * 3.0 => p.scale,
+            _ if v.moving => v.goal.min(most).max(need),
+            _ => need,
+        };
+        let (tw, th) = size(s);
         // A new size without a new picture from mpv (turned with R, say): mpv
         // hasn't got there yet, so what it has would be drawn wrongly sized. The
         // last one stays as it was meanwhile (but not for long).
@@ -222,7 +231,7 @@ unsafe fn paint_picture(gl: &glow::Context, rc: &mut RenderContext<'static>, are
                 gl.delete_framebuffer(old.t.fbo);
                 gl.delete_texture(old.t.tex);
             }
-            *pt = Some(PicTarget { t: make_target(gl, cw.max(tw), ch.max(th))?, drawn: (0, 0), size: (0.0, 0.0), shown: None });
+            *pt = Some(PicTarget { t: make_target(gl, cw.max(tw), ch.max(th))?, drawn: (0, 0), scale: 0.0, size: (0.0, 0.0), shown: None });
         }
         let p = pt.as_mut()?;
         let drew = pending || changed || p.drawn != (tw, th);
@@ -230,12 +239,13 @@ unsafe fn paint_picture(gl: &glow::Context, rc: &mut RenderContext<'static>, are
             gl.disable(glow::SCISSOR_TEST);
             let _ = rc.render::<*mut std::os::raw::c_void>(p.t.fbo.0.get() as i32, tw, th, true);
             p.drawn = (tw, th);
+            p.scale = s;
             p.size = v.size;
             PIC_NEW.with(|n| n.set(false));
             PIC_WAIT.with(|t| t.set(None));
         }
         // (drawn at the zoom's own size: copied pixel for pixel)
-        let exact = (v.scale - s).abs() < 1e-4;
+        let exact = (v.scale - p.scale).abs() < 1e-4;
         blit_picture(gl, p, area, v.rect, exact);
         WIN_STALE.with(|s| s.set(true));
         Some(drew)
@@ -333,12 +343,16 @@ enum PicFrame {
 }
 
 /// A picture to show: its size (as turned), where it goes (pixels from the
-/// window's top left: left, top, right, bottom), and window pixels per picture pixel
+/// window's top left: left, top, right, bottom), window pixels per picture
+/// pixel, and whether it's gliding to a new zoom (and the larger of the zooms
+/// it glides from and to, as window pixels per picture pixel)
 #[derive(Clone, Copy)]
 struct PicView {
     size: (f32, f32),
     rect: [f32; 4],
     scale: f32,
+    moving: bool,
+    goal: f32,
 }
 
 /// A picture's own texture: the size mpv drew it at, the picture size it was
@@ -346,6 +360,7 @@ struct PicView {
 struct PicTarget {
     t: VideoTarget,
     drawn: (i32, i32),
+    scale: f32,
     size: (f32, f32),
     shown: Option<([f32; 4], bool)>,
 }
@@ -1832,6 +1847,8 @@ impl FluentMediaPlayer {
             size: (w as f32, h as f32),
             rect: [(r.min.x - o.x) * ppp, (r.min.y - o.y) * ppp, (r.max.x - o.x) * ppp, (r.max.y - o.y) * ppp],
             scale: (fit * self.pic_zoom.exp2()) as f32,
+            moving: self.pic_glide.is_some(),
+            goal: (fit * self.pic_glide.as_ref().map_or(self.pic_zoom, |g| g.from_zoom.max(g.to_zoom)).exp2()) as f32,
         })
     }
 
