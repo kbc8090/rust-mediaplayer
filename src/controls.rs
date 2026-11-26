@@ -1811,7 +1811,8 @@ pub(crate) fn draw_picture_arrows(app: &mut FluentMediaPlayer, ctx: &egui::Conte
                 } else {
                     egui::Rounding { nw: 10.0, sw: 10.0, ne: 0.0, se: 0.0 }
                 };
-                p.rect_filled(r, rounding, Color32::from_black_alpha((140.0 * a) as u8));
+                // (about the bottom bar's dark tint, a touch darker, without its blur)
+                p.rect_filled(r, rounding, Color32::from_rgba_unmultiplied(0x20, 0x21, 0x24, (122.0 * a) as u8));
                 // A thin chevron, 44 px tall (a little toward the window's edge, so it
                 // looks centred: a chevron's weight is in its open side)
                 let c = r.center() + vec2(if left { -3.0 } else { 3.0 }, 0.0);

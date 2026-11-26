@@ -1474,6 +1474,13 @@ impl FluentMediaPlayer {
         self.link.set("background-color", if picture { PICTURE_BACKDROP } else { "#000000" });
         // Started part way through if right-clicked along its row in the playlist
         let mut options = Vec::new();
+        // A picture: taken for what its first bytes say. (mpv's check of a file's
+        // format wants more certainty than a JPEG gives it, so it read on and
+        // checked again, 2 KB, 4 KB, 8 KB... up to the whole file: half a second
+        // for a 5 MB photo before decoding even started.)
+        if picture {
+            options.push("demuxer-lavf-probescore=25".to_owned());
+        }
         if let Some(f) = self.start_at.take() {
             options.push(format!("start={:.2}%", f * 100.0));
         }
@@ -3464,15 +3471,19 @@ impl eframe::App for FluentMediaPlayer {
                     self.blank_hover = true;
                 }
 
-                // Double-click → toggle fullscreen
-                if resp.double_clicked() {
-                    self.toggle_fullscreen(ctx);
-                }
-
                 // A picture: dragging it moves it about (an open hand over it, a
                 // closed one while dragging); dragging beside it moves the window
                 let pic_rect = if self.is_picture() { self.picture_rect() } else { None };
                 let on_picture = |p: Option<Pos2>| p.is_some_and(|p| pic_rect.is_some_and(|r| r.contains(p)));
+
+                // Double-click → toggle fullscreen (on a picture: back to fitting the window)
+                if resp.double_clicked() {
+                    if on_picture(resp.interact_pointer_pos()) {
+                        self.picture_fit();
+                    } else {
+                        self.toggle_fullscreen(ctx);
+                    }
+                }
                 let pressed_on_picture = on_picture(ctx.input(|i| i.pointer.press_origin()));
                 if resp.drag_started_by(egui::PointerButton::Primary) && pressed_on_picture {
                     self.pic_drag = true;
