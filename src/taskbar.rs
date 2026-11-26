@@ -410,40 +410,57 @@ pub fn hook_window(hwnd: isize) -> bool {
     }
 }
 
+// ── Starting maximized ────────────────────────────────────────────────────────
 #[link(name = "user32")]
 unsafe extern "system" {
-    fn GetDC(hwnd: isize) -> isize;
-    fn ReleaseDC(hwnd: isize, dc: isize) -> i32;
-    fn FillRect(dc: isize, rect: *const RectI, brush: isize) -> i32;
-    fn GetClientRect(hwnd: isize, rect: *mut RectI) -> i32;
-}
-#[link(name = "gdi32")]
-unsafe extern "system" {
-    fn GetStockObject(which: i32) -> isize;
+    fn GetWindowPlacement(hwnd: isize, wp: *mut WindowPlacement) -> i32;
+    fn SetWindowPlacement(hwnd: isize, wp: *const WindowPlacement) -> i32;
 }
 
-/// Fill the window black at once, before OpenGL has drawn anything in it
-/// (Windows shows a new window white until then)
-pub fn paint_black(hwnd: isize) {
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct WindowPlacement {
+    length: u32,
+    flags: u32,
+    show_cmd: u32,
+    min_pos: Point,
+    max_pos: Point,
+    normal: RectI,
+}
+
+/// Maximized last time. The window is still hidden (it's shown once its first
+/// frame is drawn), and a hidden window can't be maximized without showing it
+/// undrawn (a white flash). So: size it to the screen's work area now, as it
+/// will be maximized, and its first frame is drawn at that size. Returns where
+/// it was, for `finish_maximized`.
+pub fn prepare_maximized(hwnd: isize) -> Option<WindowPlacement> {
     unsafe {
-        let mut r: RectI = std::mem::zeroed();
-        if GetClientRect(hwnd, &mut r) != 0 {
-            let dc = GetDC(hwnd);
-            if dc != 0 {
-                FillRect(dc, &r, GetStockObject(4 /* BLACK_BRUSH */));
-                ReleaseDC(hwnd, dc);
-            }
+        let mut wp: WindowPlacement = std::mem::zeroed();
+        wp.length = std::mem::size_of::<WindowPlacement>() as u32;
+        if GetWindowPlacement(hwnd, &mut wp) == 0 {
+            return None;
         }
+        let mut mi: MonitorInfo = std::mem::zeroed();
+        mi.size = std::mem::size_of::<MonitorInfo>() as u32;
+        if GetMonitorInfoW(MonitorFromWindow(hwnd, 2 /* MONITOR_DEFAULTTONEAREST */), &mut mi) == 0 {
+            return None;
+        }
+        let w = mi.work;
+        // SWP_NOZORDER | SWP_NOACTIVATE
+        SetWindowPos(hwnd, 0, w.left, w.top, w.right - w.left, w.bottom - w.top, 0x0004 | 0x0010);
+        Some(wp)
     }
 }
 
-/// Hide the window from the screen while it stays open and sized as it is
-/// (DWM "cloaking"), or show it again: so it can be maximized before anything
-/// is drawn in it, without a white flash
-pub fn cloak(hwnd: isize, on: bool) {
-    let v: i32 = on as i32;
+/// Once shown: maximize it (nothing moves: it's that size already), and put
+/// back the size it had before, to restore to
+pub fn finish_maximized(hwnd: isize, before: WindowPlacement) {
     unsafe {
-        DwmSetWindowAttribute(hwnd, 13 /* DWMWA_CLOAK */, &v as *const i32 as *const c_void, 4);
+        ShowWindow(hwnd, 3); // SW_MAXIMIZE
+        let mut wp = before;
+        wp.flags = 0;
+        wp.show_cmd = 3; // SW_SHOWMAXIMIZED
+        SetWindowPlacement(hwnd, &wp);
     }
 }
 

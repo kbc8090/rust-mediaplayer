@@ -63,6 +63,7 @@ unsafe extern "system" {
     fn GetSystemMetrics(index: i32) -> i32;
     fn MessageBoxW(hwnd: isize, text: *const u16, caption: *const u16, kind: u32) -> i32;
     fn IsZoomed(hwnd: isize) -> i32;
+    fn IsWindowVisible(hwnd: isize) -> i32;
     fn ShowWindow(hwnd: isize, cmd: i32) -> i32;
 }
 
@@ -600,9 +601,10 @@ struct FluentMediaPlayer {
     pic_drag: bool,
     /// Gliding to a new zoom
     pic_glide: Option<ZoomGlide>,
-    /// Frames still to draw before the window, maximized at startup while
-    /// hidden from the screen, is shown (0: shown)
-    uncloak_in: u8,
+    /// Maximized last time: the window was sized to the screen while still
+    /// hidden; once shown it's maximized for real, keeping this normal place
+    /// to restore to
+    start_place: Option<taskbar::WindowPlacement>,
     /// The pictures either side already read ahead for this one (its path, and
     /// how many files the folder had then)
     pic_prefetch: (String, usize),
@@ -683,6 +685,16 @@ impl FluentMediaPlayer {
         let caption_font = install_fonts(&cc.egui_ctx);
         taskbar::set_snap(load_settings().snap);
         let saved = load_window_state().unwrap_or(WinState::DEFAULT);
+        // Maximized last time: the still-hidden window takes the screen's size
+        // now, so it's drawn at that size before it first appears
+        let start_place = if saved.maximized {
+            cc.window_handle().ok().and_then(|h| match h.as_raw() {
+                RawWindowHandle::Win32(w) => taskbar::prepare_maximized(w.hwnd.get()),
+                _ => None,
+            })
+        } else {
+            None
+        };
         let st = load_settings();
         let (volume, muted) = (st.volume as f64, st.muted);
         // A file passed on the command line: drag a video onto the .exe, double-click an
@@ -915,7 +927,7 @@ impl FluentMediaPlayer {
             pic_turn: 0,
             pic_drag: false,
             pic_glide: None,
-            uncloak_in: 0,
+            start_place,
             pic_prefetch: (String::new(), 0),
             wallpaper_result: Arc::new(Mutex::new(None)),
             snap: st.snap,
@@ -2551,37 +2563,21 @@ impl eframe::App for FluentMediaPlayer {
         if self.hwnd != 0 && !self.taskbar_tried {
             self.taskbar_tried = true;
             taskbar::hook_window(self.hwnd);
-            // Maximized last time: maximize now, before the window is first shown
-            // (it used to appear at its normal size and maximize half a second
-            // later). Its normal size is still the one to restore to. Kept off
-            // the screen until it has drawn itself at the new size: shown
-            // straight away, it flashed white.
-            if self.start_max && !self.start_max_done {
-                self.start_max_done = true;
-                unsafe {
-                    if IsZoomed(self.hwnd) == 0 {
-                        taskbar::cloak(self.hwnd, true);
-                        ShowWindow(self.hwnd, 3); // SW_MAXIMIZE
-                        // (in case it shows before it's hidden: black, not white)
-                        taskbar::paint_black(self.hwnd);
-                        self.uncloak_in = 3;
-                    }
-                }
-                ctx.request_repaint();
-            }
             self.taskbar = taskbar::Taskbar::new(self.hwnd);
             self.win11_frame = taskbar::round_corners(self.hwnd);
             // (smooth motion needs the window to find the monitor's refresh rate)
             if self.adjust.smooth {
                 self.apply_smooth();
             }
-        } else if self.uncloak_in > 0 {
-            self.uncloak_in -= 1;
-            // (a few frames: the one drawn at the old size, then at the new; or
-            // in any case after a second)
-            if self.uncloak_in == 0 || self.start_time.elapsed().as_secs_f32() > 1.0 {
-                self.uncloak_in = 0;
-                taskbar::cloak(self.hwnd, false);
+        }
+        // Maximized last time (see `start_place`): once the window is on screen,
+        // drawn at the screen's size, maximize it (nothing visibly changes)
+        if self.hwnd != 0 && self.start_place.is_some() {
+            if unsafe { IsWindowVisible(self.hwnd) } != 0 {
+                if let Some(place) = self.start_place.take() {
+                    taskbar::finish_maximized(self.hwnd, place);
+                    self.start_max_done = true;
+                }
             } else {
                 ctx.request_repaint();
             }
@@ -3877,9 +3873,8 @@ fn main() -> eframe::Result<()> {
         viewport = viewport
             .with_inner_size([w.w.max(480.0), w.h.max(300.0)])
             .with_position([w.x, w.y]);
-        if w.maximized {
-            viewport = viewport.with_maximized(true);
-        }
+        // (maximized last time: see `start_place`; asking winit to start the
+        // window maximized doesn't work while it's hidden)
     }
     if load_settings().on_top {
         viewport = viewport.with_window_level(egui::WindowLevel::AlwaysOnTop);
