@@ -231,16 +231,10 @@ unsafe fn paint_picture(gl: &glow::Context, rc: &mut RenderContext<'static>, are
                 gl.delete_framebuffer(old.t.fbo);
                 gl.delete_texture(old.t.tex);
             }
-            *pt = Some(PicTarget { t: make_target(gl, cw.max(tw), ch.max(th))?, drawn: (0, 0), scale: 0.0, size: (0.0, 0.0), shown: None, again: true });
+            *pt = Some(PicTarget { t: make_target(gl, cw.max(tw), ch.max(th))?, drawn: (0, 0), scale: 0.0, size: (0.0, 0.0), shown: None });
         }
         let p = pt.as_mut()?;
-        // (a new picture is drawn by mpv twice, the second time the frame after:
-        // its first drawing into a new texture could come out speckled)
-        let again = std::mem::take(&mut p.again) && !changed && !pending && p.drawn == (tw, th);
-        let drew = pending || changed || p.drawn != (tw, th) || again;
-        if pending || changed {
-            p.again = p.again || changed;
-        }
+        let drew = pending || changed || p.drawn != (tw, th);
         if drew {
             gl.disable(glow::SCISSOR_TEST);
             let _ = rc.render::<*mut std::os::raw::c_void>(p.t.fbo.0.get() as i32, tw, th, true);
@@ -325,6 +319,25 @@ unsafe fn make_target(gl: &glow::Context, tw: i32, th: i32) -> Option<VideoTarge
     }
 }
 
+/// The window's transparency made fully solid over the video: Windows blends
+/// the window by it (its borderless look), and what mpv draws for a picture with
+/// a transparency channel (RGBA PNGs) can leave stray values there even where
+/// the picture is solid, which showed as black specks, over the top bar's text
+/// too. Only the transparency is touched, not the colours.
+unsafe fn solid_alpha(gl: &glow::Context, x: i32, y: i32, w: i32, h: i32) {
+    if w <= 0 || h <= 0 {
+        return;
+    }
+    gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+    gl.enable(glow::SCISSOR_TEST);
+    gl.scissor(x, y, w, h);
+    gl.color_mask(false, false, false, true);
+    gl.clear_color(0.0, 0.0, 0.0, 1.0);
+    gl.clear(glow::COLOR_BUFFER_BIT);
+    gl.color_mask(true, true, true, true);
+    gl.disable(glow::SCISSOR_TEST);
+}
+
 /// Draws mpv's picture into `rect`
 fn video_callback(rect: Rect) -> egui::PaintCallback {
     egui::PaintCallback {
@@ -337,6 +350,7 @@ fn video_callback(rect: Rect) -> egui::PaintCallback {
                 Some(rc) => unsafe { paint_video(painter.gl(), rc, vp.left_px, vp.from_bottom_px, vp.width_px, vp.height_px) },
                 None => false,
             });
+            unsafe { solid_alpha(painter.gl(), vp.left_px, vp.from_bottom_px, vp.width_px, vp.height_px) };
             // (timings only count real mpv draws, not copies of the last picture)
             if drew {
                 let ms = started.elapsed().as_secs_f32() * 1000.0;
@@ -376,8 +390,6 @@ struct PicTarget {
     t: VideoTarget,
     drawn: (i32, i32),
     scale: f32,
-    /// Draw it once more next frame (see paint_picture)
-    again: bool,
     size: (f32, f32),
     shown: Option<([f32; 4], bool)>,
 }
