@@ -568,13 +568,24 @@ fn needs_flatten(path: &str) -> bool {
 /// (mpv's check of a file's format wants more certainty than a JPEG gives it, so
 /// it read on and checked again, 2 KB, 4 KB, 8 KB... up to the whole file: half a
 /// second for a 5 MB photo before decoding even started.)
-/// And a JPEG shows only its first picture: phones (Pixel, Samsung, newer iPhones)
-/// put a second, hidden one after it (the half-size grey "gain map" for HDR
-/// screens), and mpv took the file for a two-frame video and went on to it a
-/// second later, drawn over the photo as a bar of green across the bottom.
+/// A JPEG (by its first bytes, not just its name) is read as a plain JPEG and shows
+/// only its first picture. Phones (Pixel, Samsung, newer iPhones) put more pictures
+/// after the photo, such as the half-size grey "gain map" for HDR screens:
+/// - newer FFmpeg reads such files with its new "jpeg_mpf" reader, which cuts the
+///   photo's last few rows off (a green bar across the bottom), so the plain JPEG
+///   reader is named instead (which also skips mpv's format check);
+/// - that reader takes the file for a short video, and went on to the grey
+///   picture a second later, so only the first frame is shown.
 fn picture_options(path: &str) -> &'static str {
-    if has_ext(path, &["jpg", "jpeg", "jpe", "jfif"]) {
-        "demuxer-lavf-probescore=25,frames=1"
+    let jpeg = has_ext(path, &["jpg", "jpeg", "jpe", "jfif"])
+        && std::fs::File::open(path)
+            .and_then(|mut f| {
+                let mut b = [0u8; 2];
+                std::io::Read::read_exact(&mut f, &mut b).map(|_| b)
+            })
+            .is_ok_and(|b| b == [0xFF, 0xD8]);
+    if jpeg {
+        "demuxer-lavf-format=jpeg_pipe,frames=1"
     } else {
         "demuxer-lavf-probescore=25"
     }
