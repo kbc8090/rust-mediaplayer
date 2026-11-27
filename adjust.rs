@@ -1,0 +1,2300 @@
+//! "Picture & Sound" panel and the equalizer panel.
+//!
+//! Everything here is plain settings plus drawing: the panels change an `Adjust`
+//! value, and main.rs compares it with the previous one and sends the differences
+//! to mpv (properties for brightness etc., FFmpeg filter chains for the rest).
+
+use eframe::egui::{self, pos2, vec2, Align2, Color32, FontFamily, FontId, Pos2, Rect, Sense, Stroke};
+use crate::glass;
+use std::path::Path;
+
+// ── Settings ──────────────────────────────────────────────────────────────────
+
+/// Equalizer bands (Hz) and their labels: the classic 10-band set
+pub const EQ_FREQS: [u32; 10] = [60, 170, 310, 600, 1000, 3000, 6000, 12000, 14000, 16000];
+const EQ_LABELS: [&str; 10] = ["60", "170", "310", "600", "1K", "3K", "6K", "12K", "14K", "16K"];
+/// Band / preamp range in dB
+const EQ_MAX: i32 = 12;
+
+const EQ_PRESETS: [(&str, [i32; 10]); 9] = [
+    ("Flat", [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+    ("Bass boost", [6, 5, 4, 2, 0, 0, 0, 0, 0, 0]),
+    ("Treble boost", [0, 0, 0, 0, 0, 2, 4, 5, 6, 6]),
+    ("Bass & treble", [6, 4, 2, 0, -1, 0, 2, 4, 5, 5]),
+    ("Vocal", [-2, -1, 0, 2, 4, 4, 3, 1, 0, -1]),
+    ("Rock", [5, 3, -1, -3, -1, 2, 4, 5, 5, 5]),
+    ("Pop", [-1, 2, 4, 4, 2, 0, -1, -1, -1, -1]),
+    ("Classical", [0, 0, 0, 0, 0, 0, -4, -4, -4, -5]),
+    ("Loudness", [6, 4, 0, -2, -1, 0, 0, 2, 4, 5]),
+];
+
+/// Volume normalizer: FFmpeg's "dynamic audio normalizer" (built into mpv). It looks
+/// ~1 s ahead and smoothly raises quiet passages / lowers loud ones.
+const NORMALIZER: &str = "lavfi=[dynaudnorm=f=150:g=15]";
+
+/// What fills the window while a song plays (Picture & Sound → Sound)
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum MusicShow {
+    /// Glowing bars that move with the music
+    Visualizer,
+    /// The song's cover with its title, artist and album; songs without a cover
+    /// get the visualizer
+    AlbumArt,
+}
+
+impl MusicShow {
+    const ALL: [MusicShow; 2] = [MusicShow::Visualizer, MusicShow::AlbumArt];
+    fn key(self) -> &'static str {
+        match self {
+            MusicShow::Visualizer => "visualizer",
+            MusicShow::AlbumArt => "album_art",
+        }
+    }
+}
+
+/// How the visualizer looks
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum VisStyle {
+    /// Glowing bars, lows to highs left to right
+    Bars,
+    /// The start screen's ribbon of lines, moved by the music
+    Wave,
+    /// Bars round a ring, the song's cover inside it
+    Circle,
+}
+
+impl VisStyle {
+    const ALL: [VisStyle; 3] = [VisStyle::Bars, VisStyle::Wave, VisStyle::Circle];
+    fn key(self) -> &'static str {
+        match self {
+            VisStyle::Bars => "bars",
+            VisStyle::Wave => "wave",
+            VisStyle::Circle => "circle",
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Debug)]
+pub struct Adjust {
+    // Picture: mpv's own controls, −100…100
+    pub brightness: i32,
+    pub contrast: i32,
+    pub saturation: i32,
+    pub gamma: i32,
+    pub hue: i32,
+    // Picture: FFmpeg filters
+    /// −5 (cool) … +5 (warm), 600 K per step
+    pub temperature: i32,
+    /// −20 … +20, 0.05 of FFmpeg's vibrance strength per step
+    pub vibrance: i32,
+    /// 0 (off) … 5
+    pub sharpen: i32,
+    /// 0 (off), 1 low, 2 medium, 3 high
+    pub denoise: i32,
+    pub deband: bool,
+    pub deinterlace: bool,
+    pub smooth: bool,
+    // Sound
+    pub night: bool,
+    pub dialogue: bool,
+    /// Audio delay in ms (+ = sound later)
+    pub delay_ms: i32,
+    pub mono: bool,
+    pub crossfeed: bool,
+    pub widen: bool,
+    pub keep_pitch: bool,
+    /// While a song plays (not reset by Reset: it's how songs look, not how they sound)
+    pub music: MusicShow,
+    /// The visualizer's look (not reset either)
+    pub vis_style: VisStyle,
+    // Equalizer (dB)
+    pub eq_on: bool,
+    pub preamp: i32,
+    pub eq: [i32; 10],
+}
+
+impl Default for Adjust {
+    fn default() -> Self {
+        Self {
+            brightness: 0,
+            contrast: 0,
+            saturation: 0,
+            gamma: 0,
+            hue: 0,
+            temperature: 0,
+            vibrance: 0,
+            sharpen: 0,
+            denoise: 0,
+            deband: false,
+            deinterlace: false,
+            smooth: false,
+            night: false,
+            dialogue: false,
+            delay_ms: 0,
+            mono: false,
+            crossfeed: false,
+            widen: false,
+            keep_pitch: true,
+            music: MusicShow::AlbumArt,
+            vis_style: VisStyle::Bars,
+            eq_on: false,
+            preamp: 0,
+            eq: [0; 10],
+        }
+    }
+}
+
+impl Adjust {
+    /// Read from `path` ("name=value" lines); anything missing keeps its default
+    pub fn load(path: &Path) -> Self {
+        let mut a = Self::default();
+        let Ok(text) = std::fs::read_to_string(path) else { return a };
+        for line in text.lines() {
+            let Some((k, v)) = line.split_once('=') else { continue };
+            let (k, v) = (k.trim(), v.trim());
+            let n = v.parse::<i32>().unwrap_or(0);
+            let b = v == "1";
+            match k {
+                "brightness" => a.brightness = n.clamp(-100, 100),
+                "contrast" => a.contrast = n.clamp(-100, 100),
+                "saturation" => a.saturation = n.clamp(-100, 100),
+                "gamma" => a.gamma = n.clamp(-100, 100),
+                "hue" => a.hue = n.clamp(-100, 100),
+                // (older files: −5…+5 in steps four times as big)
+                "temperature" => a.temperature = n.clamp(-5, 5),
+                // (briefly saved on a 4× finer scale)
+                "temperature_fine" => a.temperature = ((n as f32) / 4.0).round() as i32,
+                "vibrance" => a.vibrance = (n * 4).clamp(-20, 20),
+                "vibrance_fine" => a.vibrance = n.clamp(-20, 20),
+                "sharpen" => a.sharpen = n.clamp(0, 5),
+                "denoise" => a.denoise = n.clamp(0, 3),
+                "deband" => a.deband = b,
+                "deinterlace" => a.deinterlace = b,
+                "smooth" => a.smooth = b,
+                "night" => a.night = b,
+                "dialogue" => a.dialogue = b,
+                "delay_ms" => a.delay_ms = n.clamp(-5000, 5000),
+                "mono" => a.mono = b,
+                "crossfeed" => a.crossfeed = b,
+                "widen" => a.widen = b,
+                "keep_pitch" => a.keep_pitch = b,
+                "music" => {
+                    if let Some(m) = MusicShow::ALL.into_iter().find(|m| m.key() == v) {
+                        a.music = m;
+                    }
+                }
+                "vis_style" => {
+                    if let Some(m) = VisStyle::ALL.into_iter().find(|m| m.key() == v) {
+                        a.vis_style = m;
+                    }
+                }
+                "eq_on" => a.eq_on = b,
+                "preamp" => a.preamp = n.clamp(-EQ_MAX, EQ_MAX),
+                "eq" => {
+                    for (i, g) in v.split(',').take(10).enumerate() {
+                        a.eq[i] = g.trim().parse::<i32>().unwrap_or(0).clamp(-EQ_MAX, EQ_MAX);
+                    }
+                }
+                _ => {}
+            }
+        }
+        a
+    }
+
+    pub fn save(&self, path: &Path) {
+        let b = |v: bool| if v { 1 } else { 0 };
+        let eq: Vec<String> = self.eq.iter().map(|g| g.to_string()).collect();
+        let text = format!(
+            "brightness={}\ncontrast={}\nsaturation={}\ngamma={}\nhue={}\ntemperature={}\nvibrance_fine={}\n\
+             sharpen={}\ndenoise={}\ndeband={}\ndeinterlace={}\nsmooth={}\nnight={}\ndialogue={}\n\
+             delay_ms={}\nmono={}\ncrossfeed={}\nwiden={}\nkeep_pitch={}\nmusic={}\nvis_style={}\neq_on={}\npreamp={}\neq={}\n",
+            self.brightness, self.contrast, self.saturation, self.gamma, self.hue, self.temperature,
+            self.vibrance, self.sharpen, self.denoise, b(self.deband), b(self.deinterlace), b(self.smooth),
+            b(self.night), b(self.dialogue), self.delay_ms, b(self.mono), b(self.crossfeed), b(self.widen),
+            b(self.keep_pitch), self.music.key(), self.vis_style.key(), b(self.eq_on), self.preamp, eq.join(","),
+        );
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let _ = std::fs::write(path, text);
+    }
+
+    fn reset_picture(&mut self) {
+        let d = Self::default();
+        (self.brightness, self.contrast, self.saturation, self.gamma, self.hue) = (0, 0, 0, 0, 0);
+        (self.temperature, self.vibrance, self.sharpen, self.denoise) = (0, 0, 0, 0);
+        (self.deband, self.deinterlace, self.smooth) = (d.deband, d.deinterlace, d.smooth);
+    }
+
+    fn reset_sound(&mut self) {
+        let d = Self::default();
+        (self.night, self.dialogue, self.delay_ms) = (d.night, d.dialogue, d.delay_ms);
+        (self.mono, self.crossfeed, self.widen, self.keep_pitch) = (d.mono, d.crossfeed, d.widen, d.keep_pitch);
+    }
+
+    /// Values for mpv's own colour controls (done on the GPU, as the video is
+    /// turned into RGB)
+    pub fn gpu_colour(&self) -> [(&'static str, i32); 5] {
+        [
+            ("brightness", self.brightness),
+            ("contrast", self.contrast),
+            ("saturation", self.saturation),
+            ("gamma", self.gamma),
+            ("hue", self.hue),
+        ]
+    }
+
+    /// mpv's `vf` list (FFmpeg filters, run on the CPU), or None for no filters.
+    /// Only Denoise and mirroring are left here: Color temperature, Vibrance and
+    /// Sharpen run on the GPU (see `shader`). Done in FFmpeg they had every frame
+    /// converted to RGB and processed on the CPU at full size, which a 4K 60 fps
+    /// video couldn't keep up with. Denoise can't move (it compares each frame
+    /// with the previous ones, which mpv's shaders can't see), so it's only used
+    /// where `denoise_ok` says the video is small enough (1080p or less).
+    pub fn vf_chain(&self, mirror: bool, denoise_ok: bool) -> Option<String> {
+        let mut f: Vec<String> = Vec::new();
+        if self.denoise > 0 && denoise_ok {
+            f.push(format!("hqdn3d={}", [0, 2, 4, 7][self.denoise as usize]));
+        }
+        if mirror {
+            f.push("hflip".to_owned());
+        }
+        (!f.is_empty()).then(|| format!("lavfi=[{}]", f.join(",")))
+    }
+
+    /// Short name for the current GPU picture shader's settings (used in its file
+    /// name), or None when it isn't needed
+    pub fn shader_key(&self) -> Option<String> {
+        (self.temperature != 0 || self.vibrance != 0 || self.sharpen != 0)
+            .then(|| format!("t{}-v{}-s{}", self.temperature, self.vibrance, self.sharpen))
+    }
+
+    /// An mpv user shader doing Color temperature, Vibrance and Sharpen on the GPU,
+    /// with the settings written in as constants. It runs on the picture right
+    /// after mpv's own colour conversion (where Brightness, Contrast, ... are
+    /// applied), at the video's own size. The maths follows FFmpeg's
+    /// colortemperature, vibrance and cas filters, which these used to be.
+    pub fn shader(&self) -> Option<String> {
+        self.shader_key()?;
+        let mut body = String::new();
+        if self.sharpen > 0 {
+            // AMD's contrast-adaptive sharpening, as FFmpeg's cas filter does it
+            let strength = self.sharpen as f32 * 0.2;
+            let k = -(16.0 + (4.01 - 16.0) * strength);
+            body += &format!(
+                "    vec3 a = HOOKED_texOff(vec2(-1.0, -1.0)).rgb;\n\
+                 \x20   vec3 b = HOOKED_texOff(vec2( 0.0, -1.0)).rgb;\n\
+                 \x20   vec3 c = HOOKED_texOff(vec2( 1.0, -1.0)).rgb;\n\
+                 \x20   vec3 d = HOOKED_texOff(vec2(-1.0,  0.0)).rgb;\n\
+                 \x20   vec3 e = rgb;\n\
+                 \x20   vec3 f = HOOKED_texOff(vec2( 1.0,  0.0)).rgb;\n\
+                 \x20   vec3 g = HOOKED_texOff(vec2(-1.0,  1.0)).rgb;\n\
+                 \x20   vec3 h = HOOKED_texOff(vec2( 0.0,  1.0)).rgb;\n\
+                 \x20   vec3 i = HOOKED_texOff(vec2( 1.0,  1.0)).rgb;\n\
+                 \x20   vec3 mn = min(min(min(d, e), min(f, b)), h);\n\
+                 \x20   mn += min(min(min(mn, a), min(c, g)), i);\n\
+                 \x20   vec3 mx = max(max(max(d, e), max(f, b)), h);\n\
+                 \x20   mx += max(max(max(mx, a), max(c, g)), i);\n\
+                 \x20   vec3 amp = sqrt(clamp(min(mn, 2.0 - mx) / max(mx, vec3(1e-5)), 0.0, 1.0));\n\
+                 \x20   vec3 w = amp / {k:.6};\n\
+                 \x20   rgb = clamp(((b + d + f + h) * w + e) / (1.0 + 4.0 * w), 0.0, 1.0);\n"
+            );
+        }
+        if self.temperature != 0 {
+            // 6500 K is "off"; lower is warmer
+            let [r, g, b] = kelvin_rgb((6500 - self.temperature * 600) as f32);
+            body += &format!("    rgb *= vec3({r:.6}, {g:.6}, {b:.6});\n");
+        }
+        if self.vibrance != 0 {
+            // FFmpeg's vibrance (its default mode): a saturation boost that grows
+            // with how colourful the pixel already is
+            let v = self.vibrance as f32 * 0.05;
+            let sign = if v >= 0.0 { 1.0 } else { -1.0 };
+            body += &format!(
+                "    float sat = max(rgb.r, max(rgb.g, rgb.b)) - min(rgb.r, min(rgb.g, rgb.b));\n\
+                 \x20   float luma = dot(rgb, vec3(0.072186, 0.715158, 0.212656));\n\
+                 \x20   rgb = mix(vec3(luma), rgb, 1.0 + {v:.6} * (1.0 + {sign:.1} * sat));\n"
+            );
+        }
+        Some(format!(
+            "//!HOOK MAIN\n//!BIND HOOKED\n//!DESC Rust Media Player picture\n\n\
+             vec4 hook() {{\n    vec4 px = HOOKED_texOff(vec2(0.0));\n    vec3 rgb = px.rgb;\n{body}    return vec4(rgb, px.a);\n}}\n"
+        ))
+    }
+
+    /// The equalizer's band gains as FFmpeg firequalizer wants them
+    pub fn eq_entries(&self) -> String {
+        EQ_FREQS
+            .iter()
+            .zip(self.eq.iter())
+            .map(|(f, g)| format!("entry({f},{g})"))
+            .collect::<Vec<_>>()
+            .join(";")
+    }
+
+    /// mpv's `af` list, or None for no filters. With `with_gains` false the
+    /// equalizer's gains are left out: comparing those versions tells whether only
+    /// the gains changed (then they're sent live, without rebuilding the chain).
+    pub fn af_chain(&self, normalize: bool, with_gains: bool) -> Option<String> {
+        let mut v: Vec<String> = Vec::new();
+        if self.eq_on {
+            let (pre, entries) = if with_gains { (self.preamp, self.eq_entries()) } else { (0, String::new()) };
+            v.push(format!("@eqpre:lavfi=[volume={pre}dB]"));
+            v.push(format!("@eq:lavfi=[firequalizer=gain_entry='{entries}']"));
+        }
+        if self.dialogue {
+            // (dialoguenhance takes stereo; it makes a centre channel for the voice)
+            v.push("lavfi=[aformat=channel_layouts=stereo,dialoguenhance]".to_owned());
+        }
+        if self.mono {
+            v.push("lavfi=[aformat=channel_layouts=mono]".to_owned());
+        } else if self.widen || self.crossfeed {
+            let mut g = vec!["aformat=channel_layouts=stereo"];
+            if self.widen {
+                g.push("extrastereo=m=1.6");
+            }
+            if self.crossfeed {
+                g.push("crossfeed");
+            }
+            v.push(format!("lavfi=[{}]", g.join(",")));
+        }
+        if self.night {
+            // threshold ≈ −21 dB, 4:1, quick attack, slow release, a little makeup gain
+            v.push("lavfi=[acompressor=threshold=0.089:ratio=4:attack=5:release=250:makeup=2]".to_owned());
+        }
+        if normalize {
+            v.push(NORMALIZER.to_owned());
+        }
+        (!v.is_empty()).then(|| v.join(","))
+    }
+
+    fn preset_name(&self) -> &'static str {
+        EQ_PRESETS.iter().find(|(_, g)| *g == self.eq).map_or("Custom", |(n, _)| n)
+    }
+}
+
+// ── Panel state ───────────────────────────────────────────────────────────────
+
+#[derive(Clone, Copy, PartialEq)]
+pub enum Tab {
+    Picture,
+    Sound,
+}
+
+pub struct AdjustUi {
+    pub open: bool,
+    pub eq_open: bool,
+    pub tab: Tab,
+    /// Where the panels were drawn last (the mouse wheel there doesn't change the
+    /// volume, and the mouse cursor isn't hidden over them)
+    pub panel_rect: Rect,
+    pub eq_rect: Rect,
+    /// The row whose description is pending / showing, since when, and whether
+    /// it's showing
+    tip_row: Option<&'static str>,
+    tip_since: std::time::Instant,
+    tip_shown: bool,
+    /// Denoise is on but not used for the current video (larger than 1080p);
+    /// set by the app every frame, and mentioned in Denoise's description
+    pub denoise_skipped: bool,
+    /// The Online video settings panel (same place as Picture & Sound; one or the
+    /// other) and its audio language list
+    pub online_open: bool,
+    pub online_rect: Rect,
+    pub lang_open: bool,
+    pub lang_rect: Rect,
+    /// Scroll the language list to the chosen language (set when it opens)
+    pub lang_scroll: bool,
+    /// The playlist panel (right side) and the "Up next" card (bottom right)
+    pub playlist_open: bool,
+    pub playlist_rect: Rect,
+    /// The tab on the window's right edge that slides the playlist in and out
+    pub playlist_tab: Rect,
+    pub summary_rect: Rect,
+    /// Scroll the playlist to the playing entry (set when it opens)
+    pub playlist_scroll: bool,
+}
+
+impl AdjustUi {
+    pub fn new() -> Self {
+        Self {
+            open: false,
+            eq_open: false,
+            tab: Tab::Picture,
+            panel_rect: Rect::NOTHING,
+            eq_rect: Rect::NOTHING,
+            tip_row: None,
+            tip_since: std::time::Instant::now(),
+            tip_shown: false,
+            denoise_skipped: false,
+            online_open: false,
+            online_rect: Rect::NOTHING,
+            lang_open: false,
+            lang_rect: Rect::NOTHING,
+            lang_scroll: false,
+            playlist_open: false,
+            playlist_rect: Rect::NOTHING,
+            playlist_tab: Rect::NOTHING,
+            summary_rect: Rect::NOTHING,
+            playlist_scroll: false,
+        }
+    }
+
+    pub fn contains(&self, p: Pos2) -> bool {
+        (self.open && self.panel_rect.contains(p))
+            || (self.eq_open && self.eq_rect.contains(p))
+            || (self.online_open && (self.online_rect.contains(p) || (self.lang_open && self.lang_rect.contains(p))))
+            || (self.playlist_open && self.playlist_rect.contains(p))
+            || self.playlist_tab.contains(p)
+            || self.summary_rect.contains(p)
+    }
+}
+
+// ── Drawing helpers (the menu / shortcuts style) ──────────────────────────────
+
+const BG: Color32 = glass::MENU_BG;
+const TEXT: Color32 = Color32::from_rgb(240, 240, 240);
+const DIM: Color32 = Color32::from_rgb(160, 160, 160);
+const CAP: Color32 = Color32::from_rgb(64, 64, 66);
+const CAP_EDGE: Color32 = Color32::from_rgb(52, 52, 54);
+/// Highlight under the pointer, and while the mouse button is held on it
+pub const HOVER: Color32 = Color32::from_rgba_premultiplied(26, 26, 26, 26);
+pub const PRESS: Color32 = Color32::from_rgba_premultiplied(58, 58, 58, 58);
+
+/// The highlight for a clickable item: pressed (button held with the pointer still
+/// on it), hovered, or none
+/// Fires when the mouse button is released anywhere over the item, like Windows'
+/// buttons (a plain "click" also needs the pointer to have stayed nearly still)
+pub fn activated(resp: &egui::Response) -> bool {
+    resp.clicked()
+        || (resp.drag_stopped() && resp.ctx.input(|i| i.pointer.latest_pos()).is_some_and(|p| resp.rect.contains(p)))
+}
+
+/// The accent colour lightened a little, for an icon or text on a dark ground
+fn accent_text(accent: Color32) -> Color32 {
+    Color32::from_rgb(accent.r() / 4 * 3 + 64, accent.g() / 4 * 3 + 64, accent.b() / 4 * 3 + 64)
+}
+
+/// Shuffle: two crossing arrows
+fn icon_shuffle(p: &egui::Painter, c: Pos2, col: Color32) {
+    let st = Stroke::new(1.3_f32, col);
+    // (each path: flat, an eased crossing, flat; its arrow at the right end)
+    for (y0, y1) in [(-4.0_f32, 4.0_f32), (4.0, -4.0)] {
+        let pts: Vec<Pos2> = (0..=16)
+            .map(|i| {
+                let t = i as f32 / 16.0;
+                let x = -7.0 + 13.0 * t;
+                let k = ((x + 3.5) / 7.0).clamp(0.0, 1.0);
+                let e = k * k * (3.0 - 2.0 * k);
+                c + vec2(x, y0 + (y1 - y0) * e)
+            })
+            .collect();
+        p.add(egui::Shape::line(pts, st));
+        let tip = c + vec2(6.5, y1);
+        p.line_segment([tip + vec2(-2.8, -2.8), tip], st);
+        p.line_segment([tip + vec2(-2.8, 2.8), tip], st);
+    }
+}
+
+/// Number of points for a round curve of radius `r` points, so each straight piece
+/// is about 1.5 screen pixels long whatever the display scaling (egui's own circles
+/// choose from the size in points, and small ones look like polygons above 100 %)
+pub fn arc_points(r: f32, ppp: f32) -> usize {
+    ((std::f32::consts::TAU * r * ppp / 1.5).ceil() as usize).clamp(24, 160)
+}
+
+/// A filled circle that stays smooth at any display scaling
+pub fn disc(p: &egui::Painter, centre: Pos2, r: f32, color: Color32) {
+    if r <= 0.0 || color == Color32::TRANSPARENT {
+        return;
+    }
+    let n = arc_points(r, p.ctx().pixels_per_point());
+    let pts = (0..n)
+        .map(|i| {
+            let a = std::f32::consts::TAU * i as f32 / n as f32;
+            centre + r * egui::vec2(a.cos(), a.sin())
+        })
+        .collect();
+    p.add(egui::Shape::convex_polygon(pts, color, egui::Stroke::NONE));
+}
+
+pub fn state_fill(resp: &egui::Response) -> Option<Color32> {
+    let inside = resp.ctx.input(|i| i.pointer.latest_pos()).is_some_and(|p| resp.rect.contains(p));
+    if resp.is_pointer_button_down_on() && inside {
+        Some(PRESS)
+    } else if resp.hovered() {
+        Some(HOVER)
+    } else {
+        None
+    }
+}
+const LINE: Color32 = glass::BORDER;
+const NAME_SIZE: f32 = 13.5;
+const VALUE_SIZE: f32 = 12.5;
+const ROW_H: f32 = 30.0;
+/// From a panel's or menu's edge to its rows' highlights: the 1 px border, then a
+/// 4 px gap (the same as between a separator and the rows beside it)
+pub(crate) const EDGE: f32 = 5.0;
+const HEAD_H: f32 = 44.0;
+
+fn semibold(size: f32) -> FontId {
+    FontId::new(size, FontFamily::Name("semibold".into()))
+}
+
+/// Is the pointer on row `r`? Its bottom and right edges belong to the next row
+/// (egui's own check counts both edges as inside, so on the line between two
+/// rows both were "hovered" at once)
+fn pointer_on(ui: &egui::Ui, r: Rect) -> bool {
+    ui.rect_contains_pointer(r) && ui.input(|i| i.pointer.hover_pos()).is_some_and(|p| p.x < r.right() && p.y < r.bottom())
+}
+
+fn panel_frame(p: &egui::Painter, rect: Rect) {
+    let r = 8.0;
+    glass::shadow(p, rect, r, 1.0);
+    glass::fill(p, rect, r, BG, 1.0);
+    p.rect_stroke(rect.shrink(0.5), r, Stroke::new(1.0_f32, glass::edge(glass::BORDER)));
+}
+
+/// Title, "Reset" link and an X. Returns (reset clicked, close clicked).
+fn header(ui: &mut egui::Ui, p: &egui::Painter, rect: Rect, title: &str, id: &str) -> (bool, bool) {
+    header_with(ui, p, rect, title, id, true)
+}
+
+/// Title, optionally a "Reset" link, and an X. Returns (reset clicked, close clicked).
+fn header_with(ui: &mut egui::Ui, p: &egui::Painter, rect: Rect, title: &str, id: &str, with_reset: bool) -> (bool, bool) {
+    let cy = rect.top() + HEAD_H / 2.0;
+    p.text(pos2(rect.left() + 16.0, cy), Align2::LEFT_CENTER, title, semibold(14.5), TEXT);
+
+    let xr = Rect::from_center_size(pos2(rect.right() - 22.0, cy), vec2(28.0, 28.0));
+    let x = ui.interact(xr, ui.id().with((id, "close")), Sense::click_and_drag());
+    if let Some(c) = state_fill(&x) {
+        p.rect_filled(xr, 4.0, c);
+    }
+    let c = xr.center();
+    for (a, b) in [((-5.0, -5.0), (5.0, 5.0)), ((-5.0, 5.0), (5.0, -5.0))] {
+        p.line_segment([c + vec2(a.0, a.1), c + vec2(b.0, b.1)], Stroke::new(1.2_f32, TEXT));
+    }
+
+    let mut reset_clicked = false;
+    if with_reset {
+        let font = FontId::proportional(12.5);
+        let g = p.layout_no_wrap("Reset".to_owned(), font, DIM);
+        let rr = Rect::from_center_size(pos2(xr.left() - 10.0 - g.size().x / 2.0, cy), g.size() + vec2(10.0, 8.0));
+        let reset = ui.interact(rr, ui.id().with((id, "reset")), Sense::click_and_drag());
+        if let Some(c) = state_fill(&reset) {
+            p.rect_filled(rr, 4.0, c);
+        }
+        let col = if reset.hovered() { TEXT } else { DIM };
+        p.galley(rr.center() - g.size() / 2.0, g, col);
+        reset_clicked = activated(&reset);
+    }
+
+    p.line_segment(
+        [pos2(rect.left() + 1.0, rect.top() + HEAD_H - 0.5), pos2(rect.right() - 1.0, rect.top() + HEAD_H - 0.5)],
+        Stroke::new(1.0_f32, LINE),
+    );
+    (reset_clicked, activated(&x))
+}
+
+/// A key cap button ("−" / "+") with its label at `size`; returns true when clicked
+fn cap_sized(ui: &mut egui::Ui, p: &egui::Painter, rect: Rect, label: &str, id: egui::Id, size: f32) -> bool {
+    let resp = ui.interact(rect, id, Sense::click_and_drag());
+    let inside = resp.ctx.input(|i| i.pointer.latest_pos()).is_some_and(|p| rect.contains(p));
+    let pressed = resp.is_pointer_button_down_on() && inside;
+    let fill = if pressed {
+        Color32::from_rgb(112, 112, 114)
+    } else if resp.hovered() {
+        Color32::from_rgb(82, 82, 84)
+    } else {
+        CAP
+    };
+    p.rect_filled(rect, 4.0, fill);
+    // (the darker bottom edge stays when pressed, so the cap keeps its size; only
+    // the label sinks a little)
+    p.rect_filled(
+        Rect::from_min_max(pos2(rect.left() + 1.0, rect.bottom() - 2.0), pos2(rect.right() - 1.0, rect.bottom())),
+        2.0,
+        CAP_EDGE,
+    );
+    let off = if pressed { 0.5 } else { -0.5 };
+    p.text(rect.center() + vec2(0.0, off), Align2::CENTER_CENTER, label, semibold(size), TEXT);
+    activated(&resp)
+}
+
+/// Windows 11-style on/off switch
+fn switch(p: &egui::Painter, rect: Rect, on: bool, accent: Color32) {
+    let r = rect.height() / 2.0;
+    if on {
+        p.rect_filled(rect, r, accent);
+        disc(p, pos2(rect.right() - r, rect.center().y), r - 4.5, Color32::from_rgb(26, 26, 26));
+    } else {
+        p.rect_stroke(rect.shrink(0.5), r, Stroke::new(1.0_f32, Color32::from_rgb(154, 154, 154)));
+        disc(p, pos2(rect.left() + r, rect.center().y), r - 4.5, Color32::from_rgb(207, 207, 207));
+    }
+}
+
+/// Description box beside a hovered row (after the pointer rests a moment)
+fn description(ctx: &egui::Context, row: Rect, panel: Rect, text: &str) {
+    let p = ctx.layer_painter(egui::LayerId::new(egui::Order::Tooltip, egui::Id::new("adjust_tip")));
+    let g = p.layout(text.to_owned(), FontId::proportional(12.5), Color32::from_rgb(232, 232, 232), 240.0);
+    let size = g.size() + vec2(20.0, 16.0);
+    let screen = ctx.screen_rect();
+    let mut x = panel.right() + 8.0;
+    if x + size.x > screen.right() - 4.0 {
+        x = (screen.right() - 4.0 - size.x).max(screen.left() + 4.0);
+    }
+    let y = (row.center().y - size.y / 2.0).clamp(screen.top() + 4.0, (screen.bottom() - 4.0 - size.y).max(screen.top() + 4.0));
+    let r = Rect::from_min_size(pos2(x, y), size);
+    glass::shadow(&p, r, 6.0, 0.8);
+    glass::fill(&p, r, 6.0, glass::MENU_BG, 1.0);
+    p.rect_stroke(r.shrink(0.5), 6.0, Stroke::new(1.0_f32, glass::edge(glass::BORDER)));
+    p.galley(r.min + vec2(10.0, 8.0), g, Color32::from_rgb(232, 232, 232));
+}
+
+fn signed(v: i32) -> String {
+    if v > 0 { format!("+{v}") } else { v.to_string() }
+}
+
+// ── The "Picture & Sound" panel ───────────────────────────────────────────────
+
+enum Row {
+    /// name, description, value text, value changed from normal, (−, +) actions
+    Step(&'static str, &'static str, String, bool, StepKey),
+    /// name, description, on
+    Switch(&'static str, &'static str, bool, SwitchKey),
+    /// The equalizer button
+    Equalizer(bool),
+    /// name, description, choices, chosen (a segmented control)
+    Choice(&'static str, &'static str, &'static [&'static str], usize, ChoiceKey),
+    /// A small heading
+    Section(&'static str),
+    Sep,
+}
+
+#[derive(Clone, Copy)]
+enum ChoiceKey {
+    Music,
+    Style,
+}
+
+#[derive(Clone, Copy)]
+enum StepKey {
+    Brightness,
+    Contrast,
+    Saturation,
+    Gamma,
+    Hue,
+    Temperature,
+    Vibrance,
+    Sharpen,
+    Denoise,
+    Delay,
+}
+
+#[derive(Clone, Copy)]
+enum SwitchKey {
+    Deband,
+    Deinterlace,
+    Smooth,
+    Normalize,
+    Night,
+    Dialogue,
+    Mono,
+    Crossfeed,
+    Widen,
+    Pitch,
+    Hq,
+}
+
+/// The controls with both ±5 and small ±1 buttons
+fn has_fine(key: StepKey) -> bool {
+    matches!(
+        key,
+        StepKey::Brightness | StepKey::Contrast | StepKey::Saturation | StepKey::Gamma | StepKey::Hue | StepKey::Vibrance
+    )
+}
+
+/// One step up (dir 1) or down (−1); `fine` = ±1 instead of ±5 for the has_fine ones
+fn step(a: &mut Adjust, key: StepKey, dir: i32, fine: bool) {
+    let s = |v: &mut i32, by: i32, lo: i32, hi: i32| *v = (*v + by * dir).clamp(lo, hi);
+    let big = if fine { 1 } else { 5 };
+    match key {
+        StepKey::Brightness => s(&mut a.brightness, big, -100, 100),
+        StepKey::Contrast => s(&mut a.contrast, big, -100, 100),
+        StepKey::Saturation => s(&mut a.saturation, big, -100, 100),
+        StepKey::Gamma => s(&mut a.gamma, big, -100, 100),
+        StepKey::Hue => s(&mut a.hue, big, -100, 100),
+        StepKey::Temperature => s(&mut a.temperature, 1, -5, 5),
+        StepKey::Vibrance => s(&mut a.vibrance, big, -20, 20),
+        StepKey::Sharpen => s(&mut a.sharpen, 1, 0, 5),
+        StepKey::Denoise => s(&mut a.denoise, 1, 0, 3),
+        StepKey::Delay => s(&mut a.delay_ms, 50, -5000, 5000),
+    }
+}
+
+fn flip(a: &mut Adjust, normalize: &mut bool, hq: &mut bool, key: SwitchKey) {
+    let f = |v: &mut bool| *v = !*v;
+    match key {
+        SwitchKey::Deband => f(&mut a.deband),
+        SwitchKey::Deinterlace => f(&mut a.deinterlace),
+        SwitchKey::Smooth => f(&mut a.smooth),
+        SwitchKey::Normalize => f(normalize),
+        SwitchKey::Night => f(&mut a.night),
+        SwitchKey::Dialogue => f(&mut a.dialogue),
+        SwitchKey::Mono => f(&mut a.mono),
+        SwitchKey::Crossfeed => f(&mut a.crossfeed),
+        SwitchKey::Widen => f(&mut a.widen),
+        SwitchKey::Pitch => f(&mut a.keep_pitch),
+        SwitchKey::Hq => f(hq),
+    }
+}
+
+fn rows(a: &Adjust, normalize: bool, hq: bool, tab: Tab, denoise_skipped: bool) -> Vec<Row> {
+    let level = |v: i32| (signed(v), v != 0);
+    match tab {
+        Tab::Picture => {
+            let (b, bc) = level(a.brightness);
+            let (c, cc) = level(a.contrast);
+            let (s, sc) = level(a.saturation);
+            let (g, gc) = level(a.gamma);
+            let (h, hc) = level(a.hue);
+            let temp = match a.temperature {
+                0 => "Off".to_owned(),
+                t if t > 0 => format!("Warm {t}"),
+                t => format!("Cool {}", -t),
+            };
+            let (v, vc) = level(a.vibrance);
+            let sharpen = if a.sharpen == 0 { "Off".to_owned() } else { a.sharpen.to_string() };
+            let denoise = ["Off", "Low", "Medium", "High"][a.denoise as usize].to_owned();
+            vec![
+                Row::Step("Brightness", "Lifts or lowers the whole picture. Too much washes out the blacks; for dark videos try Gamma first.", b, bc, StepKey::Brightness),
+                Row::Step("Contrast", "The difference between dark and bright parts. Higher looks punchier, lower looks flatter.", c, cc, StepKey::Contrast),
+                Row::Step("Saturation", "Colour strength. At \u{2212}100 the picture is black and white.", s, sc, StepKey::Saturation),
+                Row::Step("Gamma", "Brightens or darkens the mid-tones without crushing blacks or whites. Often better than Brightness for dark videos.", g, gc, StepKey::Gamma),
+                Row::Step("Hue", "Turns all colours around the colour wheel. Mostly for fixing a colour cast.", h, hc, StepKey::Hue),
+                Row::Step("Vibrance", "A stronger colour boost than Saturation, strongest where colours are already rich.", v, vc, StepKey::Vibrance),
+                Row::Step("Color temperature", "Warmer (more orange) or cooler (more blue) white balance.", temp, a.temperature != 0, StepKey::Temperature),
+                Row::Step("Sharpen", "Crisper edges (AMD's contrast-adaptive sharpening). High levels can look harsh on grainy video.", sharpen, a.sharpen != 0, StepKey::Sharpen),
+                Row::Step(
+                    "Denoise",
+                    if denoise_skipped {
+                        "Smooths grain and compression noise. Only used on videos up to 1080p (it runs on the processor, which can't keep up with bigger ones), so it's off for this video."
+                    } else {
+                        "Smooths grain and compression noise. Only used on videos up to 1080p (it runs on the processor, which can't keep up with bigger ones)."
+                    },
+                    denoise,
+                    a.denoise != 0,
+                    StepKey::Denoise,
+                ),
+                Row::Sep,
+                Row::Switch("Deband", "Smooths visible steps in gradients such as skies and dark scenes.", a.deband, SwitchKey::Deband),
+                Row::Switch("Deinterlace", "Removes comb-like lines from old TV recordings and DVDs. Only acts on video that's actually interlaced.", a.deinterlace, SwitchKey::Deinterlace),
+                Row::Switch("Smooth motion", "Matches films and other videos under 40 fps to your monitor's refresh rate, so panning shots judder less. (50 and 60 fps video doesn't need it, so it's left alone.)", a.smooth, SwitchKey::Smooth),
+                Row::Switch("High-quality upscaling", "A sharper, cleaner scaler when the video is smaller than the window (e.g. 1080p on a 4K screen). Uses more graphics card time.", hq, SwitchKey::Hq),
+            ]
+        }
+        Tab::Sound => {
+            let delay = if a.delay_ms == 0 { "0 ms".to_owned() } else { format!("{} ms", signed(a.delay_ms)) };
+            let music = MusicShow::ALL.iter().position(|m| *m == a.music).unwrap_or(1);
+            let mut rows = vec![
+                Row::Section("While music plays"),
+                Row::Choice(
+                    "Show",
+                    "Visualizer: glowing bars or a flowing wave that move with the music. Album art: the song's cover with its title, artist and album (songs without a cover show the visualizer).",
+                    &["Visualizer", "Album art"],
+                    music,
+                    ChoiceKey::Music,
+                ),
+            ];
+            // (the visualizer's look, while the visualizer is what shows)
+            if a.music == MusicShow::Visualizer {
+                let style = VisStyle::ALL.iter().position(|s| *s == a.vis_style).unwrap_or(0);
+                rows.push(Row::Choice(
+                    "Style",
+                    "Bars: glowing bars, lows to highs from left to right. Wave: flowing lines that swell with the music, bass in the middle and highs out to the sides. Circle: bars round a ring with the song's cover inside.",
+                    &["Bars", "Wave", "Circle"],
+                    style,
+                    ChoiceKey::Style,
+                ));
+            }
+            rows.extend([
+                Row::Sep,
+                Row::Equalizer(a.eq_on),
+                Row::Sep,
+                Row::Switch("Normalize volume", "Evens out loud and quiet passages, and songs from different albums.", normalize, SwitchKey::Normalize),
+                Row::Switch("Night mode", "Tames sudden loud parts like explosions, so you can keep the volume low at night without losing dialogue.", a.night, SwitchKey::Night),
+                Row::Switch("Dialogue boost", "Makes speech clearer by lifting the voice in the middle of the mix. Surround sound becomes stereo.", a.dialogue, SwitchKey::Dialogue),
+                Row::Sep,
+                Row::Step("Audio delay", "Fixes sound that's out of sync with the picture: + plays the sound later, \u{2212} earlier.", delay, a.delay_ms != 0, StepKey::Delay),
+                Row::Sep,
+                Row::Switch("Mono", "Mixes everything into one channel, e.g. for a single earbud.", a.mono, SwitchKey::Mono),
+                Row::Switch("Headphone crossfeed", "Blends a little of each side into the other, so hard-panned old stereo recordings are less tiring on headphones.", a.crossfeed, SwitchKey::Crossfeed),
+                Row::Switch("Stereo widening", "Makes the stereo sound wider.", a.widen, SwitchKey::Widen),
+                Row::Switch("Keep pitch at other speeds", "Voices sound normal at 1.5\u{d7} or 0.5\u{d7}. Turn off for the chipmunk / slow-motion effect.", a.keep_pitch, SwitchKey::Pitch),
+            ]);
+            rows
+        }
+    }
+}
+
+/// Top of both panels (below the menu button)
+pub const PANEL_TOP: f32 = 44.0;
+/// Space kept free above the bottom controls
+const BOTTOM_GAP: f32 = 112.0;
+const PANEL_W: f32 = 300.0;
+
+pub fn draw_panel(ctx: &egui::Context, ui_state: &mut AdjustUi, a: &mut Adjust, normalize: &mut bool, hq: &mut bool, accent: Color32) {
+    if !ui_state.open {
+        ui_state.panel_rect = Rect::NOTHING;
+        return;
+    }
+    let screen = ctx.screen_rect();
+    let list = rows(a, *normalize, *hq, ui_state.tab, ui_state.denoise_skipped);
+    let row_h = |r: &Row| match r {
+        Row::Sep => 9.0,
+        Row::Section(_) => 24.0,
+        _ => ROW_H,
+    };
+    let content_h: f32 = list.iter().map(row_h).sum();
+    const TABS_H: f32 = 42.0;
+    // (5 px under the last row, as at its sides: the 1 px border, then a 4 px gap)
+    let full_h = HEAD_H + TABS_H + content_h + EDGE;
+    let avail = (screen.bottom() - BOTTOM_GAP) - (screen.top() + PANEL_TOP);
+    let h = full_h.min(avail.max(HEAD_H + TABS_H + ROW_H * 2.0));
+    let w = PANEL_W.min(screen.width() - 16.0);
+    let rect = Rect::from_min_size(pos2(screen.left() + 8.0, screen.top() + PANEL_TOP), vec2(w, h));
+    ui_state.panel_rect = rect;
+
+    let id = egui::Id::new("adjust_panel");
+    let mut hovered_desc: Option<(Rect, &'static str)> = None;
+    let mut open_eq = false;
+    egui::Area::new(id).order(egui::Order::Foreground).fixed_pos(rect.min).show(ctx, |ui| {
+        // The panel's own background swallows clicks / drags (they don't reach the video)
+        ui.allocate_rect(rect, Sense::click_and_drag());
+        let p = ui.painter().clone();
+        panel_frame(&p, rect);
+        let (reset, close) = header(ui, &p, rect, "Picture & Sound", "adjust");
+        if close {
+            ui_state.open = false;
+        }
+        if reset {
+            match ui_state.tab {
+                Tab::Picture => {
+                    a.reset_picture();
+                    *hq = false;
+                }
+                Tab::Sound => {
+                    a.reset_sound();
+                    *normalize = false;
+                }
+            }
+        }
+
+        // Tabs
+        let tabs = Rect::from_min_size(pos2(rect.left() + 12.0, rect.top() + HEAD_H + 8.0), vec2(w - 24.0, 28.0));
+        for (i, (tab, label)) in [(Tab::Picture, "Picture"), (Tab::Sound, "Sound")].into_iter().enumerate() {
+            let half = (tabs.width() - 4.0) / 2.0;
+            let tr = Rect::from_min_size(pos2(tabs.left() + i as f32 * (half + 4.0), tabs.top()), vec2(half, tabs.height()));
+            let resp = ui.interact(tr, ui.id().with(("tab", i)), Sense::click_and_drag());
+            let on = ui_state.tab == tab;
+            if on {
+                // The selected tab: an accent shape (bottom half only, so none of
+                // it peeks out at the top corners) with the tab drawn over it 2 px
+                // shorter, leaving an accent edge along the bottom that follows the
+                // rounded corners up the sides. The top corners keep the same
+                // radius as the other tab.
+                let lower = Rect::from_min_max(pos2(tr.left() - 1.0, tr.center().y), pos2(tr.right() + 1.0, tr.bottom() + 1.0));
+                p.with_clip_rect(lower).rect_filled(tr, 5.0, accent);
+                p.rect_filled(Rect::from_min_max(tr.min, pos2(tr.right(), tr.bottom() - 2.0)), 5.0, Color32::from_rgb(68, 68, 68));
+            } else {
+                let fill = state_fill(&resp).unwrap_or(Color32::from_rgba_premultiplied(8, 8, 8, 8));
+                p.rect_filled(tr, 5.0, fill);
+            }
+            let (font, col) = if on { (semibold(NAME_SIZE), TEXT) } else { (FontId::proportional(NAME_SIZE), Color32::from_rgb(200, 200, 200)) };
+            p.text(tr.center(), Align2::CENTER_CENTER, label, font, col);
+            if activated(&resp) {
+                ui_state.tab = tab;
+            }
+        }
+
+        // Rows (scroll when the window is too short)
+        let list_rect = Rect::from_min_max(pos2(rect.left() + EDGE, rect.top() + HEAD_H + TABS_H), pos2(rect.right() - EDGE, rect.bottom() - EDGE));
+        let mut child = ui.child_ui(list_rect, egui::Layout::top_down(egui::Align::Min));
+        egui::ScrollArea::vertical().max_height(list_rect.height()).show(&mut child, |ui| {
+            ui.spacing_mut().item_spacing = vec2(0.0, 0.0);
+            let rw = list_rect.width() - if full_h > h { 8.0 } else { 0.0 };
+            for row in &list {
+                let (r, _) = ui.allocate_exact_size(vec2(rw, row_h(row)), Sense::hover());
+                let p = ui.painter().clone();
+                match row {
+                    Row::Sep => {
+                        // (the panel's full width, like every separator; kept to the
+                        // list's height so one scrolled away doesn't show over the tabs)
+                        let clip = Rect::from_min_max(pos2(rect.left(), list_rect.top()), pos2(rect.right(), list_rect.bottom()));
+                        p.with_clip_rect(clip).line_segment([pos2(rect.left() + 1.0, r.center().y), pos2(rect.right() - 1.0, r.center().y)], Stroke::new(1.0_f32, LINE));
+                    }
+                    Row::Section(title) => {
+                        p.text(pos2(r.left() + 10.0, r.bottom() - 4.0), Align2::LEFT_BOTTOM, title.to_uppercase(), FontId::proportional(10.5), DIM);
+                    }
+                    Row::Choice(name, desc, labels, chosen, key) => {
+                        if pointer_on(ui, r) {
+                            p.rect_filled(r, 4.0, HOVER);
+                            hovered_desc = Some((r, desc));
+                        }
+                        p.text(pos2(r.left() + 10.0, r.center().y), Align2::LEFT_CENTER, *name, FontId::proportional(NAME_SIZE), TEXT);
+                        if let Some(i) = segmented(ui, &p, r.right() - 8.0, r.center().y, labels, *chosen, name, accent) {
+                            match key {
+                                ChoiceKey::Music => a.music = MusicShow::ALL[i],
+                                ChoiceKey::Style => a.vis_style = VisStyle::ALL[i],
+                            }
+                        }
+                    }
+                    Row::Step(name, desc, value, changed, key) => {
+                        if pointer_on(ui, r) {
+                            p.rect_filled(r, 4.0, HOVER);
+                            hovered_desc = Some((r, desc));
+                        }
+                        p.text(pos2(r.left() + 10.0, r.center().y), Align2::LEFT_CENTER, *name, FontId::proportional(NAME_SIZE), TEXT);
+                        // Outer caps: the normal step (±5 for the −100…100 ones), a size
+                        // bigger; inner tiny caps on those: ±1
+                        let plus = Rect::from_center_size(pos2(r.right() - 19.0, r.center().y), vec2(26.0, 22.0));
+                        let minus = plus.translate(vec2(-112.0, 0.0));
+                        let col = if *changed { accent } else { Color32::from_rgb(189, 189, 189) };
+                        // (long values like "Cool 20" get a smaller size to fit between the small buttons)
+                        let size = if value.chars().count() > 6 { 11.0 } else { VALUE_SIZE };
+                        p.text(pos2((minus.right() + plus.left()) / 2.0, r.center().y), Align2::CENTER_CENTER, value, FontId::proportional(size), col);
+                        if cap_sized(ui, &p, minus, "\u{2212}", ui.id().with((*name, "minus")), 14.5) {
+                            step(a, *key, -1, false);
+                        }
+                        if cap_sized(ui, &p, plus, "+", ui.id().with((*name, "plus")), 14.5) {
+                            step(a, *key, 1, false);
+                        }
+                        if has_fine(*key) {
+                            let fplus = Rect::from_center_size(pos2(plus.left() - 12.0, r.center().y), vec2(15.0, 15.0));
+                            let fminus = Rect::from_center_size(pos2(minus.right() + 12.0, r.center().y), vec2(15.0, 15.0));
+                            if cap_sized(ui, &p, fminus, "\u{2212}", ui.id().with((*name, "minus1")), 10.0) {
+                                step(a, *key, -1, true);
+                            }
+                            if cap_sized(ui, &p, fplus, "+", ui.id().with((*name, "plus1")), 10.0) {
+                                step(a, *key, 1, true);
+                            }
+                        }
+                        // The wheel over a row steps it too (the normal step)
+                        if pointer_on(ui, r) {
+                            let wheel = ui.input(|i| i.raw_scroll_delta.y);
+                            if wheel > 0.0 {
+                                step(a, *key, 1, false);
+                            } else if wheel < 0.0 {
+                                step(a, *key, -1, false);
+                            }
+                        }
+                    }
+                    Row::Switch(name, desc, on, key) => {
+                        let resp = ui.interact(r, ui.id().with((*name, "switch")), Sense::click_and_drag());
+                        if let Some(c) = state_fill(&resp) {
+                            p.rect_filled(r, 4.0, c);
+                        }
+                        if resp.hovered() {
+                            hovered_desc = Some((r, desc));
+                        }
+                        p.text(pos2(r.left() + 10.0, r.center().y), Align2::LEFT_CENTER, *name, FontId::proportional(NAME_SIZE), TEXT);
+                        switch(&p, Rect::from_center_size(pos2(r.right() - 28.0, r.center().y), vec2(38.0, 19.0)), *on, accent);
+                        if activated(&resp) {
+                            flip(a, normalize, hq, *key);
+                        }
+                    }
+                    Row::Equalizer(on) => {
+                        let resp = ui.interact(r, ui.id().with("eq_button"), Sense::click_and_drag());
+                        if let Some(c) = state_fill(&resp) {
+                            p.rect_filled(r, 4.0, c);
+                        }
+                        if resp.hovered() {
+                            hovered_desc = Some((r, "Adjust bass, mids and treble with a 10-band equalizer."));
+                        }
+                        p.text(pos2(r.left() + 10.0, r.center().y), Align2::LEFT_CENTER, "Equalizer\u{2026}", FontId::proportional(NAME_SIZE), TEXT);
+                        let state = if *on { "On" } else { "Off" };
+                        let col = if *on { accent } else { DIM };
+                        p.text(pos2(r.right() - 26.0, r.center().y), Align2::RIGHT_CENTER, state, FontId::proportional(VALUE_SIZE), col);
+                        // chevron
+                        let c = pos2(r.right() - 14.0, r.center().y);
+                        p.line_segment([c + vec2(-2.5, -4.5), c + vec2(2.0, 0.0)], Stroke::new(1.3_f32, TEXT));
+                        p.line_segment([c + vec2(2.0, 0.0), c + vec2(-2.5, 4.5)], Stroke::new(1.3_f32, TEXT));
+                        if activated(&resp) {
+                            open_eq = true;
+                        }
+                    }
+                }
+            }
+        });
+    });
+    if open_eq {
+        ui_state.eq_open = !ui_state.eq_open;
+    }
+    show_tip(ctx, ui_state, hovered_desc, rect);
+}
+
+/// A row's description appears after the pointer has been on that row for a
+/// moment, then stays while the pointer is anywhere on the row (moving or not).
+/// Moving to another row while one is showing switches straight to the new one.
+fn show_tip(ctx: &egui::Context, ui_state: &mut AdjustUi, hovered_desc: Option<(Rect, &'static str)>, rect: Rect) {
+    const TIP_DELAY: f32 = 0.35;
+    match hovered_desc {
+        Some((row, desc)) => {
+            if ui_state.tip_row != Some(desc) {
+                let now = std::time::Instant::now();
+                ui_state.tip_since = if ui_state.tip_shown {
+                    now.checked_sub(std::time::Duration::from_secs_f32(TIP_DELAY)).unwrap_or(now)
+                } else {
+                    now
+                };
+                ui_state.tip_row = Some(desc);
+            }
+            ui_state.tip_shown = ui_state.tip_since.elapsed().as_secs_f32() >= TIP_DELAY;
+            if ui_state.tip_shown {
+                description(ctx, row, rect, desc);
+            } else {
+                ctx.request_repaint_after(std::time::Duration::from_millis(60));
+            }
+        }
+        None => {
+            ui_state.tip_row = None;
+            ui_state.tip_shown = false;
+        }
+    }
+}
+
+// ── The equalizer panel ───────────────────────────────────────────────────────
+
+pub fn draw_eq(ctx: &egui::Context, ui_state: &mut AdjustUi, a: &mut Adjust, accent: Color32) {
+    if !ui_state.eq_open {
+        ui_state.eq_rect = Rect::NOTHING;
+        return;
+    }
+    const COL_W: f32 = 24.0;
+    const PAD: f32 = 16.0;
+    const GAP: f32 = 14.0;
+    const TRACK_H: f32 = 124.0;
+    let w = PAD * 2.0 + COL_W * 11.0 + GAP;
+    let h = HEAD_H + 40.0 + 20.0 + TRACK_H + 26.0 + 8.0;
+    let screen = ctx.screen_rect();
+    // Beside the Picture & sound panel when there's room, otherwise on top of it
+    let beside = ui_state.panel_rect.is_positive() && ui_state.panel_rect.right() + 8.0 + w <= screen.right() - 8.0;
+    let left = if beside { ui_state.panel_rect.right() + 8.0 } else { screen.left() + 8.0 };
+    let rect = Rect::from_min_size(pos2(left, screen.top() + PANEL_TOP), vec2(w, h));
+    ui_state.eq_rect = rect;
+
+    let id = egui::Id::new("eq_panel");
+    egui::Area::new(id).order(egui::Order::Foreground).fixed_pos(rect.min).show(ctx, |ui| {
+        ui.allocate_rect(rect, Sense::click_and_drag());
+        let p = ui.painter().clone();
+        panel_frame(&p, rect);
+        let (reset, close) = header(ui, &p, rect, "Equalizer", "eq");
+        if close {
+            ui_state.eq_open = false;
+        }
+        if reset {
+            a.eq = [0; 10];
+            a.preamp = 0;
+        }
+
+        // On / off switch and the preset picker (‹ name ›)
+        let cy = rect.top() + HEAD_H + 20.0;
+        let sw_row = Rect::from_min_size(pos2(rect.left() + 8.0, cy - 14.0), vec2(80.0, 28.0));
+        let sw = ui.interact(sw_row, ui.id().with("eq_on"), Sense::click_and_drag());
+        if let Some(c) = state_fill(&sw) {
+            p.rect_filled(sw_row, 4.0, c);
+        }
+        switch(&p, Rect::from_min_size(pos2(sw_row.left() + 8.0, cy - 9.5), vec2(38.0, 19.0)), a.eq_on, accent);
+        p.text(pos2(sw_row.left() + 54.0, cy), Align2::LEFT_CENTER, if a.eq_on { "On" } else { "Off" }, FontId::proportional(NAME_SIZE), TEXT);
+        if activated(&sw) {
+            a.eq_on = !a.eq_on;
+        }
+        let next = Rect::from_center_size(pos2(rect.right() - PAD - 13.0, cy), vec2(26.0, 22.0));
+        let prev = next.translate(vec2(-132.0, 0.0));
+        p.text(pos2((prev.right() + next.left()) / 2.0, cy), Align2::CENTER_CENTER, a.preset_name(), FontId::proportional(VALUE_SIZE), TEXT);
+        let cur = EQ_PRESETS.iter().position(|(_, g)| *g == a.eq);
+        let n = EQ_PRESETS.len();
+        if cap_sized(ui, &p, prev, "\u{2039}", ui.id().with("eq_prev"), 15.5) {
+            a.eq = EQ_PRESETS[cur.map_or(0, |i| (i + n - 1) % n)].1;
+        }
+        if cap_sized(ui, &p, next, "\u{203a}", ui.id().with("eq_next"), 15.5) {
+            a.eq = EQ_PRESETS[cur.map_or(0, |i| (i + 1) % n)].1;
+        }
+
+        // Sliders: preamp, then the 10 bands
+        let top = rect.top() + HEAD_H + 40.0;
+        let track_top = top + 20.0;
+        let ppp = ctx.pixels_per_point();
+        let snap = |v: f32| (v * ppp).round() / ppp;
+        let dim = if a.eq_on { 1.0 } else { 0.45 };
+        for col in 0..11 {
+            let x = rect.left() + PAD + COL_W * (col as f32 + 0.5) + if col > 0 { GAP } else { 0.0 };
+            let value = if col == 0 { a.preamp } else { a.eq[col - 1] };
+            let label = if col == 0 { "Pre" } else { EQ_LABELS[col - 1] };
+            let hit = Rect::from_min_max(pos2(x - COL_W / 2.0, track_top - 8.0), pos2(x + COL_W / 2.0, track_top + TRACK_H + 8.0));
+            let resp = ui.interact(hit, ui.id().with(("band", col)), Sense::click_and_drag());
+
+            // Track, the 0 dB mark, and the fill from 0 dB to the knob
+            let y_of = |v: i32| track_top + TRACK_H * (EQ_MAX - v) as f32 / (2 * EQ_MAX) as f32;
+            let tx = snap(x);
+            p.rect_filled(Rect::from_min_max(pos2(tx - 1.5, track_top), pos2(tx + 1.5, track_top + TRACK_H)), 1.5, Color32::from_rgb(80, 80, 82));
+            p.line_segment([pos2(tx - 5.0, snap(y_of(0))), pos2(tx + 5.0, snap(y_of(0)))], Stroke::new(1.0_f32, Color32::from_rgb(110, 110, 112)));
+            let (y0, y1) = (y_of(0).min(y_of(value)), y_of(0).max(y_of(value)));
+            if value != 0 {
+                p.rect_filled(Rect::from_min_max(pos2(tx - 1.5, y0), pos2(tx + 1.5, y1)), 1.5, accent.gamma_multiply(dim));
+            }
+            let hot = resp.hovered() || resp.dragged();
+            let ky = snap(y_of(value));
+            disc(&p, pos2(tx, ky + 1.0), if hot { 7.3 } else { 6.6 }, Color32::from_black_alpha(80));
+            disc(&p, pos2(tx, ky), if hot { 7.0 } else { 6.2 }, Color32::from_rgb(186, 186, 188));
+            disc(&p, pos2(tx, ky), if hot { 4.2 } else { 3.6 }, accent.gamma_multiply(dim.max(0.7)));
+
+            p.text(pos2(x, top + 8.0), Align2::CENTER_CENTER, signed(value), FontId::proportional(11.5), if value != 0 { TEXT } else { DIM });
+            p.text(pos2(x, track_top + TRACK_H + 16.0), Align2::CENTER_CENTER, label, FontId::proportional(11.5), DIM);
+
+            // Drag / click to set, double-click for 0 dB, wheel for ±1
+            let mut v = value;
+            if resp.double_clicked() {
+                v = 0;
+            } else if resp.dragged() || resp.is_pointer_button_down_on() {
+                if let Some(pp) = resp.interact_pointer_pos() {
+                    let f = ((pp.y - track_top) / TRACK_H).clamp(0.0, 1.0);
+                    v = (EQ_MAX as f32 - f * (2 * EQ_MAX) as f32).round() as i32;
+                }
+            }
+            if resp.hovered() {
+                let wheel = ui.input(|i| i.raw_scroll_delta.y);
+                if wheel > 0.0 {
+                    v += 1;
+                } else if wheel < 0.0 {
+                    v -= 1;
+                }
+            }
+            let v = v.clamp(-EQ_MAX, EQ_MAX);
+            if col == 0 {
+                a.preamp = v;
+            } else {
+                a.eq[col - 1] = v;
+            }
+        }
+        // Divider between the preamp and the bands
+        let dx = rect.left() + PAD + COL_W + GAP / 2.0;
+        p.line_segment([pos2(dx, track_top - 4.0), pos2(dx, track_top + TRACK_H + 4.0)], Stroke::new(1.0_f32, LINE));
+    });
+    ctx.move_to_top(egui::LayerId::new(egui::Order::Foreground, id));
+}
+
+/// White balance multipliers for a colour temperature in kelvin, as FFmpeg's
+/// colortemperature filter computes them (Tanner Helland's approximation)
+fn kelvin_rgb(k: f32) -> [f32; 3] {
+    let kelvin = k / 100.0;
+    let (r, g) = if kelvin <= 66.0 {
+        (1.0, 0.390_081_58 * kelvin.ln() - 0.631_841_4)
+    } else {
+        let t = (kelvin - 60.0).max(0.0);
+        (1.292_936_2 * t.powf(-0.133_204_76), 1.129_890_9 * t.powf(-0.075_514_85))
+    };
+    let b = if kelvin >= 66.0 {
+        1.0
+    } else if kelvin <= 19.0 {
+        0.0
+    } else {
+        0.543_206_8 * (kelvin - 10.0).ln() - 1.196_254_1
+    };
+    [r.clamp(0.0, 1.0), g.clamp(0.0, 1.0), b.clamp(0.0, 1.0)]
+}
+
+// ── The "Online video settings" panel ─────────────────────────────────────────
+
+/// 2–3 choices side by side, ending at `right`; the chosen one raised, with an
+/// accent edge along its bottom like the selected tab. Returns the one clicked.
+#[allow(clippy::too_many_arguments)]
+fn segmented(ui: &mut egui::Ui, p: &egui::Painter, right: f32, cy: f32, labels: &[&str], chosen: usize, id: &str, accent: Color32) -> Option<usize> {
+    const PAD: f32 = 9.0;
+    let widths: Vec<f32> = labels
+        .iter()
+        .map(|l| p.layout_no_wrap((*l).to_owned(), semibold(12.0), TEXT).size().x + PAD * 2.0)
+        .collect();
+    let total = widths.iter().sum::<f32>() + 2.0 * (labels.len() as f32 - 1.0) + 4.0;
+    let outer = Rect::from_min_size(pos2(right - total, cy - 12.0), vec2(total, 24.0));
+    p.rect_filled(outer, 5.0, Color32::from_rgb(52, 52, 54));
+    let mut x = outer.left() + 2.0;
+    let mut clicked = None;
+    for (i, (label, w)) in labels.iter().zip(&widths).enumerate() {
+        let r = Rect::from_min_size(pos2(x, outer.top() + 2.0), vec2(*w, 20.0));
+        let resp = ui.interact(r, ui.id().with((id, i)), Sense::click_and_drag());
+        if i == chosen {
+            let lower = Rect::from_min_max(pos2(r.left() - 1.0, r.center().y), pos2(r.right() + 1.0, r.bottom() + 1.0));
+            p.with_clip_rect(lower).rect_filled(r, 4.0, accent);
+            p.rect_filled(Rect::from_min_max(r.min, pos2(r.right(), r.bottom() - 2.0)), 4.0, Color32::from_rgb(84, 84, 86));
+            p.text(r.center() - vec2(0.0, 1.0), Align2::CENTER_CENTER, *label, semibold(12.0), TEXT);
+        } else {
+            if let Some(c) = state_fill(&resp) {
+                p.rect_filled(r, 4.0, c);
+            }
+            p.text(r.center(), Align2::CENTER_CENTER, *label, FontId::proportional(12.0), Color32::from_rgb(200, 200, 200));
+        }
+        if activated(&resp) {
+            clicked = Some(i);
+        }
+        x += w + 2.0;
+    }
+    clicked
+}
+
+/// The Online video settings panel: which formats to ask yt-dlp for when a link
+/// is opened (top left, where Picture & Sound goes; one or the other)
+pub fn draw_online(ctx: &egui::Context, ui_state: &mut AdjustUi, o: &mut crate::online::Online, accent: Color32) {
+    use crate::online::{AudioCodec, Online, VideoCodec, LANGUAGES};
+    if !ui_state.online_open {
+        ui_state.online_rect = Rect::NOTHING;
+        ui_state.lang_open = false;
+        return;
+    }
+    const NOTE_H: f32 = 34.0;
+    let screen = ctx.screen_rect();
+    let w = PANEL_W.min(screen.width() - 16.0);
+    let h = HEAD_H + 4.0 + ROW_H * 6.0 + 9.0 + NOTE_H;
+    let rect = Rect::from_min_size(pos2(screen.left() + 8.0, screen.top() + PANEL_TOP), vec2(w, h));
+    ui_state.online_rect = rect;
+
+    let mut hovered_desc: Option<(Rect, &'static str)> = None;
+    let mut lang_row = Rect::NOTHING;
+    let id = egui::Id::new("online_panel");
+    egui::Area::new(id).order(egui::Order::Foreground).fixed_pos(rect.min).show(ctx, |ui| {
+        ui.allocate_rect(rect, Sense::click_and_drag());
+        let p = ui.painter().clone();
+        panel_frame(&p, rect);
+        let (reset, close) = header(ui, &p, rect, "Online video settings", "online");
+        if close {
+            ui_state.online_open = false;
+        }
+        if reset {
+            *o = Online::default();
+        }
+        let mut top = rect.top() + HEAD_H + 4.0;
+        let mut next_row = |hgt: f32| {
+            let r = Rect::from_min_size(pos2(rect.left() + EDGE, top), vec2(w - 2.0 * EDGE, hgt));
+            top += hgt;
+            r
+        };
+        let name = |p: &egui::Painter, r: Rect, text: &str| {
+            p.text(pos2(r.left() + 10.0, r.center().y), Align2::LEFT_CENTER, text, FontId::proportional(NAME_SIZE), TEXT);
+        };
+        let hover_row = |ui: &egui::Ui, p: &egui::Painter, r: Rect| {
+            let over = pointer_on(ui, r);
+            if over {
+                p.rect_filled(r, 4.0, HOVER);
+            }
+            over
+        };
+
+        // Video format
+        let r = next_row(ROW_H);
+        if hover_row(ui, &p, r) {
+            hovered_desc = Some((r, "Which kind of video to ask for when a site offers several. VP9 and H.264 are decoded by the graphics card on most PCs; AV1 only on newer ones, and it's heavy for older PCs."));
+        }
+        name(&p, r, "Video format");
+        let chosen = match o.codec {
+            VideoCodec::H264 => 0,
+            VideoCodec::Vp9 => 1,
+            VideoCodec::Av1 => 2,
+        };
+        if let Some(i) = segmented(ui, &p, r.right() - 6.0, r.center().y, &["H.264", "VP9", "AV1"], chosen, "codec", accent) {
+            o.codec = [VideoCodec::H264, VideoCodec::Vp9, VideoCodec::Av1][i];
+        }
+
+        // Max quality
+        let r = next_row(ROW_H);
+        if hover_row(ui, &p, r) {
+            hovered_desc = Some((r, "The largest picture to play. Smaller uses less internet and computer power. \"Audio only\" plays just the sound."));
+        }
+        name(&p, r, "Max quality");
+        let plus = Rect::from_center_size(pos2(r.right() - 19.0, r.center().y), vec2(26.0, 22.0));
+        let minus = plus.translate(vec2(-112.0, 0.0));
+        let col = if o.max_height != Online::default().max_height { accent } else { Color32::from_rgb(189, 189, 189) };
+        p.text(pos2((minus.right() + plus.left()) / 2.0, r.center().y), Align2::CENTER_CENTER, o.quality_label(), FontId::proportional(VALUE_SIZE), col);
+        if cap_sized(ui, &p, minus, "\u{2212}", ui.id().with("quality_minus"), 14.5) {
+            o.step_quality(-1);
+        }
+        if cap_sized(ui, &p, plus, "+", ui.id().with("quality_plus"), 14.5) {
+            o.step_quality(1);
+        }
+
+        // Switches
+        for (label, desc, key) in [
+            ("50/60 fps", "Prefer the smoother 50 or 60 fps version of a video when there is one.", 0),
+            ("HDR", "Prefer HDR versions. Only worth it on an HDR display; on a normal one HDR video tends to look washed out.", 1),
+        ] {
+            let r = next_row(ROW_H);
+            let resp = ui.interact(r, ui.id().with(("online_switch", key)), Sense::click_and_drag());
+            if let Some(c) = state_fill(&resp) {
+                p.rect_filled(r, 4.0, c);
+            }
+            if resp.hovered() {
+                hovered_desc = Some((r, desc));
+            }
+            name(&p, r, label);
+            let on = if key == 0 { o.hfr } else { o.hdr };
+            switch(&p, Rect::from_center_size(pos2(r.right() - 28.0, r.center().y), vec2(38.0, 19.0)), on, accent);
+            if activated(&resp) {
+                if key == 0 {
+                    o.hfr = !o.hfr;
+                } else {
+                    o.hdr = !o.hdr;
+                }
+            }
+        }
+
+        let r = next_row(9.0);
+        p.line_segment([pos2(rect.left() + 1.0, r.center().y), pos2(rect.right() - 1.0, r.center().y)], Stroke::new(1.0_f32, LINE));
+
+        // Audio format
+        let r = next_row(ROW_H);
+        if hover_row(ui, &p, r) {
+            hovered_desc = Some((r, "Which kind of sound to ask for. On YouTube, Opus is usually the better quality."));
+        }
+        name(&p, r, "Audio format");
+        let chosen = if o.audio == AudioCodec::Aac { 0 } else { 1 };
+        if let Some(i) = segmented(ui, &p, r.right() - 6.0, r.center().y, &["AAC", "Opus"], chosen, "audio", accent) {
+            o.audio = if i == 0 { AudioCodec::Aac } else { AudioCodec::Opus };
+        }
+
+        // Audio language (opens a list beside the panel)
+        let r = next_row(ROW_H);
+        lang_row = r;
+        let resp = ui.interact(r, ui.id().with("lang_row"), Sense::click_and_drag());
+        if ui_state.lang_open {
+            p.rect_filled(r, 4.0, HOVER);
+        } else if let Some(c) = state_fill(&resp) {
+            p.rect_filled(r, 4.0, c);
+        }
+        if resp.hovered() && !ui_state.lang_open {
+            hovered_desc = Some((r, "For videos with sound in several languages (dubbed versions). Default plays the video's own."));
+        }
+        name(&p, r, "Audio language");
+        let c = pos2(r.right() - 14.0, r.center().y);
+        p.text(pos2(r.right() - 26.0, r.center().y), Align2::RIGHT_CENTER, o.language_name(), FontId::proportional(VALUE_SIZE), Color32::from_rgb(220, 220, 220));
+        p.line_segment([c + vec2(-2.5, -4.5), c + vec2(2.0, 0.0)], Stroke::new(1.3_f32, TEXT));
+        p.line_segment([c + vec2(2.0, 0.0), c + vec2(-2.5, 4.5)], Stroke::new(1.3_f32, TEXT));
+        if activated(&resp) {
+            ui_state.lang_open = !ui_state.lang_open;
+            ui_state.lang_scroll = ui_state.lang_open;
+        }
+
+        // Note
+        let r = next_row(NOTE_H);
+        p.text(
+            pos2(r.left() + 10.0, r.center().y),
+            Align2::LEFT_CENTER,
+            "yt-dlp updates itself if a link fails to open.",
+            FontId::proportional(11.5),
+            Color32::from_rgb(150, 150, 150),
+        );
+    });
+
+    // The language list, beside the panel next to its row
+    if ui_state.lang_open {
+        const ITEM_H: f32 = 24.0;
+        // Whole rows only (at most 12), so the list never ends on half a name
+        let rows = (((screen.height() - 22.0) / ITEM_H).floor() as usize).clamp(4, 12).min(LANGUAGES.len());
+        let list_h = rows as f32 * ITEM_H + 2.0 * EDGE;
+        let lw = 190.0;
+        let x = (rect.right() + 6.0).min(screen.right() - lw - 8.0);
+        let y = (lang_row.top() - 3.0).clamp(screen.top() + 8.0, (screen.bottom() - 8.0 - list_h).max(screen.top() + 8.0));
+        let lr = Rect::from_min_size(pos2(x, y), vec2(lw, list_h));
+        ui_state.lang_rect = lr;
+        // A press outside the list (other than on its row, which toggles it) closes it
+        let outside = ctx.input(|i| {
+            i.pointer.any_pressed() && i.pointer.press_origin().is_some_and(|q| !lr.contains(q) && !lang_row.contains(q))
+        });
+        if outside {
+            ui_state.lang_open = false;
+        } else {
+            let lid = egui::Id::new("online_lang_list");
+            egui::Area::new(lid).order(crate::menus::POPUP).fixed_pos(lr.min).show(ctx, |ui| {
+                ui.allocate_rect(lr, Sense::click_and_drag());
+                let p = ui.painter().clone();
+                panel_frame(&p, lr);
+                let inner = lr.shrink(EDGE);
+                let mut child = ui.child_ui(inner, egui::Layout::top_down(egui::Align::Min));
+                egui::ScrollArea::vertical().max_height(inner.height()).show(&mut child, |ui| {
+                    ui.spacing_mut().item_spacing = vec2(0.0, 0.0);
+                    for (code, lang) in LANGUAGES {
+                        let (r, _) = ui.allocate_exact_size(vec2(inner.width() - 8.0, ITEM_H), Sense::hover());
+                        let resp = ui.interact(r, ui.id().with(("lang", code)), Sense::click_and_drag());
+                        let p = ui.painter().clone();
+                        if let Some(c) = state_fill(&resp) {
+                            p.rect_filled(r, 4.0, c);
+                        }
+                        if o.language == code {
+                            disc(&p, pos2(r.left() + 12.0, r.center().y), 2.5, TEXT);
+                            if ui_state.lang_scroll {
+                                ui.scroll_to_rect(r, Some(egui::Align::Center));
+                            }
+                        }
+                        p.text(pos2(r.left() + 24.0, r.center().y), Align2::LEFT_CENTER, lang, FontId::proportional(13.0), TEXT);
+                        if activated(&resp) {
+                            o.language = code;
+                            ui_state.lang_open = false;
+                        }
+                    }
+                    ui_state.lang_scroll = false;
+                });
+            });
+            ctx.move_to_top(egui::LayerId::new(crate::menus::POPUP, lid));
+        }
+    } else {
+        ui_state.lang_rect = Rect::NOTHING;
+    }
+    show_tip(ctx, ui_state, hovered_desc, rect);
+}
+
+/// A button filled with the accent colour, white label (the main action of a
+/// box: Open, Show in folder). Dimmed and inert when not `enabled`.
+#[allow(clippy::too_many_arguments)]
+fn accent_button(ui: &mut egui::Ui, p: &egui::Painter, r: Rect, label: &str, id: egui::Id, enabled: bool, accent: Color32) -> bool {
+    let resp = ui.interact(r, id, Sense::click_and_drag());
+    let inside = ui.ctx().input(|i| i.pointer.latest_pos()).is_some_and(|q| r.contains(q));
+    let fill = if !enabled {
+        accent.gamma_multiply(0.35)
+    } else if resp.is_pointer_button_down_on() && inside {
+        accent.gamma_multiply(0.8)
+    } else if resp.hovered() {
+        accent.gamma_multiply(0.9)
+    } else {
+        accent
+    };
+    p.rect_filled(r, 4.0, fill);
+    let text = if enabled { Color32::WHITE } else { Color32::from_white_alpha(110) };
+    p.text(r.center(), Align2::CENTER_CENTER, label, semibold(13.0), text);
+    enabled && activated(&resp)
+}
+
+// ── The Open URL box ──────────────────────────────────────────────────────────
+
+pub enum UrlBoxAction {
+    None,
+    Open(String),
+    Cancel,
+}
+
+/// The Open URL box in the middle of the window: a text field (filled in from the
+/// clipboard when it holds a link), Cancel and Open. Enter opens.
+pub fn draw_url_box(ctx: &egui::Context, b: &mut crate::online::UrlBox, accent: Color32) -> UrlBoxAction {
+    let screen = ctx.screen_rect();
+    let w = 440.0_f32.min(screen.width() - 24.0);
+    let h = HEAD_H + 134.0;
+    let rect = Rect::from_center_size(screen.center(), vec2(w, h));
+    let mut action = UrlBoxAction::None;
+    let id = egui::Id::new("url_box");
+    egui::Area::new(id).order(egui::Order::Foreground).fixed_pos(rect.min).show(ctx, |ui| {
+        ui.allocate_rect(rect, Sense::click_and_drag());
+        let p = ui.painter().clone();
+        panel_frame(&p, rect);
+        let (_, close) = header_with(ui, &p, rect, "Open URL", "url", false);
+        if close {
+            action = UrlBoxAction::Cancel;
+        }
+
+        // The text field: dark box, accent line along the bottom (Windows 11 style)
+        let field = Rect::from_min_size(pos2(rect.left() + 16.0, rect.top() + HEAD_H + 14.0), vec2(w - 32.0, 34.0));
+        p.rect_filled(field, 4.0, Color32::from_black_alpha(70));
+        p.rect_stroke(field.shrink(0.5), 4.0, Stroke::new(1.0_f32, Color32::from_rgb(64, 64, 64)));
+        p.with_clip_rect(Rect::from_min_max(pos2(field.left(), field.bottom() - 2.0), field.max))
+            .rect_filled(field, 4.0, accent);
+        let inner = Rect::from_min_max(pos2(field.left() + 10.0, field.top()), pos2(field.right() - 10.0, field.bottom() - 2.0));
+        let mut child = ui.child_ui(inner, egui::Layout::left_to_right(egui::Align::Center));
+        {
+            let v = child.visuals_mut();
+            v.selection.bg_fill = accent.gamma_multiply(0.45);
+            v.selection.stroke = Stroke::new(1.0_f32, TEXT);
+            v.text_cursor = Stroke::new(1.5_f32, TEXT);
+            v.extreme_bg_color = Color32::TRANSPARENT;
+        }
+        let edit = egui::TextEdit::singleline(&mut b.text)
+            .id(egui::Id::new(crate::online::URL_FIELD))
+            .frame(false)
+            .font(FontId::proportional(13.5))
+            .text_color(TEXT)
+            .hint_text(egui::RichText::new("https://\u{2026}").color(DIM))
+            .desired_width(inner.width());
+        // (the selection before this frame: a right-click in the field clears it,
+        // and the right-click menu needs it)
+        let field_id = egui::Id::new(crate::online::URL_FIELD);
+        let before = egui::widgets::text_edit::TextEditState::load(ctx, field_id).and_then(|s| s.cursor.char_range());
+        let resp = child.add(edit);
+        if b.focus {
+            resp.request_focus();
+            b.focus = false;
+        }
+        // Right-click in the field: Cut / Copy / Paste / Delete / Select all
+        if resp.hovered() && ctx.input(|i| i.pointer.button_pressed(egui::PointerButton::Secondary)) {
+            let sel = before.map_or((0, 0), |r| {
+                let (a, c) = (r.primary.index, r.secondary.index);
+                (a.min(c), a.max(c))
+            });
+            set_selection(ctx, field_id, sel);
+            let at = ctx.input(|i| i.pointer.latest_pos()).unwrap_or(resp.rect.center());
+            let can_paste = crate::taskbar::clipboard_text().is_some_and(|t| !t.is_empty());
+            b.menu = Some((at, can_paste, sel));
+        }
+        let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+        p.text(
+            pos2(field.left() + 2.0, field.bottom() + 16.0),
+            Align2::LEFT_CENTER,
+            "A YouTube link, or one from any other site yt-dlp supports.",
+            FontId::proportional(12.0),
+            DIM,
+        );
+
+        // Cancel / Open (Open is dimmed until the text is a link)
+        let valid = crate::online::normalize_url(&b.text).is_some();
+        let open_r = Rect::from_min_size(pos2(rect.right() - 16.0 - 84.0, rect.bottom() - 16.0 - 30.0), vec2(84.0, 30.0));
+        let cancel_r = open_r.translate(vec2(-92.0, 0.0));
+        if cap_sized(ui, &p, cancel_r, "Cancel", ui.id().with("url_cancel"), 13.0) {
+            action = UrlBoxAction::Cancel;
+        }
+        let clicked = accent_button(ui, &p, open_r, "Open", ui.id().with("url_open"), valid, accent);
+        if valid && (clicked || enter) {
+            action = UrlBoxAction::Open(b.text.clone());
+        }
+    });
+    ctx.move_to_top(egui::LayerId::new(egui::Order::Foreground, id));
+
+    // The field's right-click menu
+    if let Some((at, can_paste, (lo, hi))) = b.menu {
+        let chars = b.text.chars().count();
+        let (lo, hi) = (lo.min(chars), hi.min(chars));
+        if let Some(pick) = crate::menus::draw_text_menu(ctx, at, hi > lo, can_paste, chars > 0) {
+            let byte = |c: usize| b.text.char_indices().nth(c).map_or(b.text.len(), |(i, _)| i);
+            let (blo, bhi) = (byte(lo), byte(hi));
+            let selected = b.text[blo..bhi].to_owned();
+            let caret = match pick {
+                "cut" => {
+                    ctx.output_mut(|o| o.copied_text = selected);
+                    b.text.replace_range(blo..bhi, "");
+                    Some((lo, lo))
+                }
+                "copy" => {
+                    ctx.output_mut(|o| o.copied_text = selected);
+                    Some((lo, hi))
+                }
+                "paste" => {
+                    let clip = crate::taskbar::clipboard_text().unwrap_or_default().replace(['\r', '\n'], "");
+                    let n = clip.chars().count();
+                    b.text.replace_range(blo..bhi, &clip);
+                    Some((lo + n, lo + n))
+                }
+                "delete" => {
+                    b.text.replace_range(blo..bhi, "");
+                    Some((lo, lo))
+                }
+                "select_all" => Some((0, chars)),
+                _ => None, // (closed by a click elsewhere)
+            };
+            if let Some(sel) = caret {
+                set_selection(ctx, egui::Id::new(crate::online::URL_FIELD), sel);
+            }
+            b.menu = None;
+            b.focus = true;
+        }
+    }
+    action
+}
+
+/// Put a text field's selection (start, end, in characters) back / somewhere new
+fn set_selection(ctx: &egui::Context, id: egui::Id, (a, c): (usize, usize)) {
+    use egui::text::{CCursor, CCursorRange};
+    let mut state = egui::widgets::text_edit::TextEditState::load(ctx, id).unwrap_or_default();
+    state.cursor.set_char_range(Some(CCursorRange::two(CCursor::new(a), CCursor::new(c))));
+    state.store(ctx, id);
+}
+
+// ── The save card (Save As… in progress) ──────────────────────────────────────
+
+pub enum SaveCardAction {
+    None,
+    /// The X: cancel a save that's running, or just close the card
+    Close,
+    ShowInFolder,
+}
+
+/// One line of text cut to `width` with "…"
+fn elided(p: &egui::Painter, text: &str, font: FontId, color: Color32, width: f32) -> std::sync::Arc<egui::Galley> {
+    let mut job = egui::text::LayoutJob::simple_singleline(text.to_owned(), font, color);
+    job.wrap = egui::text::TextWrapping { max_width: width, max_rows: 1, break_anywhere: true, overflow_character: Some('\u{2026}') };
+    p.layout_job(job)
+}
+
+/// A small card in the top right while a link is being saved: what's happening,
+/// the video's title, and a progress bar; once saved, "Show in folder". `alpha`
+/// fades it with the title bar (it only stays put when there's news).
+pub fn draw_save_card(ctx: &egui::Context, title: &str, stage: &crate::online::SaveStage, note: Option<String>, alpha: f32, accent: Color32) -> SaveCardAction {
+    use crate::online::{SavePart, SaveStage};
+    if alpha <= 0.02 {
+        return SaveCardAction::None;
+    }
+    let screen = ctx.screen_rect();
+    let w = 320.0_f32.min(screen.width() - 16.0);
+    let done = matches!(stage, SaveStage::Done(_));
+    let failed = matches!(stage, SaveStage::Failed(_));
+    // (a separator, then a button: Cancel saving / Show in folder / Close)
+    let h = 146.0;
+    let rect = Rect::from_min_size(pos2(screen.right() - 8.0 - w, screen.top() + PANEL_TOP), vec2(w, h));
+    let mut action = SaveCardAction::None;
+    let (heading, detail, bar): (&str, String, Option<Option<f32>>) = match stage {
+        SaveStage::Starting => ("Saving", "Looking up the video\u{2026}".to_owned(), Some(None)),
+        // (no percentage: how much so far and for how long, if known)
+        SaveStage::Downloading(SavePart::Both, None) if note.is_some() => {
+            ("Saving", format!("Downloading\u{2026} \u{b7} {}", note.clone().unwrap_or_default()), Some(None))
+        }
+        SaveStage::Downloading(part, frac) => {
+            let what = match part {
+                SavePart::Video => "Downloading the video",
+                SavePart::Audio => "Downloading the audio",
+                SavePart::Both => "Downloading",
+            };
+            let text = match frac {
+                Some(f) => format!("{what} \u{b7} {}%", (f * 100.0).floor() as u32),
+                None => format!("{what}\u{2026}"),
+            };
+            ("Saving", text, Some(*frac))
+        }
+        SaveStage::Finishing(true) => ("Saving", "Joining the video and audio\u{2026}".to_owned(), Some(None)),
+        SaveStage::Finishing(false) => ("Saving", "Finishing\u{2026}".to_owned(), Some(None)),
+        SaveStage::Updating => ("Saving", "It didn't work: updating yt-dlp, then trying again\u{2026}".to_owned(), Some(None)),
+        SaveStage::Cutting(frac) => {
+            let text = match frac {
+                Some(f) => format!("Cutting the clip \u{b7} {}%", (f * 100.0).floor() as u32),
+                None => "Cutting the clip\u{2026}".to_owned(),
+            };
+            ("Saving", text, Some(*frac))
+        }
+        SaveStage::Done(path) => {
+            let name = Path::new(path).file_name().map_or_else(|| path.clone(), |n| n.to_string_lossy().into_owned());
+            ("Saved", name, None)
+        }
+        SaveStage::Failed(why) => ("Couldn't save", why.clone(), None),
+    };
+    let id = egui::Id::new("save_card");
+    egui::Area::new(id).order(egui::Order::Foreground).fixed_pos(rect.min).show(ctx, |ui| {
+        ui.set_opacity(alpha);
+        ui.allocate_rect(rect, Sense::click_and_drag());
+        let p = ui.painter().clone();
+        panel_frame(&p, rect);
+        let left = rect.left() + 16.0;
+
+        // Heading and the X
+        p.text(pos2(left, rect.top() + 22.0), Align2::LEFT_CENTER, heading, semibold(13.5), TEXT);
+        let xr = Rect::from_center_size(pos2(rect.right() - 20.0, rect.top() + 21.0), vec2(26.0, 26.0));
+        let x = ui.interact(xr, ui.id().with("save_close"), Sense::click_and_drag());
+        if let Some(c) = state_fill(&x) {
+            p.rect_filled(xr, 4.0, c);
+        }
+        let c = xr.center();
+        for (a, b) in [((-4.5, -4.5), (4.5, 4.5)), ((-4.5, 4.5), (4.5, -4.5))] {
+            p.line_segment([c + vec2(a.0, a.1), c + vec2(b.0, b.1)], Stroke::new(1.2_f32, TEXT));
+        }
+        let tip = if matches!(stage, SaveStage::Done(_) | SaveStage::Failed(_)) { "Close" } else { "Cancel saving" };
+        if activated(&x.on_hover_text(tip)) {
+            action = SaveCardAction::Close;
+        }
+
+        // The video's title
+        let g = elided(&p, title, FontId::proportional(13.0), Color32::from_rgb(222, 222, 222), w - 32.0);
+        p.galley(pos2(left, rect.top() + 38.0), g, Color32::from_rgb(222, 222, 222));
+
+        // What's happening / the file's name / why it failed
+        let col = if matches!(stage, SaveStage::Failed(_)) { Color32::from_rgb(232, 150, 140) } else { DIM };
+        let g = elided(&p, &detail, FontId::proportional(12.0), col, w - 32.0);
+        p.galley(pos2(left, rect.top() + 67.0 - g.size().y / 2.0), g, col);
+
+        // A separator, then the button for this stage
+        let y = rect.top() + 96.0;
+        p.line_segment([pos2(rect.left() + 1.0, y), pos2(rect.right() - 1.0, y)], Stroke::new(1.0_f32, LINE));
+        let br = Rect::from_min_max(pos2(rect.left() + 16.0, rect.bottom() - 12.0 - 30.0), pos2(rect.right() - 16.0, rect.bottom() - 12.0));
+        if done {
+            if accent_button(ui, &p, br, "Show in folder", ui.id().with("save_show"), true, accent) {
+                action = SaveCardAction::ShowInFolder;
+            }
+        } else if cap_sized(ui, &p, br, if failed { "Close" } else { "Cancel saving" }, ui.id().with("save_cancel"), 13.0) {
+            action = SaveCardAction::Close;
+        }
+
+        // Progress: a bar filling up, or a short piece sliding along while there's
+        // nothing to measure (looking up, joining)
+        if let Some(frac) = bar {
+            let track = Rect::from_min_max(pos2(left, rect.top() + 81.0), pos2(rect.right() - 16.0, rect.top() + 84.0));
+            crate::controls::pill(&p, track, Color32::from_rgb(70, 70, 72));
+            match frac {
+                Some(f) => {
+                    if f > 0.0 {
+                        let r = Rect::from_min_max(track.min, pos2(track.left() + track.width() * f, track.bottom()));
+                        crate::controls::pill(&p, r.intersect(track), accent);
+                    }
+                }
+                None => {
+                    let t = ctx.input(|i| i.time) as f32;
+                    let seg = track.width() * 0.28;
+                    let x0 = track.left() - seg + (t * 0.8).fract() * (track.width() + seg);
+                    let r = Rect::from_min_max(pos2(x0.max(track.left()), track.top()), pos2((x0 + seg).min(track.right()), track.bottom()));
+                    if r.width() > 1.0 {
+                        crate::controls::pill(&p, r, accent);
+                    }
+                    ctx.request_repaint();
+                }
+            }
+        }
+    });
+    ctx.move_to_top(egui::LayerId::new(egui::Order::Foreground, id));
+    action
+}
+
+// ── Save clip as… panel ───────────────────────────────────────────────────────
+
+pub enum ClipAction {
+    None,
+    Save,
+    Close,
+}
+
+/// The clip panel, top centre: its length, the start and end (click a time to
+/// type one; "Set to now" takes the playhead's), "Play the clip on repeat", and
+/// Cancel / Save clip…
+pub fn draw_clip_panel(ctx: &egui::Context, c: &mut crate::online::ClipUi, duration: f64, now: f64, accent: Color32) -> ClipAction {
+    use crate::online::{fmt_tenths, parse_time, ClipEnd, CLIP_FIELD};
+    let screen = ctx.screen_rect();
+    let w = 500.0_f32.min(screen.width() - 16.0);
+    let h = 40.0 + 12.0 + 40.0 + 12.0 + 30.0 + 14.0;
+    let rect = Rect::from_min_size(pos2(screen.center().x - w / 2.0, screen.top() + PANEL_TOP), vec2(w, h));
+    let mut action = ClipAction::None;
+    let id = egui::Id::new("clip_panel");
+    egui::Area::new(id).order(egui::Order::Foreground).fixed_pos(rect.min).show(ctx, |ui| {
+        ui.allocate_rect(rect, Sense::click_and_drag());
+        let p = ui.painter().clone();
+        panel_frame(&p, rect);
+
+        // Heading, the clip's length, X
+        let cy = rect.top() + 20.0;
+        let g = p.layout_no_wrap("Save a clip".to_owned(), semibold(14.0), TEXT);
+        let after = rect.left() + 16.0 + g.size().x + 10.0;
+        p.galley(pos2(rect.left() + 16.0, cy - g.size().y / 2.0), g, TEXT);
+        let len = c.end - c.start;
+        let len_text = if len >= 60.0 { format!("{}:{:04.1}", (len / 60.0).floor() as u64, len % 60.0) } else { format!("{len:.1} s") };
+        p.text(pos2(after, cy), Align2::LEFT_CENTER, len_text, semibold(12.5), accent);
+        let xr = Rect::from_center_size(pos2(rect.right() - 20.0, cy), vec2(26.0, 26.0));
+        let x = ui.interact(xr, ui.id().with("clip_close"), Sense::click_and_drag());
+        if let Some(f) = state_fill(&x) {
+            p.rect_filled(xr, 4.0, f);
+        }
+        let xc = xr.center();
+        for (a, b) in [((-4.5, -4.5), (4.5, 4.5)), ((-4.5, 4.5), (4.5, -4.5))] {
+            p.line_segment([xc + vec2(a.0, a.1), xc + vec2(b.0, b.1)], Stroke::new(1.2_f32, TEXT));
+        }
+        if activated(&x.on_hover_text("Cancel (Esc)")) {
+            action = ClipAction::Close;
+        }
+        p.line_segment([pos2(rect.left() + 1.0, rect.top() + 40.0), pos2(rect.right() - 1.0, rect.top() + 40.0)], Stroke::new(1.0_f32, LINE));
+
+        // Start and end boxes
+        let top = rect.top() + 52.0;
+        let half = (w - 28.0 - 10.0) / 2.0;
+        for (k, which) in [ClipEnd::Start, ClipEnd::End].into_iter().enumerate() {
+            let bx = Rect::from_min_size(pos2(rect.left() + 14.0 + k as f32 * (half + 10.0), top), vec2(half, 40.0));
+            p.rect_filled(bx, 6.0, Color32::from_black_alpha(55));
+            p.rect_stroke(bx.shrink(0.5), 6.0, Stroke::new(1.0_f32, Color32::from_rgb(58, 58, 60)));
+            let label = if which == ClipEnd::Start { "Start" } else { "End" };
+            p.text(pos2(bx.left() + 10.0, bx.center().y), Align2::LEFT_CENTER, label, FontId::proportional(12.0), DIM);
+
+            // "Set to now" ([ / ])
+            let key = if which == ClipEnd::Start { "[" } else { "]" };
+            let br = Rect::from_min_size(pos2(bx.right() - 6.0 - 98.0, bx.center().y - 13.0), vec2(98.0, 26.0));
+            if cap_sized(ui, &p, br, &format!("Set to now  {key}"), ui.id().with(("clip_now", k)), 12.0) {
+                c.set(which, now, duration);
+                c.editing = None;
+            }
+
+            // The time: click it to type one
+            let vr = Rect::from_min_max(pos2(bx.left() + 46.0, bx.top() + 6.0), pos2(br.left() - 8.0, bx.bottom() - 6.0));
+            let typing_here = c.editing.as_ref().is_some_and(|(e, _)| *e == which);
+            if typing_here {
+                p.rect_filled(vr, 4.0, Color32::from_black_alpha(70));
+                p.with_clip_rect(Rect::from_min_max(pos2(vr.left(), vr.bottom() - 2.0), vr.max)).rect_filled(vr, 4.0, accent);
+                let mut child = ui.child_ui(vr.shrink2(vec2(6.0, 2.0)), egui::Layout::left_to_right(egui::Align::Center));
+                {
+                    let v = child.visuals_mut();
+                    v.selection.bg_fill = accent.gamma_multiply(0.45);
+                    v.text_cursor = Stroke::new(1.5_f32, TEXT);
+                    v.extreme_bg_color = Color32::TRANSPARENT;
+                }
+                let mut done = None;
+                if let Some((_, text)) = c.editing.as_mut() {
+                    let resp = child.add(
+                        egui::TextEdit::singleline(text)
+                            .id(egui::Id::new(CLIP_FIELD))
+                            .frame(false)
+                            .font(semibold(15.0))
+                            .text_color(TEXT)
+                            .desired_width(vr.width() - 12.0),
+                    );
+                    if !resp.has_focus() && !resp.lost_focus() {
+                        resp.request_focus();
+                    }
+                    // Enter, or clicking elsewhere, takes the typed time
+                    if resp.lost_focus() {
+                        done = Some(parse_time(text));
+                    }
+                }
+                if let Some(t) = done {
+                    if let Some(t) = t {
+                        c.set(which, t, duration);
+                    }
+                    c.editing = None;
+                }
+            } else {
+                let vresp = ui.interact(vr, ui.id().with(("clip_time", k)), Sense::click());
+                if vresp.hovered() {
+                    p.rect_filled(vr, 4.0, HOVER);
+                    ctx.set_cursor_icon(egui::CursorIcon::Text);
+                }
+                p.text(pos2(vr.left() + 6.0, vr.center().y), Align2::LEFT_CENTER, fmt_tenths(c.time(which)), semibold(15.0), TEXT);
+                if vresp.clicked() {
+                    c.editing = Some((which, fmt_tenths(c.time(which))));
+                }
+            }
+        }
+
+        // "Play the clip on repeat", Cancel, Save clip…
+        let row = rect.top() + 104.0;
+        let cb = Rect::from_min_size(pos2(rect.left() + 14.0, row), vec2(210.0, 30.0));
+        let cr = ui.interact(cb, ui.id().with("clip_repeat"), Sense::click_and_drag());
+        if let Some(f) = state_fill(&cr) {
+            p.rect_filled(cb, 4.0, f);
+        }
+        let bx = Rect::from_center_size(pos2(cb.left() + 14.0, cb.center().y), vec2(16.0, 16.0));
+        if c.repeat {
+            p.rect_filled(bx, 4.0, accent);
+            p.add(egui::Shape::line(
+                vec![bx.center() + vec2(-4.0, 0.0), bx.center() + vec2(-1.0, 3.0), bx.center() + vec2(4.5, -3.5)],
+                Stroke::new(1.6_f32, Color32::WHITE),
+            ));
+        } else {
+            p.rect_stroke(bx.shrink(0.5), 4.0, Stroke::new(1.0_f32, Color32::from_rgb(150, 150, 150)));
+        }
+        p.text(pos2(bx.right() + 9.0, cb.center().y), Align2::LEFT_CENTER, "Play the clip on repeat", FontId::proportional(12.5), TEXT);
+        if activated(&cr) {
+            c.repeat = !c.repeat;
+        }
+        let save_r = Rect::from_min_size(pos2(rect.right() - 14.0 - 116.0, row), vec2(116.0, 30.0));
+        let cancel_r = save_r.translate(vec2(-124.0, 0.0));
+        if cap_sized(ui, &p, cancel_r, "Cancel", ui.id().with("clip_cancel"), 13.0) {
+            action = ClipAction::Close;
+        }
+        if accent_button(ui, &p, save_r, "Save clip\u{2026}", ui.id().with("clip_save"), c.end > c.start, accent) {
+            action = ClipAction::Save;
+        }
+    });
+    ctx.move_to_top(egui::LayerId::new(egui::Order::Foreground, id));
+    action
+}
+
+// ── Playlist ──────────────────────────────────────────────────────────────────
+
+/// One entry of the playlist panel: its title (tag, else file name) and length
+pub struct PlaylistRow {
+    pub title: String,
+    pub secs: Option<f64>,
+    /// A picture: its number stays when it's the one showing (no playing bars)
+    pub picture: bool,
+}
+
+pub enum PlaylistAction {
+    None,
+    /// Play this entry (also the one playing: from the start)
+    Play(usize),
+    /// Right-clicked along an entry's row: play it from that far through
+    /// (0…1; the one playing just jumps there)
+    PlayFrom(usize, f32),
+    /// Open the playlist panel (from the "Up next" card)
+    Open,
+}
+
+/// "4:03", "1:02:03"
+fn clock(secs: f64) -> String {
+    let s = secs.max(0.0).round() as u64;
+    if s >= 3600 {
+        format!("{}:{:02}:{:02}", s / 3600, s / 60 % 60, s % 60)
+    } else {
+        format!("{}:{:02}", s / 60, s % 60)
+    }
+}
+
+/// The playing row's progress: a lighter fill up to `frac`, ending in a bright
+/// thin "spark" line with a soft glow behind it
+fn progress_fill(p: &egui::Painter, r: Rect, frac: f32, accent: Color32) {
+    let frac = frac.clamp(0.0, 1.0);
+    if frac <= 0.0 {
+        return;
+    }
+    // The edge on a whole pixel: between two pixels it was blended across both,
+    // so as it crept along it kept flickering between crisp and soft
+    let ppp = p.ctx().pixels_per_point();
+    let x = ((r.left() + r.width() * frac) * ppp).round() / ppp;
+    let fill = Rect::from_min_max(r.min, pos2(x, r.bottom()));
+    let round = egui::Rounding { nw: 5.0, sw: 5.0, ne: if frac > 0.99 { 5.0 } else { 0.0 }, se: if frac > 0.99 { 5.0 } else { 0.0 } };
+    p.rect_filled(fill, round, accent.gamma_multiply(0.26));
+    if frac > 0.99 {
+        return;
+    }
+    // Glow: fading in towards the edge (additive light: alpha 0), along a smooth
+    // curve so it has no visible start, brightest right at the edge. (No line at
+    // the edge: the glow alone marks it.)
+    let glow_w = (42.0_f32).min(x - r.left());
+    let light = |k: f32| {
+        let [r0, g0, b0, _] = accent.to_array();
+        Color32::from_rgba_premultiplied((r0 as f32 * k) as u8, (g0 as f32 * k) as u8, (b0 as f32 * k) as u8, 0)
+    };
+    let mut m = egui::Mesh::default();
+    const STEPS: u32 = 12;
+    for i in 0..=STEPS {
+        let s = i as f32 / STEPS as f32;
+        // (eased: barely there for most of the way, then rising to the edge)
+        let k = 0.45 * s * s * s;
+        let gx = x - glow_w * (1.0 - s);
+        m.colored_vertex(pos2(gx, r.top()), light(k));
+        m.colored_vertex(pos2(gx, r.bottom()), light(k));
+        if i > 0 {
+            let v = 2 * i;
+            m.add_triangle(v - 2, v - 1, v);
+            m.add_triangle(v - 1, v, v + 1);
+        }
+    }
+    p.add(egui::Shape::mesh(m));
+}
+
+/// The little three-bar "playing" mark (heights 0…1)
+fn playing_mark(p: &egui::Painter, right: f32, bottom: f32, levels: [f32; 3], col: Color32) {
+    for (i, v) in levels.iter().enumerate() {
+        let h = 3.0 + 9.0 * v.clamp(0.0, 1.0);
+        let x = right - (2 - i) as f32 * 5.0;
+        p.rect_filled(Rect::from_min_max(pos2(x - 3.0, bottom - h), pos2(x, bottom)), 0.0, col);
+    }
+}
+
+/// Width of the playlist's tab on the window's right edge, its height, and the
+/// gap between it and the open panel
+const TAB_W: f32 = 14.0;
+const TAB_H: f32 = 146.0;
+const TAB_GAP: f32 = 6.0;
+
+/// The playlist panel on the right: every entry (click one to play it), and its
+/// two options. `playing`: heights for the playing entry's three-bar mark;
+/// `progress`: how far into it (0…1), shown as a fill along its row. `shuffle`:
+/// `selected`: a playlist of files dropped / opened together ("Selected playlist").
+/// `shuffle`: the Shuffle button in the header.
+/// With it, its tab on the window's right edge: click to slide the panel out
+/// from behind it, or back in (`tab_alpha`: the tab's strength, fainter while
+/// the controls are hidden).
+#[allow(clippy::too_many_arguments)]
+pub fn draw_playlist(
+    ctx: &egui::Context,
+    ui_state: &mut AdjustUi,
+    rows: &[PlaylistRow],
+    current: usize,
+    playing: [f32; 3],
+    progress: f32,
+    replay: &mut bool,
+    summary: &mut bool,
+    selected: bool,
+    shuffle: &mut bool,
+    accent: Color32,
+    tab_alpha: f32,
+    tab_above: Option<f32>,
+) -> PlaylistAction {
+    if rows.is_empty() {
+        ui_state.playlist_rect = Rect::NOTHING;
+        ui_state.playlist_tab = Rect::NOTHING;
+        return PlaylistAction::None;
+    }
+    const ITEM_H: f32 = 28.0;
+    let screen = ctx.screen_rect();
+    let w = PANEL_W.min(screen.width() - 16.0);
+    let title = if selected { "Selected playlist" } else { "Playlist" };
+    // (shuffled, "already played" isn't the ones above: no greyed-out rows then)
+    let grey_played = !*shuffle;
+    let switches = 2.0;
+    // (the separator right under the list, 4 px from the rows on each side of it)
+    let foot_h = 5.0 + ROW_H * switches + EDGE;
+    let max_h = (screen.height() - PANEL_TOP - BOTTOM_GAP).max(HEAD_H + foot_h + ITEM_H * 2.0);
+    // (3 px above and below the rows: with their highlights 1 px in, 4 px gaps)
+    let list_h = (rows.len() as f32 * ITEM_H + 6.0).min(max_h - HEAD_H - foot_h);
+    let h = HEAD_H + list_h + foot_h;
+    let open_rect = Rect::from_min_size(pos2(screen.right() - TAB_W - TAB_GAP - w, screen.top() + PANEL_TOP), vec2(w, h));
+    let mut action = PlaylistAction::None;
+
+    // The tab: on the right edge, level with the middle of the panel; ‹ while
+    // the panel is in, › while it's out. (Showing a picture: kept above the
+    // picture's right-hand arrow, `tab_above`, so the arrow can stay mid-window.)
+    let mut tab_y = (open_rect.center().y - TAB_H / 2.0).round();
+    if let Some(limit) = tab_above {
+        tab_y = tab_y.min((limit - 8.0 - TAB_H).round()).max(screen.top() + PANEL_TOP);
+    }
+    let tab = Rect::from_min_size(pos2(screen.right() - TAB_W, tab_y), vec2(TAB_W, TAB_H));
+    ui_state.playlist_tab = tab;
+    let tab_id = egui::Id::new("playlist_tab");
+    egui::Area::new(tab_id).order(egui::Order::Foreground).fixed_pos(tab.min).show(ctx, |ui| {
+        let resp = ui.interact(tab, ui.id().with("tab"), Sense::click_and_drag());
+        let hot = resp.hovered() || resp.is_pointer_button_down_on();
+        let a = if hot { 1.0 } else { tab_alpha };
+        let p = ui.painter();
+        // (its right side runs off the window, so only three sides show a border)
+        let body = Rect::from_min_max(tab.min, pos2(tab.right() + 8.0, tab.bottom()));
+        let round = egui::Rounding { nw: 7.0, sw: 7.0, ne: 0.0, se: 0.0 };
+        let shadow = egui::epaint::Shadow { offset: vec2(-2.0, 0.0), blur: 8.0, spread: 0.0, color: Color32::from_black_alpha((100.0 * a) as u8) };
+        p.add(shadow.tessellate(tab, round));
+        // (the menus' background, with the usual hover / pressed highlight over it)
+        p.rect_filled(body, round, BG.gamma_multiply(0.94 * a));
+        if let Some(c) = state_fill(&resp) {
+            p.rect_filled(body, round, c);
+        }
+        // (the same grey edge as the menus and panels)
+        let edge = glass::edge(glass::BORDER).gamma_multiply(a);
+        p.with_clip_rect(tab).rect_stroke(body.shrink(0.5), round, Stroke::new(1.0_f32, edge));
+        let c = tab.center();
+        let d = if ui_state.playlist_open { 1.0 } else { -1.0 };
+        let col = Color32::from_rgb(235, 235, 240).gamma_multiply(a);
+        p.line_segment([c + vec2(-1.5 * d, -4.5), c + vec2(2.0 * d, 0.0)], Stroke::new(1.3_f32, col));
+        p.line_segment([c + vec2(2.0 * d, 0.0), c + vec2(-1.5 * d, 4.5)], Stroke::new(1.3_f32, col));
+        if hot {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        let tip = if ui_state.playlist_open { "Hide playlist (L)" } else { "Show playlist (L)" };
+        crate::controls::hover_tooltip(ui.ctx(), &resp, tab, tip, true);
+        if activated(&resp) {
+            action = PlaylistAction::Open;
+        }
+    });
+    ctx.move_to_top(egui::LayerId::new(egui::Order::Foreground, tab_id));
+
+    // The panel slides out from behind the tab (and back in): eased, a fifth of
+    // a second
+    let slide = ctx.animate_bool_with_time(egui::Id::new("playlist_slide"), ui_state.playlist_open, 0.2);
+    if slide <= 0.0 {
+        ui_state.playlist_rect = Rect::NOTHING;
+        return action;
+    }
+    let ease = 1.0 - (1.0 - slide).powi(3);
+    let rect = open_rect.translate(vec2(((1.0 - ease) * (w + TAB_GAP + 2.0)).round(), 0.0));
+    ui_state.playlist_rect = rect;
+    let id = egui::Id::new("playlist_panel");
+    egui::Area::new(id).order(egui::Order::Foreground).fixed_pos(rect.min).show(ctx, |ui| {
+        // (hidden past the tab's left edge while it slides)
+        let clip = ui.clip_rect().intersect(Rect::from_min_max(pos2(screen.left(), screen.top()), pos2(tab.left(), screen.bottom())));
+        ui.set_clip_rect(clip);
+        ui.allocate_rect(rect, Sense::click_and_drag());
+        let p = ui.painter().clone();
+        panel_frame(&p, rect);
+        // (the title after the Playlist button's own icon, in the accent colour
+        // the button lights up in: shows which button this panel belongs to)
+        let (_, close) = header_with(ui, &p, rect, "", "playlist", false);
+        if close {
+            ui_state.playlist_open = false;
+        }
+        let cy = rect.top() + HEAD_H / 2.0;
+        crate::controls::icon_playlist(&p, pos2(rect.left() + 25.0, cy), accent, None);
+        let title_x = rect.left() + 42.0;
+        p.text(pos2(title_x, cy), Align2::LEFT_CENTER, title, semibold(14.5), TEXT);
+        // Shuffle, left of the close button: lit in the accent colour while on
+        let sr = Rect::from_center_size(pos2(rect.right() - 54.0, cy), vec2(28.0, 28.0));
+        let sresp = ui.interact(sr, ui.id().with("playlist_shuffle"), Sense::click_and_drag());
+        if *shuffle {
+            p.rect_filled(sr, 4.0, accent.gamma_multiply(0.22));
+        }
+        if let Some(c) = state_fill(&sresp) {
+            p.rect_filled(sr, 4.0, c);
+        }
+        icon_shuffle(&p, sr.center(), if *shuffle { accent_text(accent) } else { TEXT });
+        crate::controls::hover_tooltip(ui.ctx(), &sresp, sr, if *shuffle { "Shuffle: on" } else { "Shuffle: off" }, false);
+        if activated(&sresp) {
+            *shuffle = !*shuffle;
+        }
+        // The total length after the title (once every length is known; left
+        // out when it would run into the buttons)
+        let title_w = p.layout_no_wrap(title.to_owned(), semibold(14.5), TEXT).size().x;
+        let total: Option<f64> = rows.iter().map(|r| r.secs).sum();
+        if let Some(t) = total {
+            let count = clock(t);
+            let count_x = title_x + title_w + 9.0;
+            if count_x + p.layout_no_wrap(count.clone(), FontId::proportional(11.5), DIM).size().x <= sr.left() - 6.0 {
+                p.text(pos2(count_x, cy + 0.5), Align2::LEFT_CENTER, count, FontId::proportional(11.5), DIM);
+            }
+        }
+
+        // The entries (scrolling when they don't fit)
+        let list = Rect::from_min_size(pos2(rect.left() + EDGE, rect.top() + HEAD_H + 3.0), vec2(w - 2.0 * EDGE, list_h - 6.0));
+        let scroll_to_current = std::mem::take(&mut ui_state.playlist_scroll);
+        ui.allocate_ui_at_rect(list, |ui| {
+            // (a slimmer scroll bar than egui's: 6 px instead of 10 when hovered)
+            ui.spacing_mut().scroll.bar_width = 6.0;
+            ui.spacing_mut().scroll.bar_inner_margin = 2.0;
+            egui::ScrollArea::vertical().id_source("playlist_rows").max_height(list.height()).auto_shrink([false, false]).show(ui, |ui| {
+                ui.spacing_mut().item_spacing = vec2(0.0, 0.0);
+                // (short of the right edge, room for the scroll bar, only when it
+                // scrolls: otherwise the same 6 px gap both sides)
+                let scrolls = rows.len() as f32 * ITEM_H > list.height() + 0.5;
+                for (i, row) in rows.iter().enumerate() {
+                    let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width() - if scrolls { 8.0 } else { 0.0 }, ITEM_H), Sense::click_and_drag());
+                    let p = ui.painter();
+                    let cur = i == current;
+                    // (highlights 1 px in from the top and bottom: a 2 px gap between
+                    // a hovered row and the playing one next to it)
+                    let hl = r.shrink2(vec2(0.0, 1.0));
+                    if cur {
+                        p.rect_filled(hl, 5.0, accent.gamma_multiply(0.22));
+                        progress_fill(p, hl, progress, accent);
+                    } else if let Some(c) = state_fill(&resp) {
+                        p.rect_filled(hl, 5.0, c);
+                    }
+                    if resp.hovered() {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                    }
+                    // (already played: the title, number and length all a dimmer grey)
+                    let played = !cur && i < current && grey_played;
+                    let (font, col) = if cur {
+                        (semibold(12.5), TEXT)
+                    } else if played {
+                        (FontId::proportional(12.5), Color32::from_rgb(122, 124, 132))
+                    } else {
+                        (FontId::proportional(12.5), Color32::from_rgb(222, 222, 226))
+                    };
+                    // (the bars start 10 px in, as the length ends 10 px from the right)
+                    let num_r = r.left() + 23.0;
+                    if cur && !row.picture {
+                        playing_mark(p, num_r, r.center().y + 6.0, playing, accent);
+                    } else if cur {
+                        // (a picture showing: its number, bright)
+                        p.text(pos2(num_r, r.center().y), Align2::RIGHT_CENTER, (i + 1).to_string(), semibold(11.0), TEXT);
+                    } else {
+                        let num_col = if played { Color32::from_rgb(96, 98, 106) } else { Color32::from_rgb(125, 128, 138) };
+                        p.text(pos2(num_r, r.center().y), Align2::RIGHT_CENTER, (i + 1).to_string(), FontId::proportional(11.0), num_col);
+                    }
+                    let len = row.secs.map(clock).unwrap_or_default();
+                    let len_w = if len.is_empty() { 0.0 } else { p.layout_no_wrap(len.clone(), FontId::proportional(11.5), DIM).size().x + 10.0 };
+                    if !len.is_empty() {
+                        let len_col = if played { Color32::from_rgb(112, 114, 122) } else { DIM };
+                        p.text(pos2(r.right() - 10.0, r.center().y), Align2::RIGHT_CENTER, len, FontId::proportional(11.5), len_col);
+                    }
+                    let g = crate::controls::elide(p, &row.title, font, col, r.right() - 10.0 - len_w - (num_r + 10.0));
+                    p.galley(pos2(num_r + 10.0, r.center().y - g.size().y / 2.0), g, col);
+                    if activated(&resp) {
+                        action = PlaylistAction::Play(i);
+                    }
+                    // (right-click: that far through the song, as if the row were
+                    // its seek bar)
+                    if resp.secondary_clicked() {
+                        if let Some(pos) = resp.interact_pointer_pos() {
+                            action = PlaylistAction::PlayFrom(i, ((pos.x - hl.left()) / hl.width()).clamp(0.0, 0.99));
+                        }
+                    }
+                    if cur && scroll_to_current {
+                        ui.scroll_to_rect(r, Some(egui::Align::Center));
+                    }
+                }
+            });
+        });
+
+        // The options
+        let mut top = rect.top() + HEAD_H + list_h;
+        p.line_segment([pos2(rect.left() + 1.0, top + 0.5), pos2(rect.right() - 1.0, top + 0.5)], Stroke::new(1.0_f32, LINE));
+        top += 5.0;
+        for (label, key) in [("Replay when it ends", 0), ("Always show \u{201c}Up next\u{201d}", 1)] {
+            let r = Rect::from_min_size(pos2(rect.left() + EDGE, top), vec2(w - 2.0 * EDGE, ROW_H));
+            top += ROW_H;
+            let resp = ui.interact(r, ui.id().with(("playlist_switch", key)), Sense::click_and_drag());
+            if let Some(c) = state_fill(&resp) {
+                p.rect_filled(r, 4.0, c);
+            }
+            p.text(pos2(r.left() + 10.0, r.center().y), Align2::LEFT_CENTER, label, FontId::proportional(NAME_SIZE), TEXT);
+            let on = if key == 0 { *replay } else { *summary };
+            switch(&p, Rect::from_center_size(pos2(r.right() - 28.0, r.center().y), vec2(38.0, 19.0)), on, accent);
+            if activated(&resp) {
+                if key == 0 {
+                    *replay = !*replay;
+                } else {
+                    *summary = !*summary;
+                }
+            }
+        }
+    });
+    action
+}
+
+/// The "Up next" card, bottom right: the next two entries (click one to play
+/// it) and a link to the whole list
+/// `noun`: "songs", "videos" or "files", for its "All 12 songs…" link
+/// (`next`: the next entries in playing order: shuffled, or going round to the
+/// start when it replays)
+pub fn draw_playlist_summary(ctx: &egui::Context, ui_state: &mut AdjustUi, rows: &[PlaylistRow], current: usize, next: &[usize], noun: &str, accent: Color32) -> PlaylistAction {
+    const ITEM_H: f32 = 25.0;
+    let next: Vec<usize> = next.iter().copied().filter(|&i| i < rows.len()).collect();
+    let screen = ctx.screen_rect();
+    let w = 240.0_f32.min(screen.width() - 16.0);
+    let body = if next.is_empty() { ITEM_H } else { next.len() as f32 * ITEM_H };
+    let h = 34.0 + body + 22.0 + EDGE;
+    // (clear of the playlist's tab on the right edge)
+    let rect = Rect::from_min_size(pos2(screen.right() - TAB_W - TAB_GAP - w, screen.bottom() - BOTTOM_GAP - h), vec2(w, h));
+    ui_state.summary_rect = rect;
+
+    let mut action = PlaylistAction::None;
+    egui::Area::new(egui::Id::new("playlist_summary")).order(egui::Order::Foreground).fixed_pos(rect.min).show(ctx, |ui| {
+        ui.allocate_rect(rect, Sense::click_and_drag());
+        let p = ui.painter().clone();
+        panel_frame(&p, rect);
+        p.text(pos2(rect.left() + 14.0, rect.top() + 18.0), Align2::LEFT_CENTER, "Up next", semibold(12.5), TEXT);
+        p.text(pos2(rect.right() - 14.0, rect.top() + 18.0), Align2::RIGHT_CENTER, format!("{} of {}", current + 1, rows.len()), FontId::proportional(11.5), DIM);
+        let mut top = rect.top() + 32.0;
+        if next.is_empty() {
+            let r = Rect::from_min_size(pos2(rect.left() + EDGE, top), vec2(w - 2.0 * EDGE, ITEM_H));
+            p.text(pos2(r.left() + 10.0, r.center().y), Align2::LEFT_CENTER, "That\u{2019}s the last one", FontId::proportional(12.5), DIM);
+            top += ITEM_H;
+        }
+        for i in next {
+            let r = Rect::from_min_size(pos2(rect.left() + EDGE, top), vec2(w - 2.0 * EDGE, ITEM_H));
+            top += ITEM_H;
+            let resp = ui.interact(r, ui.id().with(("summary_row", i)), Sense::click_and_drag());
+            if let Some(c) = state_fill(&resp) {
+                p.rect_filled(r, 5.0, c);
+            }
+            let num_r = r.left() + 22.0;
+            p.text(pos2(num_r, r.center().y), Align2::RIGHT_CENTER, (i + 1).to_string(), FontId::proportional(11.0), Color32::from_rgb(125, 128, 138));
+            let len = rows[i].secs.map(clock).unwrap_or_default();
+            let len_w = if len.is_empty() { 0.0 } else { p.layout_no_wrap(len.clone(), FontId::proportional(11.5), DIM).size().x + 10.0 };
+            if !len.is_empty() {
+                p.text(pos2(r.right() - 8.0, r.center().y), Align2::RIGHT_CENTER, len, FontId::proportional(11.5), DIM);
+            }
+            let col = Color32::from_rgb(222, 222, 226);
+            let g = crate::controls::elide(&p, &rows[i].title, FontId::proportional(12.5), col, r.right() - 8.0 - len_w - (num_r + 9.0));
+            p.galley(pos2(num_r + 9.0, r.center().y - g.size().y / 2.0), g, col);
+            if activated(&resp) {
+                action = PlaylistAction::Play(i);
+            }
+        }
+        // "All 12 songs…" opens the panel
+        let r = Rect::from_min_size(pos2(rect.left() + EDGE, top + 2.0), vec2(w - 2.0 * EDGE, 22.0));
+        let resp = ui.interact(r, ui.id().with("summary_all"), Sense::click_and_drag());
+        if let Some(c) = state_fill(&resp) {
+            p.rect_filled(r, 5.0, c);
+        }
+        let link = Color32::from_rgb(
+            accent.r() / 4 * 3 + 64,
+            accent.g() / 4 * 3 + 64,
+            accent.b() / 4 * 3 + 64,
+        );
+        p.text(pos2(r.left() + 8.0, r.center().y), Align2::LEFT_CENTER, format!("All {} {noun}\u{2026}", rows.len()), FontId::proportional(11.5), link);
+        if activated(&resp) {
+            action = PlaylistAction::Open;
+        }
+    });
+    action
+}
