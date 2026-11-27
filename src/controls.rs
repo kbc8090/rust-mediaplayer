@@ -579,9 +579,13 @@ pub(crate) fn draw_top_bar(app: &mut FluentMediaPlayer, ctx: &egui::Context, t: 
             let font = FontId::new(14.5, FontFamily::Name("semibold".into()));
             clip.text(pos2(tx + 1.0, y + 1.0), Align2::LEFT_CENTER, &title, font.clone(), black(170, t));
             let name = clip.text(pos2(tx, y), Align2::LEFT_CENTER, &title, font, white);
-            // A picture: its size after the name ("— 2560 × 1440"), a little quieter
+            // A picture: its size after the name, and its file's ("— 2560 × 1440
+            // · 2.4 MB"), a little quieter
             if let Some((w, h)) = app.picture_size().filter(|_| app.is_picture()) {
-                let size = format!("\u{2014}  {w:.0} \u{d7} {h:.0}");
+                let mut size = format!("\u{2014}  {w:.0} \u{d7} {h:.0}");
+                if let Some(len) = app.picture_bytes() {
+                    size += &format!("  \u{b7}  {}", crate::file_size_text(len));
+                }
                 let at = pos2(name.right() + 8.0, y);
                 let small = FontId::proportional(14.0);
                 clip.text(at + vec2(1.0, 1.0), Align2::LEFT_CENTER, &size, small.clone(), black(170, t));

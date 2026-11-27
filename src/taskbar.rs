@@ -514,55 +514,6 @@ pub fn set_border_color(hwnd: isize, color: u32) {
     unsafe { DwmSetWindowAttribute(hwnd, 34, &color as *const u32 as *const c_void, 4) };
 }
 
-/// Called straight after the window is resized into or out of full screen, from
-/// inside the resize, to draw the new frame at once (see set_resize_painter)
-static RESIZE_PAINTER: Mutex<Option<fn(isize)>> = Mutex::new(None);
-
-/// What draws the video at the window's new size the moment it has been resized
-/// (going into / out of full screen). Windows shows the resized window at once,
-/// but the next frame would only come a screen refresh later: until then it
-/// showed the old, smaller frame in the corner and the desktop around it.
-pub fn set_resize_painter(painter: fn(isize)) {
-    if let Ok(mut p) = RESIZE_PAINTER.lock() {
-        *p = Some(painter);
-    }
-}
-
-fn paint_after_resize(hwnd: isize) {
-    let painter = RESIZE_PAINTER.lock().ok().and_then(|p| *p);
-    if let Some(paint) = painter {
-        paint(hwnd);
-    }
-}
-
-#[link(name = "user32")]
-unsafe extern "system" {
-    fn GetDC(hwnd: isize) -> isize;
-    fn ReleaseDC(hwnd: isize, hdc: isize) -> i32;
-    fn GetClientRect(hwnd: isize, rect: *mut RectI) -> i32;
-}
-#[link(name = "gdi32")]
-unsafe extern "system" {
-    fn SwapBuffers(hdc: isize) -> i32;
-}
-
-/// The window's client size in pixels
-pub fn client_size(hwnd: isize) -> Option<(i32, i32)> {
-    let mut r = RectI::default();
-    unsafe { (GetClientRect(hwnd, &mut r) != 0).then_some((r.right - r.left, r.bottom - r.top)) }
-}
-
-/// Show what was just drawn with OpenGL (the window's back buffer)
-pub fn swap_buffers(hwnd: isize) {
-    unsafe {
-        let dc = GetDC(hwnd);
-        if dc != 0 {
-            SwapBuffers(dc);
-            ReleaseDC(hwnd, dc);
-        }
-    }
-}
-
 unsafe fn enter_fullscreen_now(hwnd: isize) {
     if ROUNDED.load(Ordering::Relaxed) {
         set_corners(hwnd, false); // rounded corners on a full screen look wrong
@@ -612,7 +563,6 @@ unsafe fn enter_fullscreen_now(hwnd: isize) {
         // "exclusive fullscreen" present mode, and that switch is a visible blink.
         // The extra row is off-screen; the taskbar still hides as usual.
         SetWindowPos(hwnd, 0, m.left, m.top, m.right - m.left, m.bottom - m.top + 1, 0x0200); // SWP_NOOWNERZORDER
-        paint_after_resize(hwnd);
     } else {
         if was_max {
             ShowWindow(hwnd, 3); // SW_MAXIMIZE — couldn't go fullscreen, put it back
@@ -686,7 +636,6 @@ unsafe fn exit_fullscreen_now(hwnd: isize) {
     } else if let Some([l, t, r, b]) = saved {
         SetWindowPos(hwnd, 0, l, t, r - l, b - t, 0x0200);
     }
-    paint_after_resize(hwnd);
 }
 
 // ── Single window ─────────────────────────────────────────────────────────────

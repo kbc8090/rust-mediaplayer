@@ -1905,6 +1905,8 @@ pub fn draw_clip_panel(ctx: &egui::Context, c: &mut crate::online::ClipUi, durat
 pub struct PlaylistRow {
     pub title: String,
     pub secs: Option<f64>,
+    /// A picture: its number stays when it's the one showing (no playing bars)
+    pub picture: bool,
 }
 
 pub enum PlaylistAction {
@@ -2168,8 +2170,11 @@ pub fn draw_playlist(
                     };
                     // (the bars start 10 px in, as the length ends 10 px from the right)
                     let num_r = r.left() + 23.0;
-                    if cur {
+                    if cur && !row.picture {
                         playing_mark(p, num_r, r.center().y + 6.0, playing, accent);
+                    } else if cur {
+                        // (a picture showing: its number, bright)
+                        p.text(pos2(num_r, r.center().y), Align2::RIGHT_CENTER, (i + 1).to_string(), semibold(11.0), TEXT);
                     } else {
                         let num_col = if played { Color32::from_rgb(96, 98, 106) } else { Color32::from_rgb(125, 128, 138) };
                         p.text(pos2(num_r, r.center().y), Align2::RIGHT_CENTER, (i + 1).to_string(), FontId::proportional(11.0), num_col);

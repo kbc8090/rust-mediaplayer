@@ -390,44 +390,6 @@ thread_local! {
     static WIN_FRAMES: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
     /// The graphics card's largest texture (0: not asked yet)
     static MAX_TEX: std::cell::Cell<i32> = const { std::cell::Cell::new(0) };
-    /// The window's OpenGL, for drawing straight after a resize (see paint_after_resize)
-    static RESIZE_GL: std::cell::RefCell<Option<Arc<glow::Context>>> = const { std::cell::RefCell::new(None) };
-    /// The last frame showed a video, nothing over it but the controls (see paint_after_resize)
-    static RESIZE_VIDEO: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
-/// The window has just been resized into or out of full screen (from inside
-/// the resize, see taskbar::set_resize_painter): a video is drawn at the new
-/// size and shown at once, before Windows shows the resized window with the
-/// old frame in its corner. The controls follow with the next regular frame.
-/// (Pictures: their next frame is quick enough by itself.)
-fn paint_after_resize(hwnd: isize) {
-    if !RESIZE_VIDEO.with(|v| v.get()) {
-        return;
-    }
-    let Some(gl) = RESIZE_GL.with(|g| g.borrow().clone()) else { return };
-    let Some((w, h)) = taskbar::client_size(hwnd) else { return };
-    if w <= 0 || h <= 0 {
-        return;
-    }
-    let drawn = TLS_RENDER_CTX.with(|c| match c.try_borrow_mut() {
-        Ok(mut c) => match c.as_mut() {
-            Some(rc) => unsafe {
-                gl.bind_framebuffer(glow::FRAMEBUFFER, None);
-                gl.viewport(0, 0, w, h);
-                gl.disable(glow::SCISSOR_TEST);
-                gl.clear_color(0.0, 0.0, 0.0, 1.0);
-                gl.clear(glow::COLOR_BUFFER_BIT);
-                paint_video(&gl, rc, 0, 0, w, h);
-                true
-            },
-            None => false,
-        },
-        Err(_) => false,
-    });
-    if drawn {
-        taskbar::swap_buffers(hwnd);
-    }
 }
 
 /// End the process immediately, without running any DLL or runtime shutdown code.
@@ -560,6 +522,16 @@ type ScanResult = Arc<Mutex<Option<(u64, Vec<PathBuf>)>>>;
 
 /// A photo's details, read on another thread: the picture, and its details
 type PhotoSlot = Arc<Mutex<Option<(String, Option<PhotoDetails>)>>>;
+
+/// A file's size for people: "2.4 MB", "830 KB"
+pub(crate) fn file_size_text(len: u64) -> String {
+    let mb = len as f64 / (1024.0 * 1024.0);
+    if mb >= 1.0 {
+        format!("{mb:.1} MB")
+    } else {
+        format!("{:.0} KB", len as f64 / 1024.0)
+    }
+}
 
 /// The dark grey around a picture (mpv's background-color, and the window's)
 const PICTURE_BACKDROP: &str = "#2B2C30";
@@ -875,6 +847,8 @@ struct FluentMediaPlayer {
     pic_turn: i64,
     /// When this file was opened
     pic_since: std::time::Instant,
+    /// A picture's file size in bytes (a file on disk only), for the top bar
+    pic_bytes: Option<u64>,
     /// Being dragged around (zoomed in past the window)
     pic_drag: bool,
     /// Gliding to a new zoom
@@ -1221,6 +1195,7 @@ impl FluentMediaPlayer {
             pic_size: (0.0, 0.0),
             pic_turn: 0,
             pic_since: std::time::Instant::now(),
+            pic_bytes: None,
             pic_drag: false,
             pic_glide: None,
             hold: None,
@@ -1424,6 +1399,7 @@ impl FluentMediaPlayer {
                     if is_url(&p) { p.into_owned() } else { e.path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default() }
                 }),
                 secs: e.secs,
+                picture: media_kind(&e.path.to_string_lossy()) == Some(MediaKind::Image),
             })
             .collect();
         let gen = self.playlist_gen.fetch_add(1, Ordering::SeqCst) + 1;
@@ -1500,6 +1476,11 @@ impl FluentMediaPlayer {
         self.pic_size = (0.0, 0.0);
         self.pic_turn = 0;
         self.pic_since = std::time::Instant::now();
+        // (a picture on disk: its file size, once, for the top bar. Not inside an
+        // archive, nor online.)
+        self.pic_bytes = (media_kind(path) == Some(MediaKind::Image) && !is_url(path) && !is_archive_entry(path))
+            .then(|| std::fs::metadata(path).ok().map(|m| m.len()))
+            .flatten();
         self.pic_drag = false;
         self.pic_glide = None;
         self.pic_zoom = 0.0;
@@ -1880,6 +1861,11 @@ impl FluentMediaPlayer {
     }
 
     /// The zoom in percent of the picture's own size ("62%"), once its size is known
+    /// A picture's file size, for the top bar (see pic_bytes)
+    pub(crate) fn picture_bytes(&self) -> Option<u64> {
+        self.pic_bytes
+    }
+
     pub(crate) fn picture_percent(&self) -> Option<f64> {
         Some(self.fit_scale()? * self.pic_zoom.exp2() * 100.0)
     }
@@ -2500,8 +2486,7 @@ impl FluentMediaPlayer {
             rows.push(InfoRow::Item("Size", format!("{w:.0} \u{d7} {h:.0}  \u{b7}  {:.1} MP", w * h / 1e6)));
         }
         if let Some(len) = local.then(|| std::fs::metadata(&path).ok()).flatten().map(|m| m.len()) {
-            let mb = len as f64 / (1024.0 * 1024.0);
-            rows.push(InfoRow::Item("File size", if mb >= 1.0 { format!("{mb:.1} MB") } else { format!("{:.0} KB", len as f64 / 1024.0) }));
+            rows.push(InfoRow::Item("File size", file_size_text(len)));
         }
         let details = self.photo.lock().ok().and_then(|s| s.as_ref().filter(|(p, _)| *p == path).and_then(|(_, d)| d.clone()));
         if let Some(d) = details {
@@ -2974,9 +2959,10 @@ impl eframe::App for FluentMediaPlayer {
             // (a picture's size comes only with mpv's word that it's showing, see
             // update: these readings can still have the previous picture's size
             // for a moment after the file changed, the new name already; only if
-            // that word never came, after half a second, from here)
+            // that word never came, after half a second, from here. Only
+            // pictures use it.)
             let late = self.pic_size == (0.0, 0.0) && self.pic_since.elapsed().as_secs_f32() > 0.5;
-            if same_file && snap.dwidth > 0 && snap.dheight > 0 && (!self.is_picture() || late) {
+            if same_file && snap.dwidth > 0 && snap.dheight > 0 && self.is_picture() && late {
                 self.pic_size = (snap.dwidth as f64, snap.dheight as f64);
                 self.pic_turn = snap.rotate;
             }
@@ -3307,10 +3293,6 @@ impl eframe::App for FluentMediaPlayer {
                 let tx = self.repaint_tx.clone();
                 rc.set_update_callback(move || { let _ = tx.try_send(()); });
                 TLS_RENDER_CTX.with(|c| *c.borrow_mut() = Some(rc));
-                if let Some(gl) = frame.gl() {
-                    RESIZE_GL.with(|g| *g.borrow_mut() = Some(gl.clone()));
-                    taskbar::set_resize_painter(paint_after_resize);
-                }
                 self.render_ctx_initialized = true;
             }
         }
@@ -3688,7 +3670,6 @@ impl eframe::App for FluentMediaPlayer {
                     self.scope.stop();
                 }
                 self.video_shown = false;
-                RESIZE_VIDEO.with(|v| v.set(false));
                 if !self.has_file {
                     splash::draw(ui.painter(), rect, self.accent);
                 } else if music {
@@ -3698,7 +3679,6 @@ impl eframe::App for FluentMediaPlayer {
                     // new file.)
                     let frame = self.pic_frame(rect);
                     PIC_FRAME.with(|p| p.set(frame));
-                    RESIZE_VIDEO.with(|v| v.set(matches!(frame, PicFrame::Off) && !self.is_picture()));
                     ui.painter().add(video_callback(rect));
                     self.video_shown = self.video_kind == VideoKind::Video;
                 }
