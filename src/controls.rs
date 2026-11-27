@@ -250,11 +250,34 @@ fn kclosed_round(p: &egui::Painter, c: Pos2, pts: &[(f32, f32)], r: f32, col: Co
     p.add(egui::Shape::closed_line(v, Stroke::new(SW, col)));
 }
 
-/// A line with round ends
+/// A line with round ends. A straight one is drawn as one shape (a long
+/// rounded bar): dots drawn over the line's ends doubled up where they
+/// overlapped it, which showed as brighter tips on the dimmed icons.
 fn kline_round(p: &egui::Painter, c: Pos2, pts: &[(f32, f32)], col: Color32) {
+    let at = |(x, y): (f32, f32)| pos2(c.x + x * K, c.y + y * K);
+    if pts.len() == 2 {
+        let (a, b) = (at(pts[0]), at(pts[1]));
+        let d = b - a;
+        let len = d.length();
+        if len > 0.0 {
+            let r = SW / 2.0;
+            let base = d.y.atan2(d.x);
+            // (round the far end, then back round the near end: clockwise)
+            let mut v = Vec::with_capacity(20);
+            for (end, from) in [(b, base - std::f32::consts::FRAC_PI_2), (a, base + std::f32::consts::FRAC_PI_2)] {
+                for k in 0..=8 {
+                    let ang = from + std::f32::consts::PI * k as f32 / 8.0;
+                    v.push(end + vec2(ang.cos(), ang.sin()) * r);
+                }
+            }
+            p.add(egui::Shape::convex_polygon(v, col, Stroke::NONE));
+        }
+        return;
+    }
+    // (a curve: the line, and a dot at each end)
     kpoly(p, c, pts, col, SW);
-    for &(x, y) in [pts[0], pts[pts.len() - 1]].iter() {
-        p.circle_filled(pos2(c.x + x * K, c.y + y * K), SW / 2.0, col);
+    for &q in [pts[0], pts[pts.len() - 1]].iter() {
+        p.circle_filled(at(q), SW / 2.0, col);
     }
 }
 
@@ -294,7 +317,9 @@ fn play_pause_morph(ctx: &egui::Context, playing: bool) -> f32 {
     let target = if playing { 0.0 } else { 1.0 };
     let id = egui::Id::new("play_pause_morph");
     let now = ctx.input(|i| i.time);
-    let (from, to, start) = ctx.data(|d| d.get_temp::<(f32, f32, f64)>(id)).unwrap_or((target, target, 0.0));
+    // (remembered from the first frame on: when it only was once a slide had
+    // started, the first change of all had nothing to slide from, and jumped)
+    let (from, to, start) = ctx.data_mut(|d| *d.get_temp_mut_or_insert_with(id, || (target, target, 0.0)));
     let ease = |x: f32| if x < 0.5 { 4.0 * x * x * x } else { 1.0 - (-2.0 * x + 2.0).powi(3) / 2.0 };
     let at = from + (to - from) * ease(((now - start) / SECS).clamp(0.0, 1.0) as f32);
     if to != target {
