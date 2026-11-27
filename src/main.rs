@@ -222,7 +222,12 @@ unsafe fn paint_picture(gl: &glow::Context, rc: &mut RenderContext<'static>, are
                 return Some(false);
             }
         }
-        let (cw, ch) = size(most);
+        // (the texture as big as now needed, rounded up, and made bigger when
+        // zooming in needs it: made at the most it might need, a big photo
+        // only ever seen fitted to the window took ten times the graphics
+        // memory it used)
+        let max = max as i32;
+        let (cw, ch) = (((tw + 255) / 256 * 256).min(max), ((th + 255) / 256 * 256).min(max));
         let fits = pt.as_ref().is_some_and(|p| {
             p.t.w >= tw && p.t.h >= th && (p.t.w as i64 * p.t.h as i64) <= 4 * (cw as i64 * ch as i64).max(1 << 20)
         });
@@ -291,7 +296,11 @@ unsafe fn blit_picture(gl: &glow::Context, p: &mut PicTarget, area: (i32, i32, i
 
 /// An off-screen texture to draw into, `tw` × `th`
 unsafe fn make_target(gl: &glow::Context, tw: i32, th: i32) -> Option<VideoTarget> {
-    let (tex, fbo) = (gl.create_texture().ok()?, gl.create_framebuffer().ok()?);
+    let tex = gl.create_texture().ok()?;
+    let Ok(fbo) = gl.create_framebuffer() else {
+        gl.delete_texture(tex);
+        return None;
+    };
     gl.bind_texture(glow::TEXTURE_2D, Some(tex));
     gl.tex_image_2d(glow::TEXTURE_2D, 0, glow::RGBA8 as i32, tw, th, 0, glow::RGBA, glow::UNSIGNED_BYTE, None);
     gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::NEAREST as i32);
@@ -2866,14 +2875,25 @@ impl eframe::App for FluentMediaPlayer {
                         !is_url(&s) && !is_archive_entry(&s)
                     })
                     .collect();
+                // (each picture's read-ahead stops as soon as there's a newer one:
+                // going through quickly started one per picture, all reading at
+                // once, and on a hard disk they held up the picture being opened)
+                static READ_AHEAD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                let gen = READ_AHEAD.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                 if !near.is_empty() {
                     let _ = std::thread::Builder::new().name("read ahead".into()).spawn(move || {
+                        use std::io::Read;
+                        let current = || READ_AHEAD.load(std::sync::atomic::Ordering::Relaxed) == gen;
+                        // (a moment's pause first: mpv opens the picture shown, unhurried)
+                        std::thread::sleep(std::time::Duration::from_millis(150));
+                        let mut buf = vec![0_u8; 1 << 20];
                         for p in near {
                             // (not huge files: a 300 MB TIFF isn't worth it)
-                            if std::fs::metadata(&p).is_ok_and(|m| m.len() < 256 << 20) {
-                                if let Ok(mut f) = std::fs::File::open(&p) {
-                                    let _ = std::io::copy(&mut f, &mut std::io::sink());
-                                }
+                            if !current() || !std::fs::metadata(&p).is_ok_and(|m| m.len() < 256 << 20) {
+                                continue;
+                            }
+                            if let Ok(mut f) = std::fs::File::open(&p) {
+                                while current() && f.read(&mut buf).is_ok_and(|n| n > 0) {}
                             }
                         }
                     });
