@@ -225,6 +225,76 @@ pub(crate) fn has_ext(path: &str, exts: &[&str]) -> bool {
         .is_some_and(|e| exts.iter().any(|x| x.eq_ignore_ascii_case(e)))
 }
 
+/// Whether a picture reaches mpv's drawing with a transparency channel, as far
+/// as its first bytes tell (a PNG or WebP's header). Not whether it looks
+/// see-through: an all-solid RGBA PNG has the channel all the same, and mpv
+/// turns palette PNGs and lossless WebPs into a format with one. Any other type,
+/// a file inside an archive or online, or one that can't be read or
+/// understood: it may.
+pub(crate) fn may_have_alpha(path: &str) -> bool {
+    use std::io::Read;
+    let png = has_ext(path, &["png"]);
+    if !(png || has_ext(path, &["webp"])) || is_url(path) || is_archive_entry(path) {
+        return true;
+    }
+    let Ok(file) = std::fs::File::open(path) else { return true };
+    let mut head = Vec::with_capacity(64 * 1024);
+    if file.take(64 * 1024).read_to_end(&mut head).is_err() {
+        return true;
+    }
+    let says = if png { png_alpha(&head) } else { webp_alpha(&head) };
+    says.unwrap_or(true)
+}
+
+/// A PNG's chunks up to its picture data: IHDR's colour type 3, 4 or 6
+/// (palette, grey or colour with alpha), or a tRNS chunk (a transparent
+/// colour). Only grey (0) and colour (2) without one have no channel. None:
+/// not a PNG, or its picture data starts further in than `b` reaches.
+fn png_alpha(b: &[u8]) -> Option<bool> {
+    if b.len() < 33 || &b[..8] != b"\x89PNG\r\n\x1a\n" {
+        return None;
+    }
+    let mut i = 8;
+    while i + 8 <= b.len() {
+        let len = u32::from_be_bytes(b[i..i + 4].try_into().ok()?) as usize;
+        match &b[i + 4..i + 8] {
+            b"IHDR" => {
+                if matches!(*b.get(i + 8 + 9)?, 3 | 4 | 6) {
+                    return Some(true);
+                }
+            }
+            b"tRNS" => return Some(true),
+            b"IDAT" => return Some(false),
+            _ => {}
+        }
+        i = i.checked_add(12 + len)?;
+    }
+    None
+}
+
+/// A WebP's chunks: only a plain lossy picture ("VP8 ") without an alpha chunk
+/// arrives without the channel; lossless ("VP8L") always arrives with one, and
+/// so does an animation, or anything flagged as having alpha. None: not
+/// understood.
+fn webp_alpha(b: &[u8]) -> Option<bool> {
+    if b.len() < 20 || &b[0..4] != b"RIFF" || &b[8..12] != b"WEBP" {
+        return None;
+    }
+    let mut i = 12;
+    while i + 8 <= b.len() {
+        let len = u32::from_le_bytes(b[i + 4..i + 8].try_into().ok()?) as usize;
+        match &b[i..i + 4] {
+            b"VP8X" if *b.get(i + 8)? & 0x12 != 0 => return Some(true), // alpha, or animation
+            b"VP8 " => return Some(false),
+            b"VP8L" | b"ALPH" | b"ANIM" | b"ANMF" => return Some(true),
+            _ => {}
+        }
+        // (chunks are padded to an even length)
+        i = i.checked_add(8 + len + (len & 1))?;
+    }
+    None
+}
+
 pub(crate) fn is_media_file(path: &str) -> bool {
     media_kind(path).is_some()
 }

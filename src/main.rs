@@ -546,11 +546,14 @@ pub(crate) fn file_size_text(len: u64) -> String {
 const PICTURE_BACKDROP: &str = "#2B2C30";
 pub(crate) const PICTURE_GREY: (u8, u8, u8) = (0x2B, 0x2C, 0x30);
 
-/// A picture whose file type can carry a transparency channel, laid onto the
-/// backdrop's grey before mpv draws it (see AdjustState::vf_chain). (JPEG has
-/// none; HEIC and AVIF are stored like JPEG's colours, and rarely see-through.)
+/// A picture with a transparency channel, laid onto the backdrop's grey before
+/// mpv draws it (see AdjustState::vf_chain): file types that can have one,
+/// unless the file says it won't (a PNG or WebP's first bytes, see
+/// may_have_alpha: the filter costs a big PNG about a third more time, for
+/// nothing when it reaches mpv without the channel). (JPEG has none; HEIC and AVIF are
+/// stored like JPEG's colours, and rarely see-through.)
 fn needs_flatten(path: &str) -> bool {
-    media_kind(path) == Some(MediaKind::Image) && has_ext(path, &["png", "webp", "gif", "tif", "tiff", "bmp", "jxl"])
+    media_kind(path) == Some(MediaKind::Image) && has_ext(path, &["png", "webp", "gif", "tif", "tiff", "bmp", "jxl"]) && may_have_alpha(path)
 }
 /// A picture's own settings as it's opened: taken for what its first bytes say.
 /// (mpv's check of a file's format wants more certainty than a JPEG gives it, so
