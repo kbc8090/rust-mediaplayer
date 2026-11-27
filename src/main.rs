@@ -319,25 +319,6 @@ unsafe fn make_target(gl: &glow::Context, tw: i32, th: i32) -> Option<VideoTarge
     }
 }
 
-/// The window's transparency made fully solid over the video: Windows blends
-/// the window by it (its borderless look), and what mpv draws for a picture with
-/// a transparency channel (RGBA PNGs) can leave stray values there even where
-/// the picture is solid, which showed as black specks, over the top bar's text
-/// too. Only the transparency is touched, not the colours.
-unsafe fn solid_alpha(gl: &glow::Context, x: i32, y: i32, w: i32, h: i32) {
-    if w <= 0 || h <= 0 {
-        return;
-    }
-    gl.bind_framebuffer(glow::FRAMEBUFFER, None);
-    gl.enable(glow::SCISSOR_TEST);
-    gl.scissor(x, y, w, h);
-    gl.color_mask(false, false, false, true);
-    gl.clear_color(0.0, 0.0, 0.0, 1.0);
-    gl.clear(glow::COLOR_BUFFER_BIT);
-    gl.color_mask(true, true, true, true);
-    gl.disable(glow::SCISSOR_TEST);
-}
-
 /// Draws mpv's picture into `rect`
 fn video_callback(rect: Rect) -> egui::PaintCallback {
     egui::PaintCallback {
@@ -350,7 +331,6 @@ fn video_callback(rect: Rect) -> egui::PaintCallback {
                 Some(rc) => unsafe { paint_video(painter.gl(), rc, vp.left_px, vp.from_bottom_px, vp.width_px, vp.height_px) },
                 None => false,
             });
-            unsafe { solid_alpha(painter.gl(), vp.left_px, vp.from_bottom_px, vp.width_px, vp.height_px) };
             // (timings only count real mpv draws, not copies of the last picture)
             if drew {
                 let ms = started.elapsed().as_secs_f32() * 1000.0;
@@ -568,8 +548,13 @@ const PICTURE_GREY: (u8, u8, u8) = (0x2B, 0x2C, 0x30);
 /// A picture's own settings as it's opened: taken for what its first bytes say.
 /// (mpv's check of a file's format wants more certainty than a JPEG gives it, so
 /// it read on and checked again, 2 KB, 4 KB, 8 KB... up to the whole file: half a
-/// second for a 5 MB photo before decoding even started.)
-const PICTURE_OPTIONS: &str = "demuxer-lavf-probescore=25";
+/// second for a 5 MB photo before decoding even started.) And decoded into
+/// ordinary memory, then copied for the graphics card: mpv's shortcut of
+/// decoding straight into memory shared with the card ("direct rendering")
+/// showed some pictures scrambled on an AMD card, read before they were all
+/// there (with a filter on, which works on its own copy, they never were).
+/// One picture's copy is a millisecond.
+const PICTURE_OPTIONS: &str = "demuxer-lavf-probescore=25,vd-lavc-dr=no";
 
 /// Keeping the picture just left on screen (see PicFrame::Keep): since when, how
 /// many times playback had (re)started by then (see PLAYBACK_RESTARTS), and since
