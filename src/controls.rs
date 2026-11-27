@@ -198,38 +198,130 @@ pub(crate) fn kclosed(p: &egui::Painter, c: Pos2, pts: &[(f32, f32)], col: Color
     p.add(egui::Shape::closed_line(v, Stroke::new(w, col)));
 }
 
-pub(crate) fn icon_pause(p: &egui::Painter, c: Pos2, col: Color32) {
-    p.rect_filled(Rect::from_center_size(pos2(c.x - 3.5 * K, c.y), vec2(2.6 * K, 13.0 * K)), 0.5, col);
-    p.rect_filled(Rect::from_center_size(pos2(c.x + 3.5 * K, c.y), vec2(2.6 * K, 13.0 * K)), 0.5, col);
+/// How round the play / pause / previous / next / volume icons' corners are
+/// (icon units): play and pause's filled shapes; the outlined ones a bit less
+const ROUND: f32 = 2.08;
+const ROUND_LINE: f32 = 1.66;
+
+/// A polygon's outline with its corners rounded (radius `r` in icon units, or
+/// less on short sides), as points around it: each corner a short curve.
+/// Points on top of each other (play's tip, see icon_play_pause) count once.
+fn rounded_outline(pts: &[(f32, f32)], r: f32) -> Vec<(f32, f32)> {
+    rounded_outline_each(pts, &vec![r; pts.len()])
 }
 
-pub(crate) fn icon_play(p: &egui::Painter, c: Pos2, col: Color32) {
-    p.add(egui::Shape::convex_polygon(
-        vec![
-            pos2(c.x - 4.5 * K, c.y - 7.5 * K),
-            pos2(c.x - 4.5 * K, c.y + 7.5 * K),
-            pos2(c.x + 7.5 * K, c.y),
-        ],
-        col, Stroke::NONE,
-    ));
+/// rounded_outline, each corner with its own radius
+fn rounded_outline_each(pts: &[(f32, f32)], radii: &[f32]) -> Vec<(f32, f32)> {
+    let mut v: Vec<(f32, f32)> = Vec::new();
+    let mut rs: Vec<f32> = Vec::new();
+    for (&q, &r) in pts.iter().zip(radii) {
+        if v.last().is_none_or(|l: &(f32, f32)| (l.0 - q.0).hypot(l.1 - q.1) > 0.05) {
+            v.push(q);
+            rs.push(r);
+        }
+    }
+    if v.len() > 1 && (v[0].0 - v[v.len() - 1].0).hypot(v[0].1 - v[v.len() - 1].1) <= 0.05 {
+        v.pop();
+        rs.pop();
+    }
+    let n = v.len();
+    if n < 3 {
+        return v;
+    }
+    let mut out = Vec::with_capacity(n * 7);
+    for i in 0..n {
+        let (a, b, d) = (v[(i + n - 1) % n], v[i], v[(i + 1) % n]);
+        let (l1, l2) = ((a.0 - b.0).hypot(a.1 - b.1), (d.0 - b.0).hypot(d.1 - b.1));
+        let rr = rs[i].min(l1 * 0.45).min(l2 * 0.45);
+        let p1 = (b.0 + (a.0 - b.0) * rr / l1, b.1 + (a.1 - b.1) * rr / l1);
+        let p2 = (b.0 + (d.0 - b.0) * rr / l2, b.1 + (d.1 - b.1) * rr / l2);
+        // (a curve from p1 to p2 bent towards the corner)
+        for k in 0..=6 {
+            let s = k as f32 / 6.0;
+            let (u, w) = ((1.0 - s) * (1.0 - s), 2.0 * s * (1.0 - s));
+            out.push((u * p1.0 + w * b.0 + s * s * p2.0, u * p1.1 + w * b.1 + s * s * p2.1));
+        }
+    }
+    out
+}
+
+fn kclosed_round(p: &egui::Painter, c: Pos2, pts: &[(f32, f32)], r: f32, col: Color32) {
+    let v: Vec<Pos2> = rounded_outline(pts, r).iter().map(|&(x, y)| pos2(c.x + x * K, c.y + y * K)).collect();
+    p.add(egui::Shape::closed_line(v, Stroke::new(SW, col)));
+}
+
+/// A line with round ends
+fn kline_round(p: &egui::Painter, c: Pos2, pts: &[(f32, f32)], col: Color32) {
+    kpoly(p, c, pts, col, SW);
+    for &(x, y) in [pts[0], pts[pts.len() - 1]].iter() {
+        p.circle_filled(pos2(c.x + x * K, c.y + y * K), SW / 2.0, col);
+    }
+}
+
+/// Play and pause as one shape, `k` of the way from pause (0) to play (1): each
+/// pause bar turns into one half of the play triangle (the left one its back,
+/// the right one its tip), so switching slides one into the other
+pub(crate) fn icon_play_pause(p: &egui::Painter, c: Pos2, col: Color32, k: f32) {
+    const PAUSE: [[(f32, f32); 4]; 2] = [[(-4.8, -6.5), (-2.2, -6.5), (-2.2, 6.5), (-4.8, 6.5)], [(2.2, -6.5), (4.8, -6.5), (4.8, 6.5), (2.2, 6.5)]];
+    // (the triangle split down the middle, x = 1.5)
+    const M: f32 = 1.5;
+    const YM: f32 = 7.5 * (7.5 - M) / 12.0;
+    const PLAY: [[(f32, f32); 4]; 2] = [[(-4.5, -7.5), (M, -YM), (M, YM), (-4.5, 7.5)], [(M, -YM), (7.5, 0.0), (7.5, 0.0), (M, YM)]];
+    // (finished as play: one triangle, the same shape as the two halves but
+    // with no seam where they'd touch, which smoothing the edges could show)
+    if k >= 0.999 {
+        let v: Vec<Pos2> = rounded_outline(&[(-4.5, -7.5), (7.5, 0.0), (-4.5, 7.5)], ROUND).iter().map(|&(x, y)| pos2(c.x + x * K, c.y + y * K)).collect();
+        p.add(egui::Shape::convex_polygon(v, col, Stroke::NONE));
+        return;
+    }
+    // (the corners where the halves meet lose their rounding as they come
+    // together: rounded there, the finished triangle had notches in its edges)
+    const INNER: [[bool; 4]; 2] = [[false, true, true, false], [true, false, false, true]];
+    for ((bar, half), inner) in PAUSE.iter().zip(PLAY.iter()).zip(INNER.iter()) {
+        let q: Vec<(f32, f32)> = bar.iter().zip(half.iter()).map(|(a, b)| (a.0 + (b.0 - a.0) * k, a.1 + (b.1 - a.1) * k)).collect();
+        let radii: Vec<f32> = inner.iter().map(|&i| if i { ROUND * (1.0 - k) } else { ROUND }).collect();
+        let v: Vec<Pos2> = rounded_outline_each(&q, &radii).iter().map(|&(x, y)| pos2(c.x + x * K, c.y + y * K)).collect();
+        if v.len() >= 3 {
+            p.add(egui::Shape::convex_polygon(v, col, Stroke::NONE));
+        }
+    }
+}
+
+/// Play / pause on the bar, sliding into each other over 0.22 s when it changes
+/// (and back from wherever it is if it changes again meanwhile)
+fn play_pause_morph(ctx: &egui::Context, playing: bool) -> f32 {
+    const SECS: f64 = 0.22;
+    let target = if playing { 0.0 } else { 1.0 };
+    let id = egui::Id::new("play_pause_morph");
+    let now = ctx.input(|i| i.time);
+    let (from, to, start) = ctx.data(|d| d.get_temp::<(f32, f32, f64)>(id)).unwrap_or((target, target, 0.0));
+    let ease = |x: f32| if x < 0.5 { 4.0 * x * x * x } else { 1.0 - (-2.0 * x + 2.0).powi(3) / 2.0 };
+    let at = from + (to - from) * ease(((now - start) / SECS).clamp(0.0, 1.0) as f32);
+    if to != target {
+        ctx.data_mut(|d| d.insert_temp(id, (at, target, now)));
+    }
+    if at != target {
+        ctx.request_repaint();
+    }
+    at
 }
 
 pub(crate) fn icon_prev(p: &egui::Painter, c: Pos2, col: Color32) {
-    p.line_segment([pos2(c.x - 6.5 * K, c.y - 6.0 * K), pos2(c.x - 6.5 * K, c.y + 6.0 * K)], Stroke::new(SW, col));
-    kclosed(p, c, &[(6.5, -6.0), (6.5, 6.0), (-3.0, 0.0)], col, SW);
+    kline_round(p, c, &[(-6.5, -6.0), (-6.5, 6.0)], col);
+    kclosed_round(p, c, &[(6.5, -6.0), (6.5, 6.0), (-3.0, 0.0)], ROUND_LINE, col);
 }
 
 pub(crate) fn icon_next(p: &egui::Painter, c: Pos2, col: Color32) {
-    p.line_segment([pos2(c.x + 6.5 * K, c.y - 6.0 * K), pos2(c.x + 6.5 * K, c.y + 6.0 * K)], Stroke::new(SW, col));
-    kclosed(p, c, &[(-6.5, -6.0), (-6.5, 6.0), (3.0, 0.0)], col, SW);
+    kline_round(p, c, &[(6.5, -6.0), (6.5, 6.0)], col);
+    kclosed_round(p, c, &[(-6.5, -6.0), (-6.5, 6.0), (3.0, 0.0)], ROUND_LINE, col);
 }
 
 pub(crate) fn icon_volume(p: &egui::Painter, c: Pos2, col: Color32, level: f64, muted: bool) {
     let c = pos2(c.x - 3.0 * K, c.y);
-    kclosed(p, c, &[(-6.0, -3.0), (-3.0, -3.0), (1.5, -7.0), (1.5, 7.0), (-3.0, 3.0), (-6.0, 3.0)], col, SW);
+    kclosed_round(p, c, &[(-6.0, -3.0), (-3.0, -3.0), (1.5, -7.0), (1.5, 7.0), (-3.0, 3.0), (-6.0, 3.0)], 1.2, col);
     if muted || level <= 0.0 {
-        kpoly(p, c, &[(5.0, -3.5), (10.5, 3.5)], col, SW);
-        kpoly(p, c, &[(5.0, 3.5), (10.5, -3.5)], col, SW);
+        kline_round(p, c, &[(5.0, -3.5), (10.5, 3.5)], col);
+        kline_round(p, c, &[(5.0, 3.5), (10.5, -3.5)], col);
     } else {
         let arc = |r: f32| -> Vec<(f32, f32)> {
             (-4..=4).map(|k| {
@@ -237,8 +329,8 @@ pub(crate) fn icon_volume(p: &egui::Painter, c: Pos2, col: Color32, level: f64, 
                 (1.5 + r * a.cos(), r * a.sin())
             }).collect()
         };
-        kpoly(p, c, &arc(5.0), col, SW);
-        if level >= 40.0 { kpoly(p, c, &arc(9.0), col, SW); }
+        kline_round(p, c, &arc(5.0), col);
+        if level >= 40.0 { kline_round(p, c, &arc(9.0), col); }
     }
 }
 
@@ -945,7 +1037,7 @@ pub(crate) fn draw_bottom_bar(app: &mut FluentMediaPlayer, ctx: &egui::Context, 
             if hit(ui, c, "play", if app.is_playing { "Pause (Space)" } else { "Play (Space)" }, t).activated() {
                 app.toggle_play_pause();
             }
-            if app.is_playing { icon_pause(&p, c, white) } else { icon_play(&p, c, white) }
+            icon_play_pause(&p, c, white, play_pause_morph(ctx, app.is_playing));
 
             // Previous / next file in the same folder (dimmed when there isn't one)
             let dim = white.gamma_multiply(0.4);
