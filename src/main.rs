@@ -568,7 +568,17 @@ fn needs_flatten(path: &str) -> bool {
 /// (mpv's check of a file's format wants more certainty than a JPEG gives it, so
 /// it read on and checked again, 2 KB, 4 KB, 8 KB... up to the whole file: half a
 /// second for a 5 MB photo before decoding even started.)
-const PICTURE_OPTIONS: &str = "demuxer-lavf-probescore=25";
+/// And a JPEG shows only its first picture: phones (Pixel, Samsung, newer iPhones)
+/// put a second, hidden one after it (the half-size grey "gain map" for HDR
+/// screens), and mpv took the file for a two-frame video and went on to it a
+/// second later, drawn over the photo as a bar of green across the bottom.
+fn picture_options(path: &str) -> &'static str {
+    if has_ext(path, &["jpg", "jpeg", "jpe", "jfif"]) {
+        "demuxer-lavf-probescore=25,frames=1"
+    } else {
+        "demuxer-lavf-probescore=25"
+    }
+}
 
 /// Keeping the picture just left on screen (see PicFrame::Keep): since when, how
 /// many times playback had (re)started by then (see PLAYBACK_RESTARTS), and since
@@ -1559,7 +1569,7 @@ impl FluentMediaPlayer {
         // Started part way through if right-clicked along its row in the playlist
         let mut options = Vec::new();
         if picture {
-            options.push(PICTURE_OPTIONS.to_owned());
+            options.push(picture_options(path).to_owned());
         }
         if let Some(f) = self.start_at.take() {
             options.push(format!("start={:.2}%", f * 100.0));
@@ -2652,7 +2662,7 @@ impl FluentMediaPlayer {
         self.denoise_ok = false;
         self.flatten = needs_flatten(&path);
         self.apply_vf();
-        self.link.command("loadfile", &[&path, "replace", "-1", PICTURE_OPTIONS]);
+        self.link.command("loadfile", &[&path, "replace", "-1", picture_options(&path)]);
         self.preload = Some(Preload { path, delta, source, restarts });
         // (this frame too: the picture was already set to be drawn from mpv)
         PIC_FRAME.with(|p| p.set(PicFrame::Keep));
@@ -2685,7 +2695,7 @@ impl FluentMediaPlayer {
         self.denoise_ok = false;
         self.flatten = needs_flatten(&path);
         self.apply_vf();
-        self.link.command("loadfile", &[&path, "replace", "-1", PICTURE_OPTIONS]);
+        self.link.command("loadfile", &[&path, "replace", "-1", picture_options(&path)]);
     }
 
     /// Skip with the keys / taskbar buttons, and show "+5 sec" (adding up quick repeats
