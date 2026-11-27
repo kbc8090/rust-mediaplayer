@@ -934,6 +934,8 @@ pub fn open_file_dialog(owner: isize, initial_dir: Option<String>) {
     DIALOG_OWNER.store(owner, Ordering::Relaxed);
     std::thread::spawn(move || {
         let picked = unsafe { run_open_dialog(owner, initial_dir) };
+        // (the dialog's thread set up COM for itself, see run_*_dialog: undone as it ends)
+        unsafe { CoUninitialize() };
         if !picked.is_empty() {
             if let Ok(mut slot) = PICKED.lock() {
                 *slot = picked;
@@ -1053,6 +1055,8 @@ pub fn folder_dialog(owner: isize) {
     DIALOG_OWNER.store(owner, Ordering::Relaxed);
     std::thread::spawn(move || {
         let picked = unsafe { run_folder_dialog(owner) };
+        // (the dialog's thread set up COM for itself, see run_*_dialog: undone as it ends)
+        unsafe { CoUninitialize() };
         if let Some(p) = picked {
             if let Ok(mut slot) = PICKED_FOLDER.lock() {
                 *slot = Some(p);
