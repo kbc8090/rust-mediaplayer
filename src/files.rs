@@ -62,37 +62,46 @@ fn sort_files(files: Vec<(PathBuf, std::fs::Metadata)>, by: SortBy, desc: bool) 
 
 /// Case-insensitive compare where digit runs compare by value ("2" < "10"),
 /// like Windows Explorer
-pub(crate) fn natural_cmp(a: &str, b: &str) -> Ordering {
-    let mut ai = a.chars().peekable();
-    let mut bi = b.chars().peekable();
-    loop {
-        match (ai.peek().copied(), bi.peek().copied()) {
-            (None, None) => return Ordering::Equal,
-            (None, Some(_)) => return Ordering::Less,
-            (Some(_), None) => return Ordering::Greater,
-            (Some(x), Some(y)) => {
-                if x.is_ascii_digit() && y.is_ascii_digit() {
-                    let mut na = String::new();
-                    while let Some(&c) = ai.peek() {
-                        if c.is_ascii_digit() { na.push(c); ai.next(); } else { break; }
-                    }
-                    let mut nb = String::new();
-                    while let Some(&c) = bi.peek() {
-                        if c.is_ascii_digit() { nb.push(c); bi.next(); } else { break; }
-                    }
-                    let (ta, tb) = (na.trim_start_matches('0'), nb.trim_start_matches('0'));
-                    let o = ta.len().cmp(&tb.len()).then_with(|| ta.cmp(tb));
-                    if o != Ordering::Equal { return o; }
-                } else {
-                    let o = x.to_lowercase().collect::<String>()
-                        .cmp(&y.to_lowercase().collect::<String>());
-                    if o != Ordering::Equal { return o; }
-                    ai.next();
-                    bi.next();
-                }
+pub(crate) fn natural_cmp(sa: &str, sb: &str) -> Ordering {
+    let (a, b) = (sa.as_bytes(), sb.as_bytes());
+    let (mut i, mut j) = (0, 0);
+    while i < a.len() && j < b.len() {
+        if a[i].is_ascii_digit() && b[j].is_ascii_digit() {
+            // Numbers by value, read in place: leading zeros skipped, then the
+            // longer number is bigger, then digit by digit
+            let (si, sj) = (i, j);
+            while i < a.len() && a[i].is_ascii_digit() { i += 1; }
+            while j < b.len() && b[j].is_ascii_digit() { j += 1; }
+            let da = &a[si..i];
+            let db = &b[sj..j];
+            let da = &da[da.iter().take_while(|&&c| c == b'0').count()..];
+            let db = &db[db.iter().take_while(|&&c| c == b'0').count()..];
+            let o = da.len().cmp(&db.len()).then_with(|| da.cmp(db));
+            if o != Ordering::Equal {
+                return o;
             }
+        } else if a[i].is_ascii() && b[j].is_ascii() {
+            let o = a[i].to_ascii_lowercase().cmp(&b[j].to_ascii_lowercase());
+            if o != Ordering::Equal {
+                return o;
+            }
+            i += 1;
+            j += 1;
+        } else {
+            // (a character outside ASCII on either side: compared as characters,
+            // lower-cased, as before)
+            let x = sa.get(i..).and_then(|s| s.chars().next());
+            let y = sb.get(j..).and_then(|s| s.chars().next());
+            let (Some(x), Some(y)) = (x, y) else { return a[i..].cmp(&b[j..]) };
+            let o = x.to_lowercase().cmp(y.to_lowercase());
+            if o != Ordering::Equal {
+                return o;
+            }
+            i += x.len_utf8();
+            j += y.len_utf8();
         }
     }
+    (a.len() - i).cmp(&(b.len() - j)).then(Ordering::Equal)
 }
 
 // ── File types ────────────────────────────────────────────────────────────────
