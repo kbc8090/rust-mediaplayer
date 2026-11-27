@@ -251,8 +251,24 @@ impl Adjust {
     /// video couldn't keep up with. Denoise can't move (it compares each frame
     /// with the previous ones, which mpv's shaders can't see), so it's only used
     /// where `denoise_ok` says the video is small enough (1080p or less).
-    pub fn vf_chain(&self, mirror: bool, denoise_ok: bool) -> Option<String> {
+    ///
+    /// `flatten`: a picture that can have a transparency channel (PNG, WebP, …)
+    /// is first laid onto the picture backdrop's grey, as plain RGB. With that
+    /// channel left in, mpv's drawing of the picture came out scrambled on an
+    /// AMD card (random specks and stripes, new ones each time it was drawn at
+    /// another size). Without it, it's drawn as a JPEG's colours are. The
+    /// picture is unchanged (where it's solid, to the bit); see-through parts
+    /// show the grey around them, as they did.
+    pub fn vf_chain(&self, mirror: bool, denoise_ok: bool, flatten: bool) -> Option<String> {
         let mut f: Vec<String> = Vec::new();
+        if flatten {
+            f.push(format!(
+                "split[a][b];[b]format=gbrp,drawbox=c=0x{:02X}{:02X}{:02X}@1:t=fill[bg];[bg][a]overlay=format=gbrp,format=gbrp",
+                crate::PICTURE_GREY.0,
+                crate::PICTURE_GREY.1,
+                crate::PICTURE_GREY.2
+            ));
+        }
         if self.denoise > 0 && denoise_ok {
             f.push(format!("hqdn3d={}", [0, 2, 4, 7][self.denoise as usize]));
         }

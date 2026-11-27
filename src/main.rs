@@ -544,17 +544,19 @@ pub(crate) fn file_size_text(len: u64) -> String {
 
 /// The dark grey around a picture (mpv's background-color, and the window's)
 const PICTURE_BACKDROP: &str = "#2B2C30";
-const PICTURE_GREY: (u8, u8, u8) = (0x2B, 0x2C, 0x30);
+pub(crate) const PICTURE_GREY: (u8, u8, u8) = (0x2B, 0x2C, 0x30);
+
+/// A picture whose file type can carry a transparency channel, laid onto the
+/// backdrop's grey before mpv draws it (see AdjustState::vf_chain). (JPEG has
+/// none; HEIC and AVIF are stored like JPEG's colours, and rarely see-through.)
+fn needs_flatten(path: &str) -> bool {
+    media_kind(path) == Some(MediaKind::Image) && has_ext(path, &["png", "webp", "gif", "tif", "tiff", "bmp", "jxl"])
+}
 /// A picture's own settings as it's opened: taken for what its first bytes say.
 /// (mpv's check of a file's format wants more certainty than a JPEG gives it, so
 /// it read on and checked again, 2 KB, 4 KB, 8 KB... up to the whole file: half a
-/// second for a 5 MB photo before decoding even started.) And decoded into
-/// ordinary memory, then copied for the graphics card: mpv's shortcut of
-/// decoding straight into memory shared with the card ("direct rendering")
-/// showed some pictures scrambled on an AMD card, read before they were all
-/// there (with a filter on, which works on its own copy, they never were).
-/// One picture's copy is a millisecond.
-const PICTURE_OPTIONS: &str = "demuxer-lavf-probescore=25,vd-lavc-dr=no";
+/// second for a 5 MB photo before decoding even started.)
+const PICTURE_OPTIONS: &str = "demuxer-lavf-probescore=25";
 
 /// Keeping the picture just left on screen (see PicFrame::Keep): since when, how
 /// many times playback had (re)started by then (see PLAYBACK_RESTARTS), and since
@@ -911,6 +913,8 @@ struct FluentMediaPlayer {
     /// The current video is small enough for Denoise (1080p or less); false while
     /// its size isn't known yet, so a 4K video never starts out denoised
     denoise_ok: bool,
+    /// The file is a picture laid onto grey first (see needs_flatten)
+    flatten: bool,
     last_af: Option<String>,
     /// High-quality upscaling (menu)
     hq: bool,
@@ -1241,6 +1245,7 @@ impl FluentMediaPlayer {
             video_fps: 0.0,
             smooth_on: false,
             denoise_ok: false,
+            flatten: false,
             last_af: None,
         };
         app.apply_adjust_all();
@@ -1508,11 +1513,12 @@ impl FluentMediaPlayer {
         // for the previous one
         self.link.set("sid", "no");
         self.link.set("loop-file", if self.wants_loop() { "inf" } else { "no" });
-        // Denoise starts off for every file, until its size is known (see update)
-        if self.denoise_ok {
-            self.denoise_ok = false;
-            self.apply_vf();
-        }
+        // Denoise starts off for every file, until its size is known (see update);
+        // a picture that may be see-through is laid onto grey (see needs_flatten).
+        // Both before it's opened: its first drawing is already right.
+        self.denoise_ok = false;
+        self.flatten = needs_flatten(path);
+        self.apply_vf();
         // Read-ahead. A file on disk is read in an instant, so mpv keeps only a few
         // seconds of it (little memory). A link gets mpv's network cache: it reads
         // well ahead and pauses to catch up if the connection stalls. (Without it a
@@ -1745,7 +1751,7 @@ impl FluentMediaPlayer {
 
     /// Picture filters plus mirroring, as one filter chain
     fn apply_vf(&mut self) {
-        let chain = self.adjust.vf_chain(self.mirror, self.denoise_ok);
+        let chain = self.adjust.vf_chain(self.mirror, self.denoise_ok, self.flatten);
         if chain != self.last_vf {
             match &chain {
                 Some(c) => self.link.command("vf", &["set", c]),
@@ -2630,6 +2636,10 @@ impl FluentMediaPlayer {
             return;
         }
         let restarts = mpv_link::PLAYBACK_RESTARTS.load(std::sync::atomic::Ordering::Relaxed);
+        // (its filters as it will have them, see load_entry)
+        self.denoise_ok = false;
+        self.flatten = needs_flatten(&path);
+        self.apply_vf();
         self.link.command("loadfile", &[&path, "replace", "-1", PICTURE_OPTIONS]);
         self.preload = Some(Preload { path, delta, source, restarts });
         // (this frame too: the picture was already set to be drawn from mpv)
@@ -2660,6 +2670,9 @@ impl FluentMediaPlayer {
         let restarts = mpv_link::PLAYBACK_RESTARTS.load(std::sync::atomic::Ordering::Relaxed);
         self.hold = Some(Holding { since: std::time::Instant::now(), restarts, ready: None, strict: true });
         let path = self.current_file.clone();
+        self.denoise_ok = false;
+        self.flatten = needs_flatten(&path);
+        self.apply_vf();
         self.link.command("loadfile", &[&path, "replace", "-1", PICTURE_OPTIONS]);
     }
 
