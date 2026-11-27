@@ -86,8 +86,13 @@ pub(crate) fn inert(ui: &mut egui::Ui, centre: Pos2, id: &str) {
 
 /// `hit` with the tooltip above (`above`) or below the button
 pub(crate) fn hit_at(ui: &mut egui::Ui, centre: Pos2, id: &str, tip: &str, t: f32, above: bool) -> egui::Response {
+    hit_area(ui, centre, Rect::from_center_size(centre, vec2(BTN_STEP, 34.0)), id, tip, t, above)
+}
+
+/// `hit_at` answering anywhere in `area` (the button itself still drawn at `centre`)
+pub(crate) fn hit_area(ui: &mut egui::Ui, centre: Pos2, area: Rect, id: &str, tip: &str, t: f32, above: bool) -> egui::Response {
     let r = ui.interact(
-        Rect::from_center_size(centre, vec2(BTN_STEP, 34.0)),
+        area,
         ui.id().with(id),
         // drags starting on a button must not move the window (see the window buttons)
         Sense::click_and_drag(),
@@ -247,8 +252,70 @@ fn rounded_outline_each(pts: &[(f32, f32)], radii: &[f32]) -> Vec<(f32, f32)> {
 
 fn kclosed_round(p: &egui::Painter, c: Pos2, pts: &[(f32, f32)], r: f32, col: Color32) {
     let v: Vec<Pos2> = rounded_outline(pts, r).iter().map(|&(x, y)| pos2(c.x + x * K, c.y + y * K)).collect();
-    p.add(egui::Shape::closed_line(v, Stroke::new(SW, col)));
+    p.add(ring_shape(&v, SW, col));
 }
+
+/// A closed outline drawn as one mesh with no part laid twice. (egui's own
+/// outline overlapped itself at tight rounded corners, on the inner side of the
+/// bend: on a see-through colour those pixels came out about twice as bright,
+/// the white specks on the dimmed previous / next icons.) Its inner edge keeps
+/// clear of a bend's centre, so it never folds back over itself.
+fn ring_shape(pts: &[Pos2], w: f32, col: Color32) -> egui::Shape {
+    let mut v: Vec<Pos2> = Vec::with_capacity(pts.len());
+    for &q in pts {
+        if v.last().is_none_or(|l: &Pos2| l.distance(q) > 0.02) {
+            v.push(q);
+        }
+    }
+    while v.len() > 1 && v[0].distance(v[v.len() - 1]) <= 0.02 {
+        v.pop();
+    }
+    let n = v.len();
+    if n < 3 {
+        return egui::Shape::Noop;
+    }
+    // (which way round it goes, so "out" is away from the inside)
+    let area: f32 = (0..n).map(|i| { let (a, b) = (v[i], v[(i + 1) % n]); a.x * b.y - b.x * a.y }).sum();
+    let side = if area > 0.0 { 1.0 } else { -1.0 };
+    let seg_out = |i: usize| {
+        let d = (v[(i + 1) % n] - v[i]).normalized();
+        vec2(d.y, -d.x) * side
+    };
+    // (egui's look: solid for the line's width less a pixel, then fading out
+    // over a pixel on each side)
+    let (solid, fade) = ((w / 2.0 - 0.5).max(0.0), w / 2.0 + 0.5);
+    let clear = Color32::TRANSPARENT;
+    // (how tight the bend is at each point: the circle through it and its
+    // neighbours. The inner edge stays inside the tightest of those nearby,
+    // so it can't cross itself where a straight side runs into a corner.)
+    let radius: Vec<f32> = (0..n)
+        .map(|i| {
+            let (a, b, c) = (v[(i + n - 1) % n], v[i], v[(i + 1) % n]);
+            let cross = ((b - a).x * (c - b).y - (b - a).y * (c - b).x).abs();
+            if cross < 1e-6 { f32::INFINITY } else { a.distance(b) * b.distance(c) * c.distance(a) / (2.0 * cross) }
+        })
+        .collect();
+    let mut mesh = egui::epaint::Mesh::default();
+    for i in 0..n {
+        let (prev, next) = (seg_out((i + n - 1) % n), seg_out(i));
+        let nrm = (prev + next).normalized();
+        let miter = nrm / nrm.dot(next).max(0.5);
+        let tight = (0..5).map(|k| radius[(i + n + k - 2) % n]).fold(f32::INFINITY, f32::min);
+        let inner = |d: f32| d.min(tight * 0.8);
+        for (off, colour) in [(fade, clear), (solid, col), (-inner(solid), col), (-inner(fade), clear)] {
+            mesh.colored_vertex(v[i] + miter * off, colour);
+        }
+    }
+    for i in 0..n {
+        let (a, b) = (4 * i as u32, 4 * ((i + 1) % n) as u32);
+        for k in 0..3 {
+            mesh.add_triangle(a + k, b + k, a + k + 1);
+            mesh.add_triangle(a + k + 1, b + k, b + k + 1);
+        }
+    }
+    egui::Shape::mesh(mesh)
+}
+
 
 /// A line with round ends. A straight one is drawn as one shape (a long
 /// rounded bar): dots drawn over the line's ends doubled up where they
@@ -1191,8 +1258,16 @@ pub(crate) fn draw_bottom_bar(app: &mut FluentMediaPlayer, ctx: &egui::Context, 
             if hit(ui, c, "ontop", "Always on top", t).activated() { app.toggle_on_top(ctx); }
             icon_compact(&p, c, tint(app.on_top));
 
+            // (in full screen, the whole corner below the seek bar from this
+            // button to the screen's edges is the button: the mouse can be flung
+            // to the bottom right corner and clicked)
             let c = pos2(lay.fullscreen, row_y);
-            if hit(ui, c, "fs", "Full screen (Enter)", t).activated() { app.toggle_fullscreen(ctx); }
+            let area = if app.is_fullscreen {
+                Rect::from_min_max(pos2(c.x - BTN_STEP / 2.0, sr.bottom()), screen.right_bottom())
+            } else {
+                Rect::from_center_size(c, vec2(BTN_STEP, 34.0))
+            };
+            if hit_area(ui, c, area, "fs", "Full screen (Enter)", t, true).activated() { app.toggle_fullscreen(ctx); }
             icon_fullscreen(&p, c, white);
 
             // "More" → playback speed menu
