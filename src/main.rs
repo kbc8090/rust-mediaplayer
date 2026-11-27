@@ -231,10 +231,16 @@ unsafe fn paint_picture(gl: &glow::Context, rc: &mut RenderContext<'static>, are
                 gl.delete_framebuffer(old.t.fbo);
                 gl.delete_texture(old.t.tex);
             }
-            *pt = Some(PicTarget { t: make_target(gl, cw.max(tw), ch.max(th))?, drawn: (0, 0), scale: 0.0, size: (0.0, 0.0), shown: None });
+            *pt = Some(PicTarget { t: make_target(gl, cw.max(tw), ch.max(th))?, drawn: (0, 0), scale: 0.0, size: (0.0, 0.0), shown: None, again: true });
         }
         let p = pt.as_mut()?;
-        let drew = pending || changed || p.drawn != (tw, th);
+        // (a new picture is drawn by mpv twice, the second time the frame after:
+        // its first drawing into a new texture could come out speckled)
+        let again = std::mem::take(&mut p.again) && !changed && !pending && p.drawn == (tw, th);
+        let drew = pending || changed || p.drawn != (tw, th) || again;
+        if pending || changed {
+            p.again = p.again || changed;
+        }
         if drew {
             gl.disable(glow::SCISSOR_TEST);
             let _ = rc.render::<*mut std::os::raw::c_void>(p.t.fbo.0.get() as i32, tw, th, true);
@@ -300,6 +306,15 @@ unsafe fn make_target(gl: &glow::Context, tw: i32, th: i32) -> Option<VideoTarge
     gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
     gl.framebuffer_texture_2d(glow::FRAMEBUFFER, glow::COLOR_ATTACHMENT0, glow::TEXTURE_2D, Some(tex), 0);
     let ok = gl.check_framebuffer_status(glow::FRAMEBUFFER) == glow::FRAMEBUFFER_COMPLETE;
+    if ok {
+        // (a new texture holds whatever was in that graphics memory before:
+        // cleared, so nothing of that can ever show)
+        gl.disable(glow::SCISSOR_TEST);
+        gl.viewport(0, 0, tw, th);
+        let (r, g, b) = PICTURE_GREY;
+        gl.clear_color(r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0, 1.0);
+        gl.clear(glow::COLOR_BUFFER_BIT);
+    }
     gl.bind_framebuffer(glow::FRAMEBUFFER, None);
     if ok {
         Some(VideoTarget { fbo, tex, w: tw, h: th })
@@ -361,6 +376,8 @@ struct PicTarget {
     t: VideoTarget,
     drawn: (i32, i32),
     scale: f32,
+    /// Draw it once more next frame (see paint_picture)
+    again: bool,
     size: (f32, f32),
     shown: Option<([f32; 4], bool)>,
 }
@@ -2724,7 +2741,7 @@ impl FluentMediaPlayer {
         }
     }
 
-    fn toggle_maximize(&mut self, ctx: &egui::Context) {
+    pub(crate) fn toggle_maximize(&mut self, ctx: &egui::Context) {
         let maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
         ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
     }

@@ -513,9 +513,14 @@ pub(crate) fn draw_top_bar(app: &mut FluentMediaPlayer, ctx: &egui::Context, t: 
                     ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
                 }
                 // (fullscreen, like double-clicking the video; the maximise button
-                // and dragging to the top of the screen still maximise)
-                if drag.double_clicked() && !app.is_picture() {
-                    app.toggle_fullscreen(ctx);
+                // and dragging to the top of the screen still maximise. A picture:
+                // maximised and back, like most windows' title bars.)
+                if drag.double_clicked() {
+                    if !app.is_picture() {
+                        app.toggle_fullscreen(ctx);
+                    } else if !fullscreen {
+                        app.toggle_maximize(ctx);
+                    }
                 }
             }
 
@@ -1794,7 +1799,7 @@ pub(crate) fn draw_picture_bar(app: &mut FluentMediaPlayer, ctx: &egui::Context,
 /// Where a picture's previous (left) / next arrow is: 70 × 160 at the side,
 /// in the middle
 pub(crate) fn picture_arrow_rect(screen: Rect, left: bool) -> Rect {
-    let (w, h) = (70.0, 160.0_f32.min(screen.height() - TOP_H - 90.0).max(60.0));
+    let (w, h) = (82.0, 160.0_f32.min(screen.height() - TOP_H - 90.0).max(60.0));
     let x0 = if left { screen.left() } else { screen.right() - w };
     Rect::from_min_size(pos2(x0, (screen.center().y - h / 2.0).round()), vec2(w, h))
 }
