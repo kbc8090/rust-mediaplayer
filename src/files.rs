@@ -488,10 +488,14 @@ pub(crate) fn path_shape(path: &str) -> String {
 
 /// The same file name, give or take letter case, from Explorer and from mpv
 /// (whose names show "?" for letters it couldn't convert)
-fn same_name(explorer: &str, mpv: &str) -> bool {
-    let a: Vec<char> = explorer.chars().flat_map(char::to_lowercase).collect();
-    let b: Vec<char> = mpv.chars().flat_map(char::to_lowercase).collect();
-    a == b || (a.len() == b.len() && a.iter().zip(&b).all(|(x, y)| x == y || *y == '?'))
+/// (Both lower-cased already: see lower_chars.)
+fn same_name_lowered(a: &[char], b: &[char]) -> bool {
+    a == b || (a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x == y || *y == '?'))
+}
+
+/// A name's characters, lower-cased (see same_name_lowered)
+fn lower_chars(name: &str) -> Vec<char> {
+    name.chars().flat_map(char::to_lowercase).collect()
 }
 
 /// A file Explorer copied out of a zip (see `temp_copy_name`) and the rest
@@ -518,6 +522,11 @@ pub(crate) fn explorer_zip_playlist(copy: &str) -> Result<(String, Vec<String>, 
     // (each with its name, to sort by: Explorer hands a zip's files over in the
     // zip's own order, not the one it shows)
     let mut found: Vec<(String, String)> = Vec::new();
+    // (mpv's names lower-cased once, and looked up by name: comparing every
+    // file in the window with every file in the zip, lower-casing both each
+    // time, took a big zip a second or more)
+    let lowered: Vec<Vec<char>> = listed.iter().map(|e| lower_chars(inside_of(e))).collect();
+    let by_name: std::collections::HashMap<&[char], usize> = lowered.iter().enumerate().rev().map(|(i, n)| (n.as_slice(), i)).collect();
     for item in &items {
         // (only what's in that zip's folder: its path inside the zip, / between folders)
         if item.chars().count() <= keep + 1 || media_kind(item) != Some(kind) {
@@ -526,8 +535,12 @@ pub(crate) fn explorer_zip_playlist(copy: &str) -> Result<(String, Vec<String>, 
         let rel: String = item.chars().skip(keep + 1).collect::<String>().replace('\\', "/");
         if *item == clicked {
             found.push((rel, copy.to_owned()));
-        } else if let Some(e) = listed.iter().find(|e| same_name(&rel, inside_of(e))) {
-            found.push((rel, e.clone()));
+        } else {
+            let want = lower_chars(&rel);
+            let hit = by_name.get(want.as_slice()).copied().or_else(|| lowered.iter().position(|n| same_name_lowered(&want, n)));
+            if let Some(i) = hit {
+                found.push((rel, listed[i].clone()));
+            }
         }
     }
     // By name, in natural order (Ep 2 before Ep 10), as a zip's files usually are
@@ -581,8 +594,12 @@ pub(crate) fn photo_details(path: &str) -> Option<PhotoDetails> {
         if n == 0 {
             break;
         }
+        // (only what's new is searched, from a little before it, for a marker
+        // split between two reads: searching it all again each time read the
+        // first megabytes over and over, in a file without EXIF up to 32 times)
+        let from = data.len().saturating_sub(16);
         data.extend_from_slice(&chunk[..n]);
-        if let Some(at) = find_tiff(&data) {
+        if let Some(at) = find_tiff(&data, from) {
             // (a little more read, if the details run past what's read so far)
             let mut more = vec![0_u8; 256 << 10];
             if let Ok(m) = f.read(&mut more) {
@@ -596,14 +613,14 @@ pub(crate) fn photo_details(path: &str) -> Option<PhotoDetails> {
 
 /// Where the EXIF (a little TIFF file) starts: at the start of a TIFF; after
 /// "Exif\0\0" (JPEG, HEIC, AVIF); in a PNG's eXIf or a WebP's EXIF chunk
-fn find_tiff(d: &[u8]) -> Option<usize> {
+fn find_tiff(d: &[u8], start: usize) -> Option<usize> {
     let tiff = |at: usize| d.get(at..at + 4).is_some_and(|h| h == b"II*\0" || h == b"MM\0*");
-    if tiff(0) {
+    if start == 0 && tiff(0) {
         return Some(0);
     }
     // (WebP's "EXIF" chunk: its 4-byte size, then the TIFF, sometimes after "Exif\0\0")
     for (marker, skip) in [(&b"Exif\0\0"[..], 0), (&b"eXIf"[..], 0), (&b"EXIF"[..], 4)] {
-        let mut from = 0;
+        let mut from = start;
         while let Some(i) = d[from..].windows(marker.len()).position(|w| w == marker) {
             let at = from + i + marker.len() + skip;
             if tiff(at) {
